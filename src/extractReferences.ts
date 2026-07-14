@@ -198,29 +198,10 @@ const EXTRACT_QIANWEN_SEARCH_RESULTS_SCRIPT = `
     return Math.max((Number.isFinite(rect.top) ? rect.top : 0) + window.scrollY, 0);
   };
 
-  const normalizeTitle = (line) => clean(line).replace(/^\\d+\\s*/, "");
-
-  const titleLineFrom = (text, metaLine, dateLine) => {
-    const lines = text
-      .split(/[\\n\\r]+/)
-      .map(clean)
-      .filter(Boolean)
-      .map(normalizeTitle)
-      .filter(Boolean)
-      .filter((line) => line !== metaLine && line !== dateLine)
-      .filter((line) => !/^\\d+$/.test(line))
-      .filter((line) => !/^参考来源/.test(line))
-      .filter((line) => !datePattern.test(line))
-      .filter((line) => !domainPattern.test(line) || line.length > 35)
-      .filter((line) => line.length >= 4 && line.length <= 180);
-
-    return lines[0] || "";
-  };
-
   const resultByKey = new Map();
 
   const parseJsonAttr = (element) => {
-    for (const attr of ["data-extra", "data-click-extra"]) {
+    for (const attr of ["data-exposure-extra", "data-click-extra"]) {
       const value = element.getAttribute(attr);
       if (!value) continue;
       try {
@@ -236,30 +217,35 @@ const EXTRACT_QIANWEN_SEARCH_RESULTS_SCRIPT = `
     return null;
   };
 
-  const pushCandidate = (candidate) => {
-    if (!candidate.title || !candidate.href) return;
-    const key = candidate.href + "::" + candidate.title;
-    const existing = resultByKey.get(key);
-    if (!existing || candidate.contextText.length < existing.contextText.length) {
-      resultByKey.set(key, candidate);
-    }
-  };
+  const list = document.querySelector('[class~="list-XPxyL2"]');
+  if (!list) return [];
+  const cards = Array.from(list.children).filter((element) =>
+    element.matches('[data-exposure-extra], [data-click-extra]')
+  );
 
-  for (const element of Array.from(document.querySelectorAll("[data-extra], [data-click-extra]"))) {
+  for (const element of cards) {
     const data = parseJsonAttr(element);
     if (!data) continue;
 
-    const text = clean(element instanceof HTMLElement ? element.innerText : element.textContent || "");
+    const rawText = element instanceof HTMLElement ? element.innerText : element.textContent || "";
+    const text = clean(rawText);
     const title = clean(data.title || data.name || "");
     const href = clean(data.url || data.ref_url || data.href || "");
     if (!title || !href || (!href.startsWith("http://") && !href.startsWith("https://"))) continue;
 
-    const lines = text.split(/[\\n\\r]+/).map(clean).filter(Boolean);
+    const referenceNumber = Number.parseInt(String(data.refer_num || ""), 10);
+    const lines = rawText.split(/[\\n\\r]+/).map(clean).filter(Boolean);
     const dateLine = lines.find((line) => datePattern.test(line)) || "";
-    const domain = text.match(domainPattern)?.[0] || "";
-    const metaLine =
-      lines.find((line) => domainPattern.test(line) && !datePattern.test(line) && line.length <= 120) ||
-      "";
+    let host = "";
+    try { host = new URL(href).hostname.replace(/^www\\./, ""); } catch {}
+    const domain = lines.find((line) => domainPattern.test(line) && line.length <= 120)?.match(domainPattern)?.[0]
+      || host
+      || "";
+    const metaLine = lines.find((line) => {
+      const value = line.replace(domainPattern, "").trim();
+      const normalizedLine = line.replace(/^\\d+\\s*/, "");
+      return value.length >= 2 && value.length <= 40 && normalizedLine !== title && !datePattern.test(line) && !/^\\d+$/.test(line);
+    }) || "";
     const platform = clean(
       (data.source || data.source_name || data.site || data.media || metaLine)
         .replace(domainPattern, "")
@@ -267,65 +253,38 @@ const EXTRACT_QIANWEN_SEARCH_RESULTS_SCRIPT = `
         .trim()
     );
 
-    pushCandidate({
+    const summary = clean(
+      dateLine.replace(datePattern, "").replace(/^[\\s—–|｜·:：-]+/, "") ||
+      lines.find((line) => line !== title && line !== metaLine && !/^\\d+$/.test(line) && line.length > 30) ||
+      ""
+    );
+    const candidate = {
       score: scoreElement(element),
       href,
       platform: platform || domain,
       articleTime: dateLine.match(datePattern)?.[0] || text.match(datePattern)?.[0] || "",
       title,
+      summary,
+      referenceNumber: Number.isFinite(referenceNumber) ? referenceNumber : undefined,
       contextText: text
-    });
+    };
+    const key = href + "::" + title;
+    const existing = resultByKey.get(key);
+    if (!existing || candidate.contextText.length < existing.contextText.length) {
+      resultByKey.set(key, candidate);
+    }
   }
 
-  for (const element of Array.from(document.querySelectorAll("div, li, article, section"))) {
-    const text = clean(element instanceof HTMLElement ? element.innerText : element.textContent || "");
-    if (!datePattern.test(text) || text.length < 20 || text.length > 1000) continue;
-
-    const links = Array.from(element.querySelectorAll("a[href]"))
-      .map((anchor) => ({
-        href: anchor.href,
-        text: clean(anchor.innerText || anchor.textContent || "")
-      }))
-      .filter((item) => item.href.startsWith("http://") || item.href.startsWith("https://"));
-
-    const lines = text.split(/[\\n\\r]+/).map(clean).filter(Boolean);
-    const dateLine = lines.find((line) => datePattern.test(line)) || "";
-    const domain = text.match(domainPattern)?.[0] || "";
-    const metaLine =
-      lines.find((line) => domainPattern.test(line) && !datePattern.test(line) && line.length <= 120) ||
-      links[0]?.text ||
-      "";
-
-    const platform = clean(
-      metaLine
-        .replace(domainPattern, "")
-        .replace(/[|｜]/g, " ")
-        .trim()
-    ) || clean((links[0]?.text || "").replace(domainPattern, ""));
-
-    const date = dateLine.match(datePattern)?.[0] || text.match(datePattern)?.[0] || "";
-    const title = titleLineFrom(text, metaLine, dateLine);
-    const href = links[0]?.href || (domain ? "https://" + domain : "");
-    if (!title || !href) continue;
-
-    pushCandidate({
-      score: scoreElement(element),
-      href,
-      platform,
-      articleTime: date,
-      title,
-      contextText: text
-    });
-  }
-
-  return Array.from(resultByKey.values()).sort((a, b) => a.score - b.score);
+  return Array.from(resultByKey.values()).sort((a, b) =>
+    (a.referenceNumber || Number.MAX_SAFE_INTEGER) - (b.referenceNumber || Number.MAX_SAFE_INTEGER) || a.score - b.score
+  );
 })()
 `;
 
 const EXTRACT_YUANBAO_REFERENCES_SCRIPT = `
 (() => {
   const clean = (text) => (text || "").replace(/\\s+/g, " ").trim();
-  const datePattern = /(?:19|20)\\d{2}[年\\/-]\\d{1,2}[月\\/-]\\d{1,2}日?/;
+  const datePattern = /(?:19|20)\\d{2}[年\\/-]\\d{1,2}[月\\/-]\\d{1,2}日?|\\d+\\s*(?:天|小时|分钟)前|今天|昨天/;
 
   const scoreElement = (element) => {
     const rect = element.getBoundingClientRect();
@@ -333,6 +292,7 @@ const EXTRACT_YUANBAO_REFERENCES_SCRIPT = `
   };
 
   const getAttr = (element, names) => {
+    if (!element) return "";
     for (const name of names) {
       const value = element.getAttribute(name);
       if (value) return clean(value);
@@ -340,55 +300,55 @@ const EXTRACT_YUANBAO_REFERENCES_SCRIPT = `
     return "";
   };
 
-  const platformFrom = (element, text) => {
-    const sourceText =
-      element.querySelector("[class*='source_txt']")?.textContent ||
-      element.querySelector("[class*='foot__source']")?.textContent ||
-      "";
-    const spanText = Array.from(element.querySelectorAll("span"))
-      .map((span) => clean(span.textContent || ""))
-      .find((line) => line.length >= 2 && line.length <= 30 && !datePattern.test(line) && !/^\\d+$/.test(line));
-
-    return clean(sourceText || spanText || text.split(/[\\n\\r]+/).map(clean).find((line) => line.length >= 2 && line.length <= 30) || "");
-  };
-
-  const titleFrom = (element, text) => {
-    const explicit =
-      getAttr(element, ["dt-title", "data-title", "title"]) ||
-      clean(element.querySelector("h1,h2,h3,h4,[class*='title']")?.textContent || "");
-    if (explicit) return explicit;
-
-    return text
-      .split(/[\\n\\r]+/)
-      .map(clean)
-      .filter(Boolean)
-      .find((line) => line.length >= 4 && line.length <= 180 && !/^引用来源/.test(line) && !datePattern.test(line)) || "";
-  };
-
   const resultByKey = new Map();
-  const candidates = Array.from(document.querySelectorAll(
-    "li.agent-dialogue-references__item, [class*='references__item'], [class*='ref_card'], [data-url], [dt-url]"
-  ));
+  const lists = Array.from(document.querySelectorAll(".agent-dialogue-references__list"))
+    .filter((element) => {
+      if (!(element instanceof HTMLElement)) return false;
+      const rect = element.getBoundingClientRect();
+      const style = window.getComputedStyle(element);
+      return rect.width > 0 && rect.height > 0 && style.display !== "none" && style.visibility !== "hidden";
+    });
+  const list = lists[lists.length - 1];
+  if (!list) return [];
 
-  for (const element of candidates) {
-    const text = clean(element instanceof HTMLElement ? element.innerText : element.textContent || "");
+  const candidates = Array.from(list.querySelectorAll("li"));
+
+  for (const [domIndex, element] of candidates.entries()) {
+    const rawText = element instanceof HTMLElement ? element.innerText : element.textContent || "";
+    const text = clean(rawText);
+    const card = element.querySelector("[data-url]");
     const url =
-      getAttr(element, ["dt-url", "data-url", "href"]) ||
-      getAttr(element.querySelector("[data-url]") || element, ["data-url"]) ||
-      getAttr(element.querySelector("[dt-url]") || element, ["dt-url"]);
+      getAttr(card, ["data-url", "href"]) ||
+      getAttr(element, ["dt-ext6", "dt-url", "data-url", "href"]);
 
-    const title = titleFrom(element, text);
+    const title = clean(
+      card?.querySelector("h1,h2,h3,h4,[class*='ref_card-title'],[class*='title']")?.textContent ||
+      element.querySelector("h1,h2,h3,h4,[class*='ref_card-title']")?.textContent ||
+      getAttr(card, ["data-title", "title"])
+    );
+    const summary = clean(
+      card?.querySelector("p,[class*='ref_card-desc'],[class*='desc']")?.textContent ||
+      element.querySelector("p,[class*='ref_card-desc']")?.textContent ||
+      ""
+    );
+    const platform = clean(
+      element.querySelector("[class*='source_txt'],[class*='source-text'],[class*='sourceText']")?.textContent ||
+      getAttr(element, ["dt-ext3"])
+    );
+
     if (!title || !url || (!url.startsWith("http://") && !url.startsWith("https://"))) continue;
 
-    const platform = platformFrom(element, text);
     const date = text.match(datePattern)?.[0] || "";
+    const referenceNumber = Number.parseInt(getAttr(card, ["data-idx"]), 10);
     const key = url + "::" + title;
     const candidate = {
-      score: scoreElement(element),
+      score: domIndex,
       href: url,
       platform,
       articleTime: date,
       title,
+      summary,
+      referenceNumber: Number.isFinite(referenceNumber) ? referenceNumber : domIndex + 1,
       contextText: text
     };
 
@@ -398,19 +358,30 @@ const EXTRACT_YUANBAO_REFERENCES_SCRIPT = `
     }
   }
 
-  return Array.from(resultByKey.values()).sort((a, b) => a.score - b.score);
+  return Array.from(resultByKey.values()).sort((a, b) =>
+    (a.referenceNumber || Number.MAX_SAFE_INTEGER) - (b.referenceNumber || Number.MAX_SAFE_INTEGER) || a.score - b.score
+  );
 })()
 `;
 
-const RESET_QIANWEN_SOURCE_SCROLL_SCRIPT = `
+const RESET_SOURCE_PANEL_SCROLL_SCRIPT = `
 (() => {
-  const panels = Array.from(document.querySelectorAll("div, aside, section"))
-    .filter((element) => element.scrollHeight > element.clientHeight + 80)
-    .filter((element) => {
-      const text = element.innerText || element.textContent || "";
-      const cls = String(element.className || "");
-      return /参考来源|引用来源|source-item|source|references/.test(text) || /source|references|scroll|overflow/.test(cls);
-    });
+  const qianwenList = document.querySelector('[class~="list-XPxyL2"]');
+  if (qianwenList) {
+    qianwenList.scrollTop = 0;
+    return;
+  }
+  const cards = Array.from(document.querySelectorAll(
+    '.agent-dialogue-references__list > .agent-dialogue-references__item'
+  ));
+  const panels = Array.from(new Set(cards.flatMap((card) => {
+    let node = card.parentElement;
+    while (node) {
+      if (node.scrollHeight > node.clientHeight + 80) return [node];
+      node = node.parentElement;
+    }
+    return [];
+  })));
 
   for (const panel of panels) {
     panel.scrollTop = 0;
@@ -418,15 +389,28 @@ const RESET_QIANWEN_SOURCE_SCROLL_SCRIPT = `
 })()
 `;
 
-const SCROLL_QIANWEN_SOURCE_PANEL_SCRIPT = `
+const SCROLL_SOURCE_PANEL_SCRIPT = `
 (() => {
-  const panels = Array.from(document.querySelectorAll("div, aside, section"))
-    .filter((element) => element.scrollHeight > element.clientHeight + 80)
-    .filter((element) => {
-      const text = element.innerText || element.textContent || "";
-      const cls = String(element.className || "");
-      return /参考来源|引用来源|source-item|source|references/.test(text) || /source|references|scroll|overflow/.test(cls);
-    })
+  const qianwenList = document.querySelector('[class~="list-XPxyL2"]');
+  if (qianwenList) {
+    const before = qianwenList.scrollTop;
+    qianwenList.scrollTop = Math.min(
+      qianwenList.scrollTop + Math.max(qianwenList.clientHeight * 0.85, 260),
+      qianwenList.scrollHeight
+    );
+    return qianwenList.scrollTop > before + 2;
+  }
+  const cards = Array.from(document.querySelectorAll(
+    '.agent-dialogue-references__list > .agent-dialogue-references__item'
+  ));
+  const panels = Array.from(new Set(cards.flatMap((card) => {
+    let node = card.parentElement;
+    while (node) {
+      if (node.scrollHeight > node.clientHeight + 80) return [node];
+      node = node.parentElement;
+    }
+    return [];
+  })))
     .sort((a, b) => (b.scrollHeight - b.clientHeight) - (a.scrollHeight - a.clientHeight));
 
   const panel = panels[0];
@@ -465,6 +449,52 @@ export async function revealReferencePanels(page: Page, selectors: string[]): Pr
       await page.waitForTimeout(300).catch(() => undefined);
     }
   }
+}
+
+export async function revealLatestReferencePanel(
+  page: Page,
+  selectors: string[],
+  expectedPanelSelector?: string
+): Promise<boolean> {
+  const startedAt = Date.now();
+
+  while (Date.now() - startedAt < 12_000) {
+    const candidates: Array<{ locator: import("playwright").Locator; y: number; area: number }> = [];
+
+    for (const selector of selectors) {
+      const locators = await page.locator(selector).all().catch(() => []);
+      for (const locator of locators.slice(-12)) {
+        const [visible, enabled, box] = await Promise.all([
+          locator.isVisible().catch(() => false),
+          locator.isEnabled().catch(() => false),
+          locator.boundingBox().catch(() => null)
+        ]);
+        if (!visible || !enabled || !box || box.width > 420 || box.height > 140) continue;
+        candidates.push({ locator, y: box.y + box.height, area: box.width * box.height });
+      }
+    }
+
+    candidates.sort((a, b) => b.y - a.y || a.area - b.area);
+    for (const candidate of candidates.slice(0, 8)) {
+      const clicked = await candidate.locator.click({ timeout: 800 }).then(() => true).catch(() => false);
+      if (!clicked) continue;
+
+      if (!expectedPanelSelector) {
+        await page.waitForTimeout(500).catch(() => undefined);
+        return true;
+      }
+
+      const panelOpened = await page.locator(expectedPanelSelector).last()
+        .waitFor({ state: "visible", timeout: 1_500 })
+        .then(() => true)
+        .catch(() => false);
+      if (panelOpened) return true;
+    }
+
+    await page.waitForTimeout(500).catch(() => undefined);
+  }
+
+  return false;
 }
 
 export async function revealNewReferencePanels(page: Page, selectors: string[], baselineCount: number): Promise<void> {
@@ -535,19 +565,14 @@ export async function extractReferences(
       true
     );
     if (structured.length > 0) return structured;
-    console.log("[千问] 结构化来源卡片未抽取到结果，回退通用链接抽取。");
+    console.log("[千问] 未在 list-XPxyL2 容器的直接子组件中找到来源数据，不执行整页链接回退抽取。");
+    return [];
   }
   if (crawlPlatform === "元宝") {
-    const structured = await extractStructuredSearchResults(
-      page,
-      question,
-      crawlPlatform,
-      0,
-      EXTRACT_YUANBAO_REFERENCES_SCRIPT,
-      true
-    );
+    const structured = await extractYuanbaoReferenceList(page, question, crawlPlatform);
     if (structured.length > 0) return structured;
-    console.log("[元宝] 结构化引用来源未抽取到结果，回退通用链接抽取。");
+    console.log("[元宝] agent-dialogue-references__list 中没有解析出有效的 li 数据。");
+    return [];
   }
 
   const raw = await page.evaluate<RawReferenceCandidate[]>(EXTRACT_REFERENCES_SCRIPT);
@@ -573,6 +598,7 @@ export async function extractReferences(
       articlePlatform: preferDisplayedTitle ? platformFromReferenceTitle(title, normalized) : platformFromUrl(normalized),
       articleTime: extractDate(context),
       title,
+      summary: "",
       url: normalized,
       extractedAt: new Date().toISOString()
     });
@@ -592,6 +618,74 @@ export async function extractReferences(
     ...record,
     rank: index + 1
   }));
+}
+
+async function extractYuanbaoReferenceList(
+  page: Page,
+  question: string,
+  crawlPlatform: string
+): Promise<ReferenceRecord[]> {
+  const list = page.locator(".agent-dialogue-references__list:visible").last();
+  const listReady = await list.waitFor({ state: "visible", timeout: 10_000 })
+    .then(() => true)
+    .catch(() => false);
+  if (!listReady) {
+    console.log("[元宝] 没有找到可见的 agent-dialogue-references__list 主列表。");
+    return [];
+  }
+
+  const items = list.locator("li");
+  const [listClass, directChildCount, liCount] = await Promise.all([
+    list.getAttribute("class").catch(() => ""),
+    list.locator(":scope > *").count().catch(() => 0),
+    items.count().catch(() => 0)
+  ]);
+  console.log(
+    `[元宝] 主列表 class=${JSON.stringify(listClass || "")}` +
+    `，直接子节点=${directChildCount}，li=${liCount}`
+  );
+
+  const itemReady = await items.first().waitFor({ state: "attached", timeout: 10_000 })
+    .then(() => true)
+    .catch(() => false);
+  if (!itemReady) {
+    console.log("[元宝] 已找到主列表，但主列表下面没有 li。");
+    return [];
+  }
+
+  const raw = await page.evaluate<SearchResultCandidate[]>(EXTRACT_YUANBAO_REFERENCES_SCRIPT);
+
+  console.log(`[元宝] agent-dialogue-references__list 下读取到 ${raw.length} 个 li`);
+
+  const seen = new Set<string>();
+  const records = raw
+    .sort((a, b) => (a.referenceNumber || 0) - (b.referenceNumber || 0) || a.score - b.score)
+    .flatMap((item) => {
+      const url = normalizeUrl(unwrapUrl(item.href));
+      if (!item.title || isInternalUrl(url) || seen.has(url)) return [];
+      seen.add(url);
+      return [{
+        question,
+        crawlPlatform,
+        rank: seen.size,
+        articlePlatform: item.platform || platformFromUrl(url),
+        articleTime: item.articleTime,
+        title: cleanText(item.title),
+        summary: cleanText(item.summary || ""),
+        url,
+        extractedAt: new Date().toISOString()
+      }];
+    });
+
+  for (const record of records) {
+    console.log(
+      `[元宝][解析] ${record.rank}/${records.length}` +
+      ` | 来源=${record.articlePlatform}` +
+      ` | 标题=${record.title}` +
+      ` | URL=${record.url}`
+    );
+  }
+  return records;
 }
 
 async function extractStructuredSearchResults(
@@ -623,6 +717,7 @@ async function extractStructuredSearchResults(
       articlePlatform: item.platform || platformFromUrl(url),
       articleTime: item.articleTime || extractDate(item.contextText),
       title: cleanText(item.title),
+      summary: cleanText(item.summary || ""),
       url,
       extractedAt: new Date().toISOString()
     };
@@ -631,11 +726,11 @@ async function extractStructuredSearchResults(
 
 async function collectScrollableStructuredResults(page: Page, script: string): Promise<SearchResultCandidate[]> {
   const collected = new Map<string, SearchResultCandidate>();
-  await page.evaluate(RESET_QIANWEN_SOURCE_SCROLL_SCRIPT).catch(() => undefined);
+  await page.evaluate(RESET_SOURCE_PANEL_SCROLL_SCRIPT).catch(() => undefined);
   await page.waitForTimeout(250).catch(() => undefined);
 
   for (let i = 0; i < 12; i += 1) {
-    const batch = await page.evaluate<SearchResultCandidate[]>(script).catch(() => []);
+    const batch = await page.evaluate<SearchResultCandidate[]>(script);
     for (const item of batch) {
       const key = `${item.href}::${item.title}`;
       const existing = collected.get(key);
@@ -644,12 +739,15 @@ async function collectScrollableStructuredResults(page: Page, script: string): P
       }
     }
 
-    const moved = await page.evaluate<boolean>(SCROLL_QIANWEN_SOURCE_PANEL_SCRIPT).catch(() => false);
+    const moved = await page.evaluate<boolean>(SCROLL_SOURCE_PANEL_SCRIPT).catch(() => false);
     if (!moved) break;
     await page.waitForTimeout(350).catch(() => undefined);
   }
 
-  return Array.from(collected.values()).sort((a, b) => a.score - b.score);
+  return Array.from(collected.values()).sort((a, b) =>
+    (a.referenceNumber || Number.MAX_SAFE_INTEGER) - (b.referenceNumber || Number.MAX_SAFE_INTEGER) ||
+    a.score - b.score
+  );
 }
 
 function normalizeUrl(url: string): string {

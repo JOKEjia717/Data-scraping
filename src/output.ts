@@ -1,6 +1,6 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import type { ReferenceRecord } from "./types.js";
+import type { PlatformId, ReferenceRecord } from "./types.js";
 
 export async function writeOutputs(outDir: string, records: ReferenceRecord[]): Promise<void> {
   await fs.mkdir(outDir, { recursive: true });
@@ -11,6 +11,14 @@ export async function writeOutputs(outDir: string, records: ReferenceRecord[]): 
   await fs.writeFile(csvPath, toCsv(records), "utf8");
 }
 
+export async function writePlatformOutputs(
+  outDir: string,
+  platformId: PlatformId,
+  records: ReferenceRecord[]
+): Promise<void> {
+  await writeOutputs(path.join(outDir, platformId), records);
+}
+
 function toCsv(records: ReferenceRecord[]): string {
   const headers: Array<keyof ReferenceRecord> = [
     "question",
@@ -19,6 +27,7 @@ function toCsv(records: ReferenceRecord[]): string {
     "articlePlatform",
     "articleTime",
     "title",
+    "summary",
     "url",
     "extractedAt"
   ];

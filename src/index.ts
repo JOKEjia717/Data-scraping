@@ -2,7 +2,7 @@ import { DEFAULT_QUESTIONS } from "./questions.js";
 import { parseCli, readQuestionFile } from "./cli.js";
 import { PLATFORMS } from "./platforms.js";
 import { crawlPlatform } from "./crawler.js";
-import { writeOutputs } from "./output.js";
+import { writeOutputs, writePlatformOutputs } from "./output.js";
 import type { ReferenceRecord } from "./types.js";
 
 async function main(): Promise<void> {
@@ -15,16 +15,17 @@ async function main(): Promise<void> {
       PLATFORMS[platformId],
       { ...options, questions },
       async (partialRecords) => {
-        const others = allRecords.filter((record) => record.crawlPlatform !== PLATFORMS[platformId].name);
-        await writeOutputs(options.outDir, [...others, ...partialRecords]);
+        await writePlatformOutputs(options.outDir, platformId, partialRecords);
+        await writeOutputs(options.outDir, [...allRecords, ...partialRecords]);
       }
     );
 
     allRecords.push(...platformRecords);
+    await writePlatformOutputs(options.outDir, platformId, platformRecords);
     await writeOutputs(options.outDir, allRecords);
   }
 
-  console.log(`\n完成。结果已写入 ${options.outDir}/references.json 和 ${options.outDir}/references.csv`);
+  console.log(`\n完成。各平台数据已分别写入 ${options.outDir}/<平台>/，汇总数据位于 ${options.outDir}/references.json 和 ${options.outDir}/references.csv`);
   process.exit(0);
 }
 

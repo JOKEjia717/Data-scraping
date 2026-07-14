@@ -164,6 +164,9 @@ export const PLATFORMS: Record<PlatformId, PlatformConfig> = {
       "[title*='搜索']"
     ],
     referenceRevealSelectors: [
+      "text=\"源\"",
+      "span:text-is('源')",
+      "div:text-is('源')",
       "text=/引用来源\\s*\\(\\d+\\)/",
       "text=引用来源",
       "button:has-text('源')",

@@ -38,6 +38,8 @@ export interface SearchResultCandidate {
   platform: string;
   articleTime: string;
   title: string;
+  summary?: string;
+  referenceNumber?: number;
   contextText: string;
 }
 
@@ -48,6 +50,7 @@ export interface ReferenceRecord {
   articlePlatform: string;
   articleTime: string;
   title: string;
+  summary: string;
   url: string;
   extractedAt: string;
 }

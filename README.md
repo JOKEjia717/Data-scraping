@@ -7,9 +7,10 @@
 - 文章平台
 - 文章时间
 - 文章标题
+- 文章摘要
 - 文章 URL
 
-默认问题在 `src/questions.ts`，就是你给出的 8 个问题。
+默认问题在 `src/questions.ts`，当前是 8 个围绕字节跳动、抖音及短视频社交平台的问题。
 
 ## 安装
 
@@ -55,9 +56,20 @@ npm run crawl
 结果会输出到：
 
 ```text
-results/references.json
-results/references.csv
+results/
+├── doubao/references.json
+├── doubao/references.csv
+├── deepseek/references.json
+├── deepseek/references.csv
+├── qianwen/references.json
+├── qianwen/references.csv
+├── yuanbao/references.json
+├── yuanbao/references.csv
+├── references.json
+└── references.csv
 ```
+
+四个平台的数据分别保存在对应子目录中；根目录的两个 `references` 文件保留全部平台的汇总数据。抓取过程中每完成一道题都会同步更新对应平台文件，意外中断时也能保留已经获取的数据。
 
 ## 常用参数
 
@@ -117,4 +129,4 @@ npm run crawl -- --prompt-prefix="请联网搜索，并在回答中保留参考�
 
 ## 注意
 
-豆包、DeepSeek、千问和元宝都是动态网页，页面结构和反爬策略可能变化。这个程序采用的是通用 DOM 抽取策略：优先点开“联网搜索/参考/来源/引用”相关控件，再抓取可见文章链接和邻近文本里的标题、时间。若平台 UI 发生较大变化，可以在 `src/platforms.ts` 里补充选择器。
+豆包和 DeepSeek 采用通用或平台定制的 DOM 抽取。千问只遍历 `.list-XPxyL2` 容器的直接子组件；元宝先定位当前可见的 `.agent-dialogue-references__list` 主列表，再逐条读取主列表下的全部 `li`。两者都会将卡片拆分为来源平台、时间、标题、摘要和 URL，不会回退扫描整页链接。若平台 UI 发生较大变化，可以在 `src/platforms.ts` 或 `src/extractReferences.ts` 中更新选择器。
