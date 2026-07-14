@@ -1,0 +1,25 @@
+{
+  "name": "ai-reference-crawler",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "crawl": "tsx src/index.ts",
+    "crawl:doubao": "tsx src/index.ts --platforms=doubao",
+    "crawl:deepseek": "tsx src/index.ts --platforms=deepseek",
+    "crawl:qianwen": "tsx src/index.ts --platforms=qianwen",
+    "crawl:yuanbao": "tsx src/index.ts --platforms=yuanbao",
+    "check": "tsc --noEmit"
+  },
+  "dependencies": {
+    "playwright": "^1.45.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "tsx": "^4.16.0",
+    "typescript": "^5.5.0"
+  },
+  "allowScripts": {
+    "esbuild@0.28.1": true
+  }
+}
