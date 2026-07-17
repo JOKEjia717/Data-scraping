@@ -9,6 +9,7 @@
     "crawl:deepseek": "tsx src/index.ts --platforms=deepseek",
     "crawl:qianwen": "tsx src/index.ts --platforms=qianwen",
     "crawl:yuanbao": "tsx src/index.ts --platforms=yuanbao",
+    "test": "tsx --test tests/doubao-extraction.test.ts",
     "check": "tsc --noEmit"
   },
   "dependencies": {

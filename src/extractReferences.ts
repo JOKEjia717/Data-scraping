@@ -1,7 +1,6 @@
-import type { Page } from "playwright";
+import type { Locator, Page } from "playwright";
 import type { RawReferenceCandidate, ReferenceRecord, SearchResultCandidate } from "./types.js";
 import {
-  chooseDisplayedReferenceTitle,
   chooseTitle,
   cleanText,
   extractDate,
@@ -9,6 +8,37 @@ import {
   platformFromUrl,
   unwrapUrl
 } from "./text.js";
+
+const DOUBAO_SEARCH_BLOCK_SELECTOR = '[data-plugin-identifier*="search_query_result_block"]';
+const DOUBAO_REFERENCE_CONTAINER_SELECTOR =
+  '[class~="relative"][class~="mt-[-8px]"][class~="flex-col"]';
+const DEEPSEEK_REFERENCE_CONTAINER_SELECTOR = '[class~="_223dd7b"]';
+const QIANWEN_REFERENCE_TRIGGER_SELECTOR = '[class~="link-title-igf0OC"]';
+const QIANWEN_REFERENCE_LIST_SELECTOR = '[class~="list-XPxyL2"]';
+const QIANWEN_ANSWER_ACTION_SELECTOR =
+  '[class~="hover:bg-tag"][class~="flex"][class~="size-6"][class~="cursor-pointer"]' +
+  '[class~="items-center"][class~="justify-center"][class~="rounded"]' +
+  '[class~="transition-colors"][class~="duration-200"]';
+const YUANBAO_REFERENCE_TRIGGER_SELECTOR =
+  ".ToolbarSearchGuid_searchGuidTool__M81L2.Toolbar_icon__xGP8b";
+const YUANBAO_REFERENCE_LIST_SELECTOR = ".agent-dialogue-references__list";
+const YUANBAO_OPEN_REFERENCE_LIST_SELECTOR =
+  ".t-drawer--open .agent-dialogue-references__list";
+
+interface DoubaoReferenceListSnapshot {
+  found: boolean;
+  visible: boolean;
+  score: number;
+  containerClass: string;
+  directChildCount: number;
+  linkedChildCount: number;
+  expectedCount: number;
+  urls: string[];
+}
+
+interface DoubaoReferenceExtraction extends DoubaoReferenceListSnapshot {
+  items: SearchResultCandidate[];
+}
 
 const INTERNAL_HOST_PATTERNS = [
   /(^|\.)doubao\.com$/,
@@ -123,67 +153,114 @@ const EXTRACT_REFERENCES_SCRIPT = `
 const EXTRACT_DEEPSEEK_SEARCH_RESULTS_SCRIPT = `
 (() => {
   const clean = (text) => (text || "").replace(/\\s+/g, " ").trim();
-  const datePattern = /(?:19|20)\\d{2}[\\/-]\\d{1,2}[\\/-]\\d{1,2}/;
+  const datePattern = /(?:19|20)\\d{2}[年\\/.-]\\d{1,2}[月\\/.-]\\d{1,2}日?|\\d+\\s*(?:天|小时|分钟)前|今天|昨天/;
 
-  const scoreElement = (element) => {
+  const isVisible = (element) => {
+    if (!(element instanceof HTMLElement)) return false;
     const rect = element.getBoundingClientRect();
-    return Math.max((Number.isFinite(rect.top) ? rect.top : 0) + window.scrollY, 0);
+    const style = window.getComputedStyle(element);
+    return rect.width > 0 && rect.height > 0 && style.display !== "none" && style.visibility !== "hidden";
   };
 
-  const titleLineFrom = (text, metaLine) => {
-    const lines = text
-      .split(/[\\n\\r]+/)
-      .map(clean)
-      .filter(Boolean)
-      .filter((line) => line !== metaLine)
-      .filter((line) => !/^\\d+$/.test(line))
-      .filter((line) => !datePattern.test(line) || line.length > 18)
-      .filter((line) => line.length >= 8 && line.length <= 160);
-
-    return lines[0] || "";
+  const getAttr = (element, names) => {
+    if (!element) return "";
+    for (const name of names) {
+      const value = element.getAttribute(name);
+      if (value) return clean(value);
+    }
+    return "";
   };
 
-  const resultByKey = new Map();
+  const containers = Array.from(document.querySelectorAll('[class~="_223dd7b"]')).filter(isVisible);
+  const container = containers[containers.length - 1];
+  if (!container) return [];
 
-  for (const element of Array.from(document.querySelectorAll("div, li, article, section"))) {
-    const text = clean(element instanceof HTMLElement ? element.innerText : element.textContent || "");
-    if (!datePattern.test(text) || text.length < 20 || text.length > 900) continue;
+  // DeepSeek 的每条来源是 _223dd7b 的一个直接子节点。当前页面版本使用 div，
+  // 也兼容截图中出现的直接 a 子节点，避免因小版本 DOM 调整漏抓。
+  const cards = Array.from(container.children).filter((element) =>
+    element.matches("a[href], [data-url], [data-href]") ||
+    Boolean(element.querySelector("a[href], [data-url], [data-href]"))
+  );
+  const resultByUrl = new Map();
 
-    const links = Array.from(element.querySelectorAll("a[href]"))
-      .map((anchor) => ({
-        href: anchor.href,
-        text: clean(anchor.innerText || anchor.textContent || "")
-      }))
-      .filter((item) => item.href.startsWith("http://") || item.href.startsWith("https://"));
-    if (links.length === 0) continue;
+  for (const [domIndex, card] of cards.entries()) {
+    const urlNode = card.matches("a[href], [data-url], [data-href]")
+      ? card
+      : card.querySelector("a[href], [data-url], [data-href]");
+    const href = urlNode instanceof HTMLAnchorElement
+      ? urlNode.href
+      : getAttr(urlNode, ["href", "data-url", "data-href"]);
+    if (!/^https?:\\/\\//i.test(href)) continue;
 
-    const metaLine = text
-      .split(/[\\n\\r]+/)
-      .map(clean)
-      .find((line) => datePattern.test(line)) || "";
-
-    const date = metaLine.match(datePattern)?.[0] || text.match(datePattern)?.[0] || "";
-    const platform = clean(metaLine.split("|")[0] || links[0].text || "");
-    const title = titleLineFrom(text, metaLine);
+    const rawText = card instanceof HTMLElement ? card.innerText : card.textContent || "";
+    const text = clean(rawText);
+    const lines = rawText.split(/[\\n\\r]+/).map(clean).filter(Boolean);
+    const dateLineIndex = lines.findIndex((line) => datePattern.test(line));
+    const dateLine = dateLineIndex >= 0 ? lines[dateLineIndex] : "";
+    const explicitTitleNode = card.querySelector(
+      "[data-title], h1, h2, h3, h4, [class*='title'], [class*='Title']"
+    );
+    const explicitTitle = clean(
+      getAttr(explicitTitleNode, ["data-title", "title"]) || explicitTitleNode?.textContent || ""
+    );
+    const attributeTitle = clean(getAttr(urlNode, ["data-title", "title", "aria-label"]));
+    const lineAfterDate = dateLineIndex >= 0 ? clean(lines[dateLineIndex + 1] || "") : "";
+    const usableLines = lines.filter((line) =>
+      line.length >= 4 &&
+      line.length <= 180 &&
+      !datePattern.test(line) &&
+      !/^https?:\\/\\//i.test(line) &&
+      !/^\\[?\\d+\\]?$/.test(line) &&
+      !/^(打开|复制|分享|更多|参考|来源|引用|网页|搜索|查看|展开|收起)$/i.test(line)
+    );
+    const title = [explicitTitle, attributeTitle, lineAfterDate, ...usableLines].find(Boolean) || "";
     if (!title) continue;
 
-    const key = links[0].href + "::" + title;
+    const sourceNode = card.querySelector(
+      "[data-source], [data-source-name], [class*='source'], [class*='Source'], [class*='site'], [class*='media']"
+    );
+    const sourceFromNode = clean(
+      getAttr(sourceNode, ["data-source", "data-source-name"]) || sourceNode?.textContent || ""
+    );
+    const sourceFromDateLine = clean(dateLine.replace(datePattern, "").replace(/[|｜·\\s]+$/, ""));
+    const sourceFromPreviousLine = dateLineIndex > 0 ? lines[dateLineIndex - 1] : "";
+    const platform = [sourceFromNode, sourceFromDateLine, sourceFromPreviousLine]
+      .map(clean)
+      .find((value) => value && value !== title && value.length <= 80) || "";
+
+    const summaryNode = card.querySelector(
+      "[data-summary], p, [class*='summary'], [class*='Summary'], [class*='desc'], [class*='Desc']"
+    );
+    const explicitSummary = clean(
+      getAttr(summaryNode, ["data-summary"]) || summaryNode?.textContent || ""
+    );
+    const titleLineIndex = lines.findIndex((line) => clean(line) === title);
+    const summary = [explicitSummary, titleLineIndex >= 0 ? lines[titleLineIndex + 1] : ""]
+      .map(clean)
+      .find((value) => value && value !== title && !datePattern.test(value)) || "";
+    const referenceNumber = Number.parseInt(
+      getAttr(card, ["data-index", "data-idx", "data-rank"]) ||
+      text.match(/^\\s*\\[?(\\d+)\\]?/)?.[1] ||
+      "",
+      10
+    );
     const candidate = {
-      score: scoreElement(element),
-      href: links[0].href,
+      score: domIndex,
+      href,
       platform,
-      articleTime: date,
+      articleTime: dateLine.match(datePattern)?.[0] || text.match(datePattern)?.[0] || "",
       title,
+      summary,
+      referenceNumber: Number.isFinite(referenceNumber) ? referenceNumber : domIndex + 1,
       contextText: text
     };
 
-    const existing = resultByKey.get(key);
-    if (!existing || candidate.contextText.length < existing.contextText.length) {
-      resultByKey.set(key, candidate);
-    }
+    if (!resultByUrl.has(href)) resultByUrl.set(href, candidate);
   }
 
-  return Array.from(resultByKey.values()).sort((a, b) => a.score - b.score);
+  return Array.from(resultByUrl.values()).sort((a, b) =>
+    (a.referenceNumber || Number.MAX_SAFE_INTEGER) - (b.referenceNumber || Number.MAX_SAFE_INTEGER) || a.score - b.score
+  );
 })()
 `;
 
@@ -217,20 +294,34 @@ const EXTRACT_QIANWEN_SEARCH_RESULTS_SCRIPT = `
     return null;
   };
 
-  const list = document.querySelector('[class~="list-XPxyL2"]');
+  const isVisible = (element) => {
+    if (!(element instanceof HTMLElement)) return false;
+    const rect = element.getBoundingClientRect();
+    const style = window.getComputedStyle(element);
+    return rect.width > 0 && rect.height > 0 && style.display !== "none" && style.visibility !== "hidden";
+  };
+  const lists = Array.from(document.querySelectorAll('[class~="list-XPxyL2"]')).filter(isVisible);
+  const list = lists[lists.length - 1];
   if (!list) return [];
-  const cards = Array.from(list.children).filter((element) =>
-    element.matches('[data-exposure-extra], [data-click-extra]')
-  );
+  const cards = Array.from(list.querySelectorAll(":scope > div"));
 
   for (const element of cards) {
-    const data = parseJsonAttr(element);
-    if (!data) continue;
+    const telemetryNode = element.matches("[data-exposure-extra], [data-click-extra]")
+      ? element
+      : element.querySelector("[data-exposure-extra], [data-click-extra]");
+    const data = parseJsonAttr(telemetryNode || element) || {};
 
     const rawText = element instanceof HTMLElement ? element.innerText : element.textContent || "";
     const text = clean(rawText);
-    const title = clean(data.title || data.name || "");
-    const href = clean(data.url || data.ref_url || data.href || "");
+    const link = element.querySelector("a[href], [data-url], [data-href]");
+    const linkHref = link instanceof HTMLAnchorElement
+      ? link.href
+      : link?.getAttribute("data-url") || link?.getAttribute("data-href") || link?.getAttribute("href") || "";
+    const titleNode = element.querySelector("h1,h2,h3,h4,[data-title],[class*='title'],[class*='Title']");
+    const title = clean(
+      data.title || data.name || titleNode?.getAttribute("data-title") || titleNode?.textContent || link?.textContent || ""
+    ).replace(/^\\d+\\s*/, "");
+    const href = clean(data.url || data.ref_url || data.href || linkHref);
     if (!title || !href || (!href.startsWith("http://") && !href.startsWith("https://"))) continue;
 
     const referenceNumber = Number.parseInt(String(data.refer_num || ""), 10);
@@ -246,8 +337,17 @@ const EXTRACT_QIANWEN_SEARCH_RESULTS_SCRIPT = `
       const normalizedLine = line.replace(/^\\d+\\s*/, "");
       return value.length >= 2 && value.length <= 40 && normalizedLine !== title && !datePattern.test(line) && !/^\\d+$/.test(line);
     }) || "";
+    const sourceNode = element.querySelector(
+      "[data-source], [data-source-name], [class*='source-name'], [class*='sourceName'], [class*='source_txt']"
+    );
+    const explicitSource = clean(
+      sourceNode?.getAttribute("data-source") ||
+      sourceNode?.getAttribute("data-source-name") ||
+      sourceNode?.textContent ||
+      ""
+    );
     const platform = clean(
-      (data.source || data.source_name || data.site || data.media || metaLine)
+      (data.source || data.source_name || data.site || data.media || explicitSource || metaLine)
         .replace(domainPattern, "")
         .replace(/[|｜]/g, " ")
         .trim()
@@ -301,6 +401,7 @@ const EXTRACT_YUANBAO_REFERENCES_SCRIPT = `
   };
 
   const resultByKey = new Map();
+  const openList = document.querySelector(".t-drawer--open .agent-dialogue-references__list");
   const lists = Array.from(document.querySelectorAll(".agent-dialogue-references__list"))
     .filter((element) => {
       if (!(element instanceof HTMLElement)) return false;
@@ -308,15 +409,15 @@ const EXTRACT_YUANBAO_REFERENCES_SCRIPT = `
       const style = window.getComputedStyle(element);
       return rect.width > 0 && rect.height > 0 && style.display !== "none" && style.visibility !== "hidden";
     });
-  const list = lists[lists.length - 1];
+  const list = openList || lists[lists.length - 1];
   if (!list) return [];
 
-  const candidates = Array.from(list.querySelectorAll("li"));
+  const candidates = Array.from(list.querySelectorAll(":scope > li"));
 
   for (const [domIndex, element] of candidates.entries()) {
     const rawText = element instanceof HTMLElement ? element.innerText : element.textContent || "";
     const text = clean(rawText);
-    const card = element.querySelector("[data-url]");
+    const card = element.querySelector(".hyc-common-markdown__ref_card[data-url], [data-url]");
     const url =
       getAttr(card, ["data-url", "href"]) ||
       getAttr(element, ["dt-ext6", "dt-url", "data-url", "href"]);
@@ -364,9 +465,589 @@ const EXTRACT_YUANBAO_REFERENCES_SCRIPT = `
 })()
 `;
 
+async function evaluateDoubaoReferenceList(
+  page: Page,
+  minBlockIndex: number,
+  includeItems: boolean,
+  currentQuestion = ""
+): Promise<DoubaoReferenceExtraction> {
+  const emptyResult: DoubaoReferenceExtraction = {
+    found: false,
+    visible: false,
+    score: 0,
+    containerClass: "",
+    directChildCount: 0,
+    linkedChildCount: 0,
+    expectedCount: 0,
+    urls: [],
+    items: []
+  };
+  const allBlocks = await page.locator(DOUBAO_SEARCH_BLOCK_SELECTOR).all().catch(() => []);
+  let firstBlockIndex = Math.max(minBlockIndex, 0);
+  if (firstBlockIndex >= allBlocks.length && allBlocks.length > 0 && currentQuestion) {
+    const bodyText = await page.locator("body").innerText({ timeout: 3_000 }).catch(() => "");
+    const questionIndex = bodyText.lastIndexOf(currentQuestion);
+    const currentAnswerText = questionIndex >= 0 ? bodyText.slice(questionIndex + currentQuestion.length) : "";
+    const currentAnswerHasReferences = /搜索\s*\d+\s*个关键词，\s*参考\s*\d+\s*篇资料/.test(currentAnswerText);
+    if (currentAnswerHasReferences) {
+      // 豆包长会话会移除最早回答并复用列表长度；当前回答通常对应末尾的“结果块 + 空占位块”。
+      firstBlockIndex = Math.max(allBlocks.length - 2, 0);
+    }
+  }
+  const blocks = allBlocks.slice(firstBlockIndex);
+  const candidates: Array<{
+    block: Locator;
+    blockIndex: number;
+    container: Locator;
+    containerIndex: number;
+    directChildren: Locator[];
+    linkedChildCount: number;
+    structuralWeight: number;
+    score: number;
+  }> = [];
+
+  for (const [relativeBlockIndex, block] of blocks.entries()) {
+    const blockIndex = firstBlockIndex + relativeBlockIndex;
+    const containers = await block.locator(DOUBAO_REFERENCE_CONTAINER_SELECTOR).all().catch(() => []);
+    for (const [containerIndex, container] of containers.entries()) {
+      const visible = await container.isVisible().catch(() => false);
+      if (!visible) continue;
+
+      const score = await container.evaluate((element) => {
+        const rect = element.getBoundingClientRect();
+        return Math.max((Number.isFinite(rect.top) ? rect.top : 0) + window.scrollY, 0);
+      }).catch(() => 0);
+      const directChildren = await container.locator(":scope > div").all().catch(() => []);
+      if (directChildren.length === 0) continue;
+
+      let linkedChildCount = 0;
+      for (const child of directChildren) {
+        if (await hasDoubaoUrlNode(child)) linkedChildCount += 1;
+      }
+      if (linkedChildCount === 0) continue;
+
+      const containerClass = await container.getAttribute("class").catch(() => "") || "";
+      const classTokens = new Set(containerClass.split(/\s+/).filter(Boolean));
+      const structuralWeight = ["flex", "w-full", "min-w-0"]
+        .filter((token) => classTokens.has(token)).length;
+      candidates.push({
+        block,
+        blockIndex,
+        container,
+        containerIndex,
+        directChildren,
+        linkedChildCount,
+        structuralWeight,
+        score
+      });
+    }
+  }
+
+  candidates.sort((a, b) =>
+    a.blockIndex - b.blockIndex ||
+    a.structuralWeight - b.structuralWeight ||
+    a.containerIndex - b.containerIndex
+  );
+  const selected = candidates[candidates.length - 1];
+  if (!selected) return emptyResult;
+
+  const blockText = cleanText(await selected.block.innerText().catch(() => ""));
+  const expectedCount = Number.parseInt(blockText.match(/参考\s*(\d+)\s*篇资料/)?.[1] || "", 10);
+  const cardData: SearchResultCandidate[] = [];
+
+  for (const [domIndex, child] of selected.directChildren.entries()) {
+    const urlEntry = await findDoubaoUrlNode(child);
+    if (!urlEntry) continue;
+
+    const childText = cleanText(await child.innerText().catch(() => ""));
+    const titleNode = child.locator(
+      "[data-title], h1, h2, h3, h4, [class*='title'], [class*='Title']"
+    ).first();
+    const titleNodeExists = await titleNode.count().catch(() => 0) > 0;
+    const [linkText, titleAttr, ariaLabel, linkDataTitle, titleNodeText, titleNodeDataTitle] = await Promise.all([
+      urlEntry.node.innerText().catch(() => ""),
+      urlEntry.node.getAttribute("title").catch(() => null),
+      urlEntry.node.getAttribute("aria-label").catch(() => null),
+      urlEntry.node.getAttribute("data-title").catch(() => null),
+      titleNodeExists ? titleNode.innerText().catch(() => "") : Promise.resolve(""),
+      titleNodeExists ? titleNode.getAttribute("data-title").catch(() => null) : Promise.resolve(null)
+    ]);
+    const title = [linkText, titleAttr, ariaLabel, linkDataTitle, titleNodeText, titleNodeDataTitle, childText]
+      .map((value) => cleanText(value || ""))
+      .find(Boolean)
+      ?.replace(/^(?:\[?\d+\]?\s*[.、):：-]\s*|第\s*\d+\s*条\s*)/, "") || "";
+
+    const sourceNode = child.locator(
+      "[data-source], [data-source-name], [class*='source'], [class*='Source']"
+    ).first();
+    const sourceNodeExists = await sourceNode.count().catch(() => 0) > 0;
+    const sourceText = sourceNodeExists ? await sourceNode.innerText().catch(() => "") : "";
+    const platformCandidate = cleanText(
+      await urlEntry.node.getAttribute("data-source").catch(() => null) ||
+      await child.getAttribute("data-source").catch(() => null) ||
+      await child.getAttribute("data-source-name").catch(() => null) ||
+      sourceText
+    );
+
+    const summaryNode = child.locator(
+      "[data-summary], p, [class*='summary'], [class*='Summary'], [class*='desc'], [class*='Desc']"
+    ).first();
+    const summaryNodeExists = await summaryNode.count().catch(() => 0) > 0;
+    const summaryCandidate = summaryNodeExists
+      ? cleanText(
+          await summaryNode.getAttribute("data-summary").catch(() => null) ||
+          await summaryNode.innerText().catch(() => "")
+        )
+      : "";
+
+    cardData.push({
+      score: selected.score + domIndex / 1000,
+      href: urlEntry.href,
+      platform: platformCandidate.length <= 80 ? platformCandidate : "",
+      articleTime: "",
+      title,
+      summary: summaryCandidate && summaryCandidate !== title ? summaryCandidate : "",
+      referenceNumber: domIndex + 1,
+      contextText: childText
+    });
+  }
+
+  return {
+    found: true,
+    visible: true,
+    score: selected.score,
+    containerClass: await selected.container.getAttribute("class").catch(() => "") || "",
+    directChildCount: selected.directChildren.length,
+    linkedChildCount: cardData.length,
+    expectedCount: Number.isFinite(expectedCount) ? expectedCount : 0,
+    urls: cardData.map((item) => item.href),
+    items: includeItems ? cardData : []
+  };
+}
+
+async function hasDoubaoUrlNode(child: Locator): Promise<boolean> {
+  const ownValues = await Promise.all([
+    child.getAttribute("href").catch(() => null),
+    child.getAttribute("data-url").catch(() => null),
+    child.getAttribute("data-href").catch(() => null)
+  ]);
+  if (ownValues.some((value) => Boolean(value))) return true;
+  return await child.locator("a[href], [data-url], [data-href]").count().catch(() => 0) > 0;
+}
+
+async function findDoubaoUrlNode(child: Locator): Promise<{ node: Locator; href: string } | null> {
+  const nodes = [child, ...await child.locator("a[href], [data-url], [data-href]").all().catch(() => [])];
+  for (const node of nodes) {
+    const href = await node.evaluate((element) => {
+      const values = [
+        element instanceof HTMLAnchorElement ? element.href : "",
+        element.getAttribute("href") || "",
+        element.getAttribute("data-url") || "",
+        element.getAttribute("data-href") || ""
+      ];
+      return values.find((value) => /^https?:\/\//i.test(value)) || "";
+    }).catch(() => "");
+    if (href) return { node, href };
+  }
+  return null;
+}
+
+export async function revealLatestDoubaoReferenceList(
+  page: Page,
+  selectors: string[],
+  minBlockIndex: number,
+  currentQuestion = ""
+): Promise<boolean> {
+  const revealStartedAt = Date.now();
+  while (Date.now() - revealStartedAt < 30_000) {
+    const existing = await evaluateDoubaoReferenceList(
+      page,
+      minBlockIndex,
+      false,
+      currentQuestion
+    ).catch(() => null);
+    if (existing?.found && existing.visible && existing.linkedChildCount > 0) return true;
+
+    const allBlocks = await page.locator(DOUBAO_SEARCH_BLOCK_SELECTOR).all().catch(() => []);
+    let firstBlockIndex = Math.max(minBlockIndex, 0);
+    if (firstBlockIndex >= allBlocks.length && allBlocks.length > 0 && currentQuestion) {
+      const bodyText = await page.locator("body").innerText({ timeout: 3_000 }).catch(() => "");
+      const questionIndex = bodyText.lastIndexOf(currentQuestion);
+      const currentAnswerText = questionIndex >= 0 ? bodyText.slice(questionIndex + currentQuestion.length) : "";
+      if (/搜索\s*\d+\s*个关键词，\s*参考\s*\d+\s*篇资料/.test(currentAnswerText)) {
+        firstBlockIndex = Math.max(allBlocks.length - 2, 0);
+      }
+    }
+    const currentBlocks = allBlocks.slice(firstBlockIndex);
+    const candidates: Array<{ locator: Locator; blockIndex: number; priority: number; area: number }> = [];
+
+    for (const [blockIndex, block] of currentBlocks.entries()) {
+      const scopedSelectors = [
+        "[class~='cursor-pointer']:has-text('参考')",
+        ...selectors
+      ];
+      for (const [priority, selector] of scopedSelectors.entries()) {
+        const locators = await block.locator(selector).all().catch(() => []);
+        for (const locator of locators.slice(-12)) {
+          const text = cleanText(await locator.innerText().catch(() => ""));
+          if (!/参考\s*\d+\s*篇资料/.test(text)) continue;
+          const [visible, enabled, box] = await Promise.all([
+            locator.isVisible().catch(() => false),
+            locator.isEnabled().catch(() => false),
+            locator.boundingBox().catch(() => null)
+          ]);
+          if (!visible || !enabled || !box || box.height > 140) continue;
+          candidates.push({ locator, blockIndex, priority, area: box.width * box.height });
+        }
+      }
+    }
+
+    candidates.sort((a, b) =>
+      b.blockIndex - a.blockIndex ||
+      a.priority - b.priority ||
+      a.area - b.area
+    );
+    const latest = candidates[0];
+    if (!latest) {
+      await page.waitForTimeout(250);
+      continue;
+    }
+
+    await latest.locator.scrollIntoViewIfNeeded({ timeout: 5_000 }).catch(() => undefined);
+    const clicked = await latest.locator.click({ timeout: 5_000 }).then(() => true).catch(() => false);
+    if (!clicked) {
+      await page.waitForTimeout(250);
+      continue;
+    }
+
+    const openedStartedAt = Date.now();
+    while (Date.now() - openedStartedAt < 15_000) {
+      const snapshot = await evaluateDoubaoReferenceList(
+        page,
+        minBlockIndex,
+        false,
+        currentQuestion
+      ).catch(() => null);
+      if (snapshot?.found && snapshot.visible && snapshot.linkedChildCount > 0) return true;
+      await page.waitForTimeout(250);
+    }
+    return false;
+  }
+
+  return false;
+}
+
+export async function waitForDoubaoReferenceListStable(
+  page: Page,
+  minBlockIndex: number,
+  timeoutMs: number,
+  currentQuestion = ""
+): Promise<boolean> {
+  const startedAt = Date.now();
+  let lastSignature = "";
+  let stableSince = Date.now();
+
+  while (Date.now() - startedAt < timeoutMs) {
+    const snapshot = await evaluateDoubaoReferenceList(
+      page,
+      minBlockIndex,
+      false,
+      currentQuestion
+    ).catch(() => null);
+    if (!snapshot?.found || !snapshot.visible || snapshot.linkedChildCount === 0) {
+      lastSignature = "";
+      stableSince = Date.now();
+      await page.waitForTimeout(250);
+      continue;
+    }
+
+    const signature = [
+      snapshot.directChildCount,
+      snapshot.linkedChildCount,
+      ...snapshot.urls
+    ].join("\n");
+    if (signature !== lastSignature) {
+      lastSignature = signature;
+      stableSince = Date.now();
+    }
+
+    const stableFor = Date.now() - stableSince;
+    const reachedExpectedCount = snapshot.expectedCount > 0 && snapshot.linkedChildCount >= snapshot.expectedCount;
+    if ((reachedExpectedCount && stableFor >= 1_000) || stableFor >= 2_500) return true;
+    await page.waitForTimeout(250);
+  }
+
+  return false;
+}
+
+export async function waitForDeepSeekReferenceListStable(
+  page: Page,
+  timeoutMs: number,
+  expectedCount = 0
+): Promise<boolean> {
+  const startedAt = Date.now();
+  let lastSignature = "";
+  let stableSince = Date.now();
+
+  while (Date.now() - startedAt < timeoutMs) {
+    const signature = await page.evaluate<string>(`
+(() => {
+  const isVisible = (element) => {
+    if (!(element instanceof HTMLElement)) return false;
+    const rect = element.getBoundingClientRect();
+    const style = window.getComputedStyle(element);
+    return rect.width > 0 && rect.height > 0 && style.display !== "none" && style.visibility !== "hidden";
+  };
+  const containers = Array.from(document.querySelectorAll('[class~="_223dd7b"]')).filter(isVisible);
+  const container = containers[containers.length - 1];
+  if (!container) return "";
+  const urls = Array.from(container.querySelectorAll("a[href], [data-url], [data-href]"))
+    .map((element) => element instanceof HTMLAnchorElement
+      ? element.href
+      : element.getAttribute("data-url") || element.getAttribute("data-href") || element.getAttribute("href") || ""
+    )
+    .filter((value) => /^https?:\\/\\//i.test(value));
+  if (urls.length === 0) return "";
+  return [container.children.length, urls.length, ...urls].join("\\n");
+})()
+`).catch(() => "");
+
+    if (!signature) {
+      lastSignature = "";
+      stableSince = Date.now();
+      await page.waitForTimeout(250);
+      continue;
+    }
+    if (signature !== lastSignature) {
+      lastSignature = signature;
+      stableSince = Date.now();
+    } else {
+      const linkedCount = Number.parseInt(signature.split("\n")[1] || "", 10);
+      const stableFor = Date.now() - stableSince;
+      if ((expectedCount > 0 && linkedCount >= expectedCount && stableFor >= 1_000) || stableFor >= 2_500) {
+        return true;
+      }
+    }
+    await page.waitForTimeout(250);
+  }
+
+  return false;
+}
+
+interface QianwenReferenceListSnapshot {
+  found: boolean;
+  directChildCount: number;
+  linkedChildCount: number;
+  urls: string[];
+}
+
+async function snapshotQianwenReferenceList(page: Page): Promise<QianwenReferenceListSnapshot> {
+  const lists = page.locator(`${QIANWEN_REFERENCE_LIST_SELECTOR}:visible`);
+  const count = await lists.count().catch(() => 0);
+  if (count === 0) return { found: false, directChildCount: 0, linkedChildCount: 0, urls: [] };
+
+  const list = lists.last();
+  const data = await list.locator(":scope > div").evaluateAll((elements) => {
+    const urls: string[] = [];
+    for (const element of elements) {
+      const telemetryNode = element.matches("[data-exposure-extra], [data-click-extra]")
+        ? element
+        : element.querySelector("[data-exposure-extra], [data-click-extra]");
+      let telemetryUrl = "";
+      for (const attr of ["data-exposure-extra", "data-click-extra"]) {
+        const value = telemetryNode?.getAttribute(attr);
+        if (!value) continue;
+        try {
+          const parsed = JSON.parse(value) as { url?: string; ref_url?: string; href?: string };
+          telemetryUrl = parsed.url || parsed.ref_url || parsed.href || "";
+        } catch {
+          // Attribute parsing falls back to link/data attributes below.
+        }
+        if (telemetryUrl) break;
+      }
+      const link = element.querySelector("a[href], [data-url], [data-href]");
+      const linkUrl = link instanceof HTMLAnchorElement
+        ? link.href
+        : link?.getAttribute("data-url") || link?.getAttribute("data-href") || link?.getAttribute("href") || "";
+      const url = telemetryUrl || linkUrl;
+      if (/^https?:\/\//i.test(url)) urls.push(url);
+    }
+    return { directChildCount: elements.length, urls };
+  }).catch(() => ({ directChildCount: 0, urls: [] as string[] }));
+
+  return {
+    found: data.directChildCount > 0,
+    directChildCount: data.directChildCount,
+    linkedChildCount: data.urls.length,
+    urls: data.urls
+  };
+}
+
+export async function countQianwenReferenceTriggers(page: Page): Promise<number> {
+  return page.locator(QIANWEN_REFERENCE_TRIGGER_SELECTOR).count().catch(() => 0);
+}
+
+export async function clickLatestQianwenRegenerate(page: Page): Promise<boolean> {
+  const actions = await page.locator(QIANWEN_ANSWER_ACTION_SELECTOR).all().catch(() => []);
+  for (const action of actions.slice().reverse()) {
+    const isRegenerate = await action.evaluate((element) =>
+      Boolean(element.querySelector('clipPath[id^="reg_svg__"], clippath[id^="reg_svg__"]'))
+    ).catch(() => false);
+    if (!isRegenerate) continue;
+
+    const [visible, enabled] = await Promise.all([
+      action.isVisible().catch(() => false),
+      action.isEnabled().catch(() => false)
+    ]);
+    if (!visible || !enabled) continue;
+
+    await action.scrollIntoViewIfNeeded({ timeout: 5_000 }).catch(() => undefined);
+    return action.click({ timeout: 5_000 }).then(() => true).catch(() => false);
+  }
+  return false;
+}
+
+export async function revealLatestQianwenReferenceList(
+  page: Page,
+  baselineTriggerCount: number,
+  timeoutMs = 30_000
+): Promise<number> {
+  const startedAt = Date.now();
+
+  while (Date.now() - startedAt < timeoutMs) {
+    const triggers = await page.locator(QIANWEN_REFERENCE_TRIGGER_SELECTOR).all().catch(() => []);
+    const freshTriggers = triggers.slice(Math.min(baselineTriggerCount, triggers.length));
+
+    for (const trigger of freshTriggers.slice().reverse()) {
+      const [visible, enabled, text] = await Promise.all([
+        trigger.isVisible().catch(() => false),
+        trigger.isEnabled().catch(() => false),
+        trigger.innerText().catch(() => "")
+      ]);
+      if (!visible || !enabled) continue;
+
+      await trigger.scrollIntoViewIfNeeded({ timeout: 5_000 }).catch(() => undefined);
+      const clicked = await trigger.click({ timeout: 5_000 }).then(() => true).catch(() => false);
+      if (!clicked) continue;
+
+      const listReady = await page.locator(`${QIANWEN_REFERENCE_LIST_SELECTOR}:visible`)
+        .last()
+        .locator(":scope > div")
+        .first()
+        .waitFor({ state: "attached", timeout: 10_000 })
+        .then(() => true)
+        .catch(() => false);
+      if (!listReady) continue;
+
+      const expectedCount = Number.parseInt(text.match(/(\d+)/)?.[1] || "", 10);
+      if (Number.isFinite(expectedCount) && expectedCount > 0) return expectedCount;
+      const snapshot = await snapshotQianwenReferenceList(page);
+      return Math.max(snapshot.linkedChildCount, 1);
+    }
+
+    await page.waitForTimeout(250);
+  }
+
+  return 0;
+}
+
+export async function waitForQianwenReferenceListStable(
+  page: Page,
+  timeoutMs: number,
+  expectedCount = 0
+): Promise<boolean> {
+  const startedAt = Date.now();
+  let lastSignature = "";
+  let stableSince = Date.now();
+
+  while (Date.now() - startedAt < timeoutMs) {
+    const snapshot = await snapshotQianwenReferenceList(page);
+    if (!snapshot.found || snapshot.linkedChildCount === 0) {
+      lastSignature = "";
+      stableSince = Date.now();
+      await page.waitForTimeout(250);
+      continue;
+    }
+
+    const signature = [snapshot.directChildCount, snapshot.linkedChildCount, ...snapshot.urls].join("\n");
+    if (signature !== lastSignature) {
+      lastSignature = signature;
+      stableSince = Date.now();
+    } else {
+      const stableFor = Date.now() - stableSince;
+      const reachedExpectedCount = expectedCount > 0 && snapshot.linkedChildCount >= expectedCount;
+      if ((reachedExpectedCount && stableFor >= 1_000) || stableFor >= 2_500) return true;
+    }
+
+    await page.waitForTimeout(250);
+  }
+
+  return false;
+}
+
+export async function revealLatestDeepSeekReferenceList(
+  page: Page,
+  timeoutMs = 30_000
+): Promise<number> {
+  const startedAt = Date.now();
+
+  while (Date.now() - startedAt < timeoutMs) {
+    const buttons = await page.locator('[class~="f93f59e4"]').all().catch(() => []);
+    const candidates: Array<{ locator: Locator; expectedCount: number; y: number; domIndex: number }> = [];
+
+    for (const [domIndex, locator] of buttons.entries()) {
+      const text = cleanText(await locator.innerText().catch(() => ""));
+      const expectedCount = Number.parseInt(text.match(/^(\d+)\s*个网页$/)?.[1] || "", 10);
+      if (!Number.isFinite(expectedCount) || expectedCount <= 0) continue;
+
+      const [visible, box] = await Promise.all([
+        locator.isVisible().catch(() => false),
+        locator.boundingBox().catch(() => null)
+      ]);
+      if (!visible || !box) continue;
+      candidates.push({ locator, expectedCount, y: box.y + box.height, domIndex });
+    }
+
+    candidates.sort((a, b) => b.y - a.y || b.domIndex - a.domIndex);
+    const latest = candidates[0];
+    if (!latest) {
+      await page.waitForTimeout(250);
+      continue;
+    }
+
+    await latest.locator.scrollIntoViewIfNeeded({ timeout: 5_000 }).catch(() => undefined);
+    const clicked = await latest.locator.click({ timeout: 5_000 }).then(() => true).catch(() => false);
+    if (!clicked) {
+      await page.waitForTimeout(250);
+      continue;
+    }
+
+    console.log(`[DeepSeek] 已点击最新回答的 ${latest.expectedCount}个网页（class=f93f59e4），等待引用列表打开`);
+    await page.waitForTimeout(750);
+    const remainingMs = Math.max(timeoutMs - (Date.now() - startedAt), 250);
+    const panelReady = await page
+      .locator(`${DEEPSEEK_REFERENCE_CONTAINER_SELECTOR}:visible`)
+      .last()
+      .locator("a[href], [data-url], [data-href]")
+      .first()
+      .waitFor({ state: "attached", timeout: Math.min(5_000, remainingMs) })
+      .then(() => true)
+      .catch(() => false);
+    if (panelReady) return latest.expectedCount;
+  }
+
+  return 0;
+}
+
 const RESET_SOURCE_PANEL_SCROLL_SCRIPT = `
 (() => {
-  const qianwenList = document.querySelector('[class~="list-XPxyL2"]');
+  const visibleQianwenLists = Array.from(document.querySelectorAll('[class~="list-XPxyL2"]')).filter((element) => {
+    if (!(element instanceof HTMLElement)) return false;
+    const rect = element.getBoundingClientRect();
+    const style = window.getComputedStyle(element);
+    return rect.width > 0 && rect.height > 0 && style.display !== "none" && style.visibility !== "hidden";
+  });
+  const qianwenList = visibleQianwenLists[visibleQianwenLists.length - 1];
   if (qianwenList) {
     qianwenList.scrollTop = 0;
     return;
@@ -391,7 +1072,13 @@ const RESET_SOURCE_PANEL_SCROLL_SCRIPT = `
 
 const SCROLL_SOURCE_PANEL_SCRIPT = `
 (() => {
-  const qianwenList = document.querySelector('[class~="list-XPxyL2"]');
+  const visibleQianwenLists = Array.from(document.querySelectorAll('[class~="list-XPxyL2"]')).filter((element) => {
+    if (!(element instanceof HTMLElement)) return false;
+    const rect = element.getBoundingClientRect();
+    const style = window.getComputedStyle(element);
+    return rect.width > 0 && rect.height > 0 && style.display !== "none" && style.visibility !== "hidden";
+  });
+  const qianwenList = visibleQianwenLists[visibleQianwenLists.length - 1];
   if (qianwenList) {
     const before = qianwenList.scrollTop;
     qianwenList.scrollTop = Math.min(
@@ -451,14 +1138,126 @@ export async function revealReferencePanels(page: Page, selectors: string[]): Pr
   }
 }
 
-export async function revealLatestReferencePanel(
+export async function countYuanbaoReferenceTriggers(page: Page): Promise<number> {
+  return page.locator(YUANBAO_REFERENCE_TRIGGER_SELECTOR).count().catch(() => 0);
+}
+
+export async function revealLatestYuanbaoReferenceList(
   page: Page,
-  selectors: string[],
-  expectedPanelSelector?: string
+  baselineTriggerCount: number,
+  timeoutMs = 30_000
 ): Promise<boolean> {
   const startedAt = Date.now();
 
-  while (Date.now() - startedAt < 12_000) {
+  while (Date.now() - startedAt < timeoutMs) {
+    const triggers = await page.locator(YUANBAO_REFERENCE_TRIGGER_SELECTOR).all().catch(() => []);
+    const newTriggers = triggers.slice(Math.max(baselineTriggerCount, 0));
+    for (const [offset, trigger] of Array.from(newTriggers.entries()).reverse()) {
+      const [visible, enabled] = await Promise.all([
+        trigger.isVisible().catch(() => false),
+        trigger.isEnabled().catch(() => false)
+      ]);
+      if (!visible || !enabled) continue;
+
+      await trigger.scrollIntoViewIfNeeded({ timeout: 5_000 }).catch(() => undefined);
+      const clicked = await trigger.click({ timeout: 5_000 }).then(() => true).catch(() => false);
+      if (!clicked) continue;
+
+      const triggerIndex = baselineTriggerCount + offset;
+      console.log(
+        `[元宝] 已点击本轮新增参考入口 ${triggerIndex + 1}/${triggers.length}` +
+        `（class="ToolbarSearchGuid_searchGuidTool__M81L2 Toolbar_icon__xGP8b"）`
+      );
+
+      const drawerItem = page
+        .locator(YUANBAO_OPEN_REFERENCE_LIST_SELECTOR)
+        .last()
+        .locator(":scope > li")
+        .first();
+      let opened = await drawerItem.waitFor({ state: "attached", timeout: 10_000 })
+        .then(() => true)
+        .catch(() => false);
+      // 测试夹具或页面旧版本可能没有 t-drawer--open，保留可见列表兼容路径。
+      const hasDrawerShell = await page.locator(".t-drawer").count().catch(() => 0) > 0;
+      if (!opened && !hasDrawerShell) {
+        opened = await page
+          .locator(`${YUANBAO_REFERENCE_LIST_SELECTOR}:visible`)
+          .last()
+          .locator(":scope > li")
+          .first()
+          .waitFor({ state: "attached", timeout: 2_000 })
+          .then(() => true)
+          .catch(() => false);
+      }
+      if (opened) return true;
+    }
+
+    await page.waitForTimeout(250);
+  }
+
+  return false;
+}
+
+export async function waitForYuanbaoReferenceListStable(
+  page: Page,
+  timeoutMs = 15_000
+): Promise<boolean> {
+  const startedAt = Date.now();
+  let lastSignature = "";
+  let stableSince = Date.now();
+
+  while (Date.now() - startedAt < timeoutMs) {
+    const openLists = page.locator(YUANBAO_OPEN_REFERENCE_LIST_SELECTOR);
+    const openListCount = await openLists.count().catch(() => 0);
+    const hasDrawerShell = await page.locator(".t-drawer").count().catch(() => 0) > 0;
+    const list = openListCount > 0
+      ? openLists.last()
+      : hasDrawerShell
+        ? page.locator(".__yuanbao_reference_list_not_open__")
+        : page.locator(`${YUANBAO_REFERENCE_LIST_SELECTOR}:visible`).last();
+    const items = list.locator(":scope > li");
+    const count = await items.count().catch(() => 0);
+    if (count === 0) {
+      lastSignature = "";
+      stableSince = Date.now();
+      await page.waitForTimeout(250);
+      continue;
+    }
+
+    const signatures: string[] = [];
+    for (let index = 0; index < count; index += 1) {
+      const item = items.nth(index);
+      const card = item.locator(".hyc-common-markdown__ref_card[data-url], [data-url]").first();
+      const [url, title] = await Promise.all([
+        card.getAttribute("data-url").catch(() => null),
+        item.locator(".hyc-common-markdown__ref_card-title, h4").first().innerText().catch(() => "")
+      ]);
+      signatures.push(`${index}:${url || ""}:${cleanText(title)}`);
+    }
+
+    const signature = `${count}\n${signatures.join("\n")}`;
+    if (signature !== lastSignature) {
+      lastSignature = signature;
+      stableSince = Date.now();
+    } else if (Date.now() - stableSince >= 1_000) {
+      return true;
+    }
+
+    await page.waitForTimeout(250);
+  }
+
+  return false;
+}
+
+export async function revealLatestReferencePanel(
+  page: Page,
+  selectors: string[],
+  expectedPanelSelector?: string,
+  timeoutMs = 12_000
+): Promise<boolean> {
+  const startedAt = Date.now();
+
+  while (Date.now() - startedAt < timeoutMs) {
     const candidates: Array<{ locator: import("playwright").Locator; y: number; area: number }> = [];
 
     for (const selector of selectors) {
@@ -537,23 +1336,25 @@ export async function countReferenceRevealButtons(page: Page, selectors: string[
   return page.locator(selectors.join(", ")).count().catch(() => 0);
 }
 
+export async function countDoubaoSearchResultBlocks(page: Page): Promise<number> {
+  return page.locator(DOUBAO_SEARCH_BLOCK_SELECTOR).count().catch(() => 0);
+}
+
+export async function countDeepSeekReferenceContainers(page: Page): Promise<number> {
+  return page.locator(DEEPSEEK_REFERENCE_CONTAINER_SELECTOR).count().catch(() => 0);
+}
+
 export async function extractReferences(
   page: Page,
   question: string,
   crawlPlatform: string,
   minScore = 0
 ): Promise<ReferenceRecord[]> {
-  const preferDisplayedTitle = crawlPlatform === "豆包";
+  if (crawlPlatform === "豆包") {
+    return extractDoubaoReferenceList(page, question, crawlPlatform, minScore);
+  }
   if (crawlPlatform === "DeepSeek") {
-    const structured = await extractStructuredSearchResults(
-      page,
-      question,
-      crawlPlatform,
-      minScore,
-      EXTRACT_DEEPSEEK_SEARCH_RESULTS_SCRIPT
-    );
-    if (structured.length > 0) return structured;
-    console.log("[DeepSeek] 结构化来源卡片未抽取到结果，回退通用链接抽取。");
+    return extractDeepSeekReferenceList(page, question, crawlPlatform);
   }
   if (crawlPlatform === "千问") {
     const structured = await extractStructuredSearchResults(
@@ -588,14 +1389,12 @@ export async function extractReferences(
     seen.add(normalized);
 
     const context = cleanText(item.contextText);
-    const title = preferDisplayedTitle
-      ? chooseDisplayedReferenceTitle(item.anchorText, item.titleAttr, item.ariaLabel, item.cardTitle, context, normalized)
-      : chooseTitle(item.anchorText, item.titleAttr, item.ariaLabel, item.cardTitle, context, normalized);
+    const title = chooseTitle(item.anchorText, item.titleAttr, item.ariaLabel, item.cardTitle, context, normalized);
 
     records.push({
       question,
       crawlPlatform,
-      articlePlatform: preferDisplayedTitle ? platformFromReferenceTitle(title, normalized) : platformFromUrl(normalized),
+      articlePlatform: platformFromUrl(normalized),
       articleTime: extractDate(context),
       title,
       summary: "",
@@ -620,12 +1419,118 @@ export async function extractReferences(
   }));
 }
 
+async function extractDeepSeekReferenceList(
+  page: Page,
+  question: string,
+  crawlPlatform: string
+): Promise<ReferenceRecord[]> {
+  const visibleContainers = page.locator(`${DEEPSEEK_REFERENCE_CONTAINER_SELECTOR}:visible`);
+  const containerCount = await visibleContainers.count().catch(() => 0);
+  if (containerCount === 0) {
+    console.log("[DeepSeek] 没有找到可见的 ._223dd7b 参考文献容器，不执行整页链接回退抽取。");
+    return [];
+  }
+
+  const container = visibleContainers.last();
+  const [containerClass, directChildCount, linkCount] = await Promise.all([
+    container.getAttribute("class").catch(() => ""),
+    container.locator(":scope > *").count().catch(() => 0),
+    container.locator("a[href], [data-url], [data-href]").count().catch(() => 0)
+  ]);
+  console.log(
+    `[DeepSeek] 命中最新可见引用容器 class=${JSON.stringify(containerClass || "")}` +
+    `，直接子节点=${directChildCount}，候选链接=${linkCount}`
+  );
+
+  const records = await extractStructuredSearchResults(
+    page,
+    question,
+    crawlPlatform,
+    0,
+    EXTRACT_DEEPSEEK_SEARCH_RESULTS_SCRIPT
+  );
+  for (const record of records) {
+    console.log(
+      `[DeepSeek][解析] ${record.rank}/${records.length}` +
+      ` | 来源=${record.articlePlatform}` +
+      ` | 时间=${record.articleTime}` +
+      ` | 标题=${record.title}` +
+      ` | URL=${record.url}`
+    );
+  }
+  return records;
+}
+
+async function extractDoubaoReferenceList(
+  page: Page,
+  question: string,
+  crawlPlatform: string,
+  minBlockIndex: number
+): Promise<ReferenceRecord[]> {
+  const extraction = await evaluateDoubaoReferenceList(page, minBlockIndex, true, question);
+  if (!extraction.found) {
+    console.log("[豆包] 当前回答中没有找到符合结构的参考文献容器。");
+    return [];
+  }
+
+  console.log(
+    `[豆包] 命中引用容器 class=${JSON.stringify(extraction.containerClass)}` +
+    `，直接子节点=${extraction.directChildCount}` +
+    `，含链接子节点=${extraction.linkedChildCount}` +
+    (extraction.expectedCount > 0 ? `，页面标注参考数=${extraction.expectedCount}` : "")
+  );
+
+  const seen = new Set<string>();
+  const records = extraction.items.flatMap((item) => {
+    const url = normalizeUrl(unwrapUrl(item.href));
+    const title = cleanDoubaoReferenceTitle(item.title);
+    if (!title || isInternalUrl(url) || seen.has(url)) return [];
+    seen.add(url);
+
+    return [{
+      question,
+      crawlPlatform,
+      rank: seen.size,
+      articlePlatform: cleanText(item.platform) || platformFromReferenceTitle(title, url),
+      articleTime: item.articleTime || extractDate(item.contextText),
+      title,
+      summary: cleanText(item.summary || ""),
+      url,
+      extractedAt: new Date().toISOString()
+    } satisfies ReferenceRecord];
+  });
+
+  console.log(`[豆包] 当前引用容器解析出 ${records.length} 条有效参考文献`);
+  for (const record of records) {
+    console.log(
+      `[豆包][解析] ${record.rank}/${records.length}` +
+      ` | 来源=${record.articlePlatform}` +
+      ` | 标题=${record.title}` +
+      ` | URL=${record.url}`
+    );
+  }
+  return records;
+}
+
+function cleanDoubaoReferenceTitle(value: string): string {
+  return cleanText(value)
+    .replace(/^(?:\[?\d+\]?\s*[.、):：-]\s*|第\s*\d+\s*条\s*)/, "")
+    .trim();
+}
+
 async function extractYuanbaoReferenceList(
   page: Page,
   question: string,
   crawlPlatform: string
 ): Promise<ReferenceRecord[]> {
-  const list = page.locator(".agent-dialogue-references__list:visible").last();
+  const openLists = page.locator(YUANBAO_OPEN_REFERENCE_LIST_SELECTOR);
+  const openListCount = await openLists.count().catch(() => 0);
+  const hasDrawerShell = await page.locator(".t-drawer").count().catch(() => 0) > 0;
+  const list = openListCount > 0
+    ? openLists.last()
+    : hasDrawerShell
+      ? page.locator(".__yuanbao_reference_list_not_open__")
+      : page.locator(`${YUANBAO_REFERENCE_LIST_SELECTOR}:visible`).last();
   const listReady = await list.waitFor({ state: "visible", timeout: 10_000 })
     .then(() => true)
     .catch(() => false);
@@ -634,7 +1539,7 @@ async function extractYuanbaoReferenceList(
     return [];
   }
 
-  const items = list.locator("li");
+  const items = list.locator(":scope > li");
   const [listClass, directChildCount, liCount] = await Promise.all([
     list.getAttribute("class").catch(() => ""),
     list.locator(":scope > *").count().catch(() => 0),
@@ -753,9 +1658,10 @@ async function collectScrollableStructuredResults(page: Page, script: string): P
 function normalizeUrl(url: string): string {
   try {
     const parsed = new URL(url);
-    ["utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content", "spm"].forEach((key) => {
-      parsed.searchParams.delete(key);
-    });
+    ["utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content", "spm", "urlSource", "url_source"]
+      .forEach((key) => {
+        parsed.searchParams.delete(key);
+      });
     parsed.hash = "";
     return parsed.toString();
   } catch {

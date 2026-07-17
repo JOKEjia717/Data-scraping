@@ -1,10 +1,22 @@
 import { chromium, type Locator, type Page } from "playwright";
 import {
+  clickLatestQianwenRegenerate,
+  countDeepSeekReferenceContainers,
+  countDoubaoSearchResultBlocks,
+  countQianwenReferenceTriggers,
   countReferenceRevealButtons,
+  countYuanbaoReferenceTriggers,
   extractReferences,
-  revealLatestReferencePanel,
+  revealLatestDeepSeekReferenceList,
+  revealLatestDoubaoReferenceList,
+  revealLatestQianwenReferenceList,
+  revealLatestYuanbaoReferenceList,
   revealReferencePanels,
-  snapshotDocumentBottom
+  snapshotDocumentBottom,
+  waitForDeepSeekReferenceListStable,
+  waitForDoubaoReferenceListStable,
+  waitForQianwenReferenceListStable,
+  waitForYuanbaoReferenceListStable
 } from "./extractReferences.js";
 import { resolveRecordTitles } from "./resolveTitles.js";
 import type { PlatformConfig, ReferenceRecord } from "./types.js";
@@ -44,36 +56,98 @@ export async function crawlPlatform(
     await waitForReadyToSend(page, config, options.timeoutMs);
     await activateWebSearch(page, config);
     const baselineBottom = await snapshotDocumentBottom(page);
+    const baselineDoubaoSearchBlockCount = config.id === "doubao"
+      ? await countDoubaoSearchResultBlocks(page)
+      : 0;
     const baselineRevealButtonCount = await countReferenceRevealButtons(page, config.referenceRevealSelectors);
     const submittedQuestion = `${options.promptPrefix}${question}`;
-    const trackedBaseline = config.id === "qianwen" || config.id === "yuanbao"
+    const trackedBaseline = config.id === "doubao" || config.id === "deepseek" || config.id === "qianwen" || config.id === "yuanbao"
       ? await snapshotTrackedAnswerBaseline(page, config.id)
       : undefined;
     await submitQuestion(page, config, submittedQuestion);
-    await waitForAnswerComplete(page, config, options.timeoutMs, trackedBaseline, submittedQuestion.length);
+    await waitForAnswerComplete(page, config, options.timeoutMs, trackedBaseline, submittedQuestion);
     await scrollToBottom(page);
-    if (config.id === "qianwen" || config.id === "yuanbao") {
-      const revealed = await revealLatestReferencePanel(
+    if (config.id === "doubao") {
+      const revealed = await revealLatestDoubaoReferenceList(
         page,
         config.referenceRevealSelectors,
-        config.id === "yuanbao" ? ".agent-dialogue-references__list" : undefined
+        baselineDoubaoSearchBlockCount,
+        submittedQuestion
       );
       if (!revealed) {
-        throw new Error(`[${config.name}] 当前回答结束后仍未找到最新的参考来源入口，已停止，避免下一题数据错位。`);
+        throw new Error("[豆包] 当前回答结束后仍未找到最新的参考文献容器或展开入口，已停止，避免下一题数据错位。");
       }
-      if (config.id === "qianwen") await waitForQianwenSourceCardsStable(page, 15_000);
+      const stable = await waitForDoubaoReferenceListStable(
+        page,
+        baselineDoubaoSearchBlockCount,
+        15_000,
+        submittedQuestion
+      );
+      if (!stable) {
+        throw new Error("[豆包] 当前回答的参考文献列表在 15 秒内没有加载稳定，已停止，避免漏抓或跨题抓取。");
+      }
+    } else if (config.id === "deepseek") {
+      const expectedCount = await revealLatestDeepSeekReferenceList(page, 30_000);
+      if (expectedCount === 0) {
+        throw new Error("[DeepSeek] 没有找到当前回答末尾 class=f93f59e4 的‘X个网页’按钮，或点击后未打开 ._223dd7b 引用列表，已停止后续问题。");
+      }
+      const stable = await waitForDeepSeekReferenceListStable(page, 15_000, expectedCount);
+      if (!stable) {
+        throw new Error(`[DeepSeek] ._223dd7b 参考文献列表在 15 秒内没有加载稳定（按钮标注 ${expectedCount} 个网页），已停止，避免漏抓或跨题抓取。`);
+      }
+    } else if (config.id === "yuanbao") {
+      const baselineTriggerCount = trackedBaseline?.referenceCount ?? 0;
+      const revealed = await revealLatestYuanbaoReferenceList(
+        page,
+        baselineTriggerCount,
+        30_000
+      );
+      if (!revealed) {
+        throw new Error(
+          "[元宝] 没有找到当前回答最新的 ToolbarSearchGuid_searchGuidTool__M81L2.Toolbar_icon__xGP8b 入口，" +
+          "或点击后未加载 agent-dialogue-references__list，已停止后续问题。"
+        );
+      }
+      const stable = await waitForYuanbaoReferenceListStable(page, 15_000);
+      if (!stable) {
+        throw new Error("[元宝] agent-dialogue-references__list 的直接子 li 在 15 秒内没有加载稳定，已停止以避免漏抓。");
+      }
+    } else if (config.id === "qianwen") {
+      let baselineTriggerCount = trackedBaseline?.referenceCount ?? 0;
+      let expectedCount = await revealLatestQianwenReferenceList(page, baselineTriggerCount, 30_000);
+      if (expectedCount === 0) {
+        console.log("[千问] 本题首次回答没有出现 link-title-igf0OC 参考入口，自动重新生成一次。");
+        const regenerationBaseline = await snapshotTrackedAnswerBaseline(page, "qianwen");
+        const clicked = await clickLatestQianwenRegenerate(page);
+        if (!clicked) {
+          throw new Error("[千问] 首次回答没有参考入口，且未找到最新回答的 reg_svg 重新生成按钮，已停止后续问题。");
+        }
+
+        await waitForAnswerComplete(page, config, options.timeoutMs, regenerationBaseline, "");
+        await scrollToBottom(page);
+        baselineTriggerCount = regenerationBaseline.referenceCount;
+        expectedCount = await revealLatestQianwenReferenceList(page, baselineTriggerCount, 30_000);
+      }
+      if (expectedCount === 0) {
+        throw new Error("[千问] 重新生成一次后仍没有 link-title-igf0OC 参考入口，或点击后未打开 list-XPxyL2，已停止后续问题。");
+      }
+      const stable = await waitForQianwenReferenceListStable(page, 15_000, expectedCount);
+      if (!stable) {
+        throw new Error(`[千问] list-XPxyL2 的直接子 div 在 15 秒内没有加载稳定（入口标注 ${expectedCount} 条），已停止以避免漏抓或跨题抓取。`);
+      }
     } else {
       await revealReferencePanels(page, config.referenceRevealSelectors);
       await page.waitForTimeout(800);
     }
 
-    const extractedRecords = await extractReferences(page, question, config.name, baselineBottom);
+    const extractionBaseline = config.id === "doubao" ? baselineDoubaoSearchBlockCount : baselineBottom;
+    const extractedRecords = await extractReferences(page, question, config.name, extractionBaseline);
     if (config.id === "yuanbao") await closeYuanbaoReferencePanel(page);
     const questionRecords = options.resolveTitles && config.id === "deepseek"
       ? await resolveRecordTitles(extractedRecords)
       : extractedRecords;
     console.log(`[${config.name}] 抽取到 ${questionRecords.length} 条参考链接`);
-    if ((config.id === "qianwen" || config.id === "yuanbao") && questionRecords.length === 0) {
+    if ((config.id === "doubao" || config.id === "deepseek" || config.id === "qianwen" || config.id === "yuanbao") && questionRecords.length === 0) {
       throw new Error(`[${config.name}] 本题没有抽取到引用数据，已停止后续问题，避免问题与数据错位。`);
     }
     if (questionRecords.length === 0 && baselineRevealButtonCount > 0) {
@@ -92,23 +166,23 @@ async function scrollToBottom(page: Page): Promise<void> {
 }
 
 async function closeYuanbaoReferencePanel(page: Page): Promise<void> {
-  const visibleList = page.locator(".agent-dialogue-references__list:visible").last();
-  if (await visibleList.count().catch(() => 0) === 0) return;
+  const openDrawer = page.locator(".t-drawer--open").last();
+  if (await openDrawer.count().catch(() => 0) === 0) return;
 
-  const closeButton = page.locator(
-    ".t-drawer__close-btn:visible, " +
+  const closeButton = openDrawer.locator(
+    ".t-drawer__close-btn, " +
     "[class*='drawer'][class*='close']:visible, " +
     "button[aria-label*='关闭']:visible"
   ).last();
   await closeButton.click({ timeout: 2_000 }).catch(() => undefined);
 
-  const closed = await visibleList.waitFor({ state: "hidden", timeout: 3_000 })
+  const closed = await openDrawer.waitFor({ state: "hidden", timeout: 3_000 })
     .then(() => true)
     .catch(() => false);
   if (closed) return;
 
   await page.keyboard.press("Escape").catch(() => undefined);
-  const closedByEscape = await visibleList.waitFor({ state: "hidden", timeout: 2_000 })
+  const closedByEscape = await openDrawer.waitFor({ state: "hidden", timeout: 2_000 })
     .then(() => true)
     .catch(() => false);
   if (!closedByEscape) {
@@ -209,7 +283,7 @@ async function waitForReadyToSend(page: Page, config: PlatformConfig, timeoutMs:
   const startedAt = Date.now();
   while (Date.now() - startedAt < timeoutMs) {
     const inputBox = await findInput(page, config.inputSelectors, 1_500);
-    const busy = config.id === "qianwen" || config.id === "yuanbao"
+    const busy = config.id === "doubao" || config.id === "deepseek" || config.id === "qianwen" || config.id === "yuanbao"
       ? await isAnswerGenerating(page)
       : false;
     if (inputBox && !busy) return;
@@ -223,15 +297,15 @@ async function waitForAnswerComplete(
   config: PlatformConfig,
   timeoutMs: number,
   trackedBaseline?: TrackedAnswerBaseline,
-  submittedQuestionLength = 0
+  submittedQuestion = ""
 ): Promise<void> {
-  if (config.id === "qianwen" || config.id === "yuanbao") {
+  if (config.id === "doubao" || config.id === "deepseek" || config.id === "qianwen" || config.id === "yuanbao") {
     if (!trackedBaseline) throw new Error(`[${config.name}] 缺少回答前页面快照，无法安全判断本题是否完成。`);
     await waitForTrackedAnswerComplete(
       page,
       timeoutMs,
       trackedBaseline,
-      submittedQuestionLength,
+      submittedQuestion,
       config.id,
       config.name
     );
@@ -244,53 +318,31 @@ async function waitForAnswerComplete(
 
 async function snapshotTrackedAnswerBaseline(
   page: Page,
-  platformId: "qianwen" | "yuanbao"
+  platformId: "doubao" | "deepseek" | "qianwen" | "yuanbao"
 ): Promise<TrackedAnswerBaseline> {
   const bodyText = await page.locator("body").innerText({ timeout: 3_000 }).catch(() => "");
   const referenceLabel = platformId === "qianwen" ? "参考来源" : "引用来源";
   return {
     bodyText,
     documentBottom: await snapshotDocumentBottom(page),
-    referenceCount: bodyText.split(referenceLabel).length - 1
+    referenceCount: platformId === "doubao"
+      ? await countDoubaoSearchResultBlocks(page)
+      : platformId === "deepseek"
+        ? await countDeepSeekReferenceContainers(page)
+        : platformId === "qianwen"
+          ? await countQianwenReferenceTriggers(page)
+        : platformId === "yuanbao"
+          ? await countYuanbaoReferenceTriggers(page)
+        : bodyText.split(referenceLabel).length - 1
   };
-}
-
-async function waitForQianwenSourceCardsStable(page: Page, timeoutMs: number): Promise<void> {
-  const startedAt = Date.now();
-  let lastSignature = "";
-  let stableSince = Date.now();
-
-  while (Date.now() - startedAt < timeoutMs) {
-    const signature = await page.evaluate<string>(`
-(() => {
-  const list = document.querySelector('[class~="list-XPxyL2"]');
-  if (!list) return "";
-  return Array.from(list.children)
-    .map((element) => element.getAttribute("data-exposure-extra") || element.getAttribute("data-click-extra") || "")
-    .filter(Boolean)
-    .join("\\n");
-})()
-`).catch(() => "");
-
-    if (signature && signature !== lastSignature) {
-      lastSignature = signature;
-      stableSince = Date.now();
-    } else if (signature && Date.now() - stableSince >= 2_000) {
-      return;
-    }
-
-    await page.waitForTimeout(250);
-  }
-
-  throw new Error("[千问] list-XPxyL2 子组件在 15 秒内没有加载稳定，已停止后续问题。");
 }
 
 async function waitForTrackedAnswerComplete(
   page: Page,
   timeoutMs: number,
   baseline: TrackedAnswerBaseline,
-  submittedQuestionLength: number,
-  platformId: "qianwen" | "yuanbao",
+  submittedQuestion: string,
+  platformId: "doubao" | "deepseek" | "qianwen" | "yuanbao",
   platformName: string
 ): Promise<void> {
   const startedAt = Date.now();
@@ -300,15 +352,30 @@ async function waitForTrackedAnswerComplete(
   let meaningfulChanges = 0;
   let sawAnswerStart = false;
   const referenceLabel = platformId === "qianwen" ? "参考来源" : "引用来源";
-  const stableWindowMs = platformId === "yuanbao" ? 15_000 : 10_000;
+  const stableWindowMs = platformId === "yuanbao"
+    ? 15_000
+    : platformId === "doubao" || platformId === "deepseek" || platformId === "qianwen"
+      ? 12_000
+      : 10_000;
   const minWaitMs = platformId === "yuanbao" ? 20_000 : 15_000;
+  let nextProgressLogAt = 30_000;
+  const baselineQuestionOccurrences = countTextOccurrences(baseline.bodyText, submittedQuestion);
 
   await page.waitForTimeout(1_000);
   while (Date.now() - startedAt < timeoutMs) {
-    const [snapshot, busy, documentBottom] = await Promise.all([
+    const [snapshot, busy, documentBottom, structuredReferenceCount] = await Promise.all([
       page.locator("body").innerText({ timeout: 3_000 }).catch(() => ""),
       isAnswerGenerating(page),
-      snapshotDocumentBottom(page)
+      snapshotDocumentBottom(page),
+      platformId === "doubao"
+        ? countDoubaoSearchResultBlocks(page)
+        : platformId === "deepseek"
+          ? countDeepSeekReferenceContainers(page)
+          : platformId === "qianwen"
+            ? countQianwenReferenceTriggers(page)
+          : platformId === "yuanbao"
+            ? countYuanbaoReferenceTriggers(page)
+            : Promise.resolve(0)
     ]);
 
     if (busy) sawGenerating = true;
@@ -318,24 +385,52 @@ async function waitForTrackedAnswerComplete(
       meaningfulChanges += 1;
     }
 
-    const referenceCount = snapshot.split(referenceLabel).length - 1;
-    const textGrowth = snapshot.length - baseline.bodyText.length - submittedQuestionLength;
+    const referenceCount = platformId === "doubao"
+      ? structuredReferenceCount
+      : platformId === "deepseek"
+        ? structuredReferenceCount
+        : platformId === "qianwen"
+          ? structuredReferenceCount
+        : platformId === "yuanbao"
+          ? structuredReferenceCount
+          : snapshot.split(referenceLabel).length - 1;
+    const textGrowth = snapshot.length - baseline.bodyText.length - submittedQuestion.length;
     const bottomGrowth = documentBottom - baseline.documentBottom;
+    const questionOccurrences = countTextOccurrences(snapshot, submittedQuestion);
+    const sawSubmittedQuestion = Boolean(submittedQuestion) && questionOccurrences > baselineQuestionOccurrences;
     sawAnswerStart ||=
       sawGenerating ||
+      sawSubmittedQuestion ||
       referenceCount > baseline.referenceCount ||
       (platformId === "yuanbao" && meaningfulChanges >= 3) ||
+      ((platformId === "doubao" || platformId === "deepseek") && meaningfulChanges >= 3 && Math.abs(textGrowth) >= 60) ||
       (meaningfulChanges >= 3 && textGrowth >= 60) ||
       (bottomGrowth >= 250 && textGrowth >= 60);
 
     const elapsed = Date.now() - startedAt;
     const stableFor = Date.now() - stableSince;
+    if (platformId === "yuanbao" && referenceCount > baseline.referenceCount && !busy) return;
     if (sawAnswerStart && !busy && stableFor >= stableWindowMs && elapsed >= minWaitMs) return;
+
+    if ((platformId === "doubao" || platformId === "deepseek" || platformId === "qianwen") && elapsed >= nextProgressLogAt) {
+      console.log(
+        `[${platformName}] 回答仍在处理中，已等待 ${Math.round(elapsed / 1000)} 秒` +
+        `（生成状态=${busy ? "生成中" : "阶段性稳定"}` +
+        `，当前问题=${sawSubmittedQuestion ? "已出现" : "未出现"}` +
+        `，引用结构变化=${referenceCount - baseline.referenceCount}）`
+      );
+      nextProgressLogAt += 30_000;
+    }
 
     await page.waitForTimeout(1_000);
   }
 
   throw new Error(`[${platformName}] 等待本题回答完整结束超时，已停止后续问题以避免题目与来源数据错位。可增大 --timeout-ms 后重试。`);
+}
+
+function countTextOccurrences(text: string, value: string): number {
+  if (!value) return 0;
+  return text.split(value).length - 1;
 }
 
 async function isAnswerGenerating(page: Page): Promise<boolean> {

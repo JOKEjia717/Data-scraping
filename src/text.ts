@@ -129,6 +129,10 @@ export function chooseDisplayedReferenceTitle(
 
 export function platformFromReferenceTitle(title: string, url: string): string {
   const value = cleanText(title);
+  const prefixMatch = value.match(/^(?:【([^】]{2,24})】|\[([^\]]{2,24})\])/);
+  const prefix = cleanText(prefixMatch?.[1] || prefixMatch?.[2] || "");
+  if (prefix && !/^\d+$/.test(prefix) && !/^(?:19|20)\d{2}(?:年)?$/.test(prefix)) return prefix;
+
   const suffix = value.match(/(?:-|_|—|｜|\|)\s*([^-_—｜|#]{2,16})$/)?.[1]?.trim();
   if (suffix && !/[，。！？,.!?]/.test(suffix)) return suffix;
   return platformFromUrl(url);

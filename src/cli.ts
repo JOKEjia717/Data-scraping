@@ -3,7 +3,7 @@ import type { CliOptions, PlatformId } from "./types.js";
 
 const DEFAULT_PLATFORMS: PlatformId[] = ["doubao", "deepseek", "qianwen", "yuanbao"];
 const ALL_PLATFORMS: PlatformId[] = ["doubao", "deepseek", "qianwen", "yuanbao"];
-const DEFAULT_PROMPT_PREFIX = "请联网搜索后回答，并在回答中保留可点击的参考来源。问题：";
+const DEFAULT_PROMPT_PREFIX = "";
 
 export async function parseCli(argv: string[]): Promise<CliOptions> {
   const args = new Map<string, string>();
@@ -19,7 +19,7 @@ export async function parseCli(argv: string[]): Promise<CliOptions> {
     questionFile: args.get("questions"),
     promptPrefix: args.get("prompt-prefix") ?? DEFAULT_PROMPT_PREFIX,
     resolveTitles: args.get("resolve-titles") !== "false",
-    timeoutMs: Number(args.get("timeout-ms") || 120_000)
+    timeoutMs: Number(args.get("timeout-ms") || 300_000)
   };
 }
 

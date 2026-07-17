@@ -24,6 +24,8 @@ export const PLATFORMS: Record<PlatformId, PlatformConfig> = {
       "[title*='联网搜索']"
     ],
     referenceRevealSelectors: [
+      "text=/参考\\s*\\d+\\s*篇资料/",
+      "[role='button']:has-text('篇资料')",
       "button:has-text('参考')",
       "button:has-text('参考来源')",
       "button:has-text('来源')",
@@ -56,10 +58,16 @@ export const PLATFORMS: Record<PlatformId, PlatformConfig> = {
       "[aria-label*='Search']"
     ],
     referenceRevealSelectors: [
+      "[class~='f93f59e4']",
+      "text=/^\\d+\\s*个网页$/",
+      "text=/搜索\\s*\\d+\\s*(?:个网页|条结果|篇资料)/",
+      "text=/已搜索\\s*\\d+/",
+      "button:has-text('搜索结果')",
       "button:has-text('参考')",
       "button:has-text('来源')",
       "button:has-text('引用')",
       "button:has-text('Sources')",
+      "[role='button']:has-text('搜索结果')",
       "[role='button']:has-text('参考')",
       "[role='button']:has-text('Sources')"
     ]
@@ -107,6 +115,7 @@ export const PLATFORMS: Record<PlatformId, PlatformConfig> = {
       "[title*='搜索']"
     ],
     referenceRevealSelectors: [
+      "[class~='link-title-igf0OC']",
       "text=/参考来源\\s*\\(\\d+\\)/",
       "text=参考来源",
       "button:has-text('参考')",
@@ -164,6 +173,7 @@ export const PLATFORMS: Record<PlatformId, PlatformConfig> = {
       "[title*='搜索']"
     ],
     referenceRevealSelectors: [
+      ".ToolbarSearchGuid_searchGuidTool__M81L2.Toolbar_icon__xGP8b",
       "text=\"源\"",
       "span:text-is('源')",
       "div:text-is('源')",
