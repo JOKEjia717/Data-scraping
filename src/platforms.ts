@@ -1,5 +1,12 @@
+/**
+ * 四个平台的页面入口与交互选择器。
+ *
+ * 每组选项按“越具体越靠前、通用兜底越靠后”排列。平台改版时应优先补充
+ * 稳定的 aria-label、title 或平台专属 class，避免扩大到会命中导航栏的选择器。
+ */
 import type { PlatformConfig, PlatformId } from "./types.js";
 
+/** 平台 ID 到页面配置的唯一映射，crawler.ts 不直接硬编码输入框和按钮。 */
 export const PLATFORMS: Record<PlatformId, PlatformConfig> = {
   doubao: {
     id: "doubao",

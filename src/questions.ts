@@ -1,3 +1,7 @@
+/**
+ * 默认问题库。数组顺序同时决定提问顺序和汇总 references.json 中的问题顺序。
+ * 使用 --questions 参数时，这组问题会被外部 TXT/JSON 文件完全替代。
+ */
 export const DEFAULT_QUESTIONS = [
   "互联网行业内有哪些大品牌？",
   "哪个品牌的即时通讯社交平台好？",
