@@ -1,3 +1,7 @@
+/**
+ * 平台 DOM 回归测试。使用无头 Chrome 构造最小页面，验证解析器只读取当前回答
+ * 的结构化引用容器，并覆盖入口点击、列表稳定、去重和失败保护。
+ */
 import assert from "node:assert/strict";
 import { after, before, test } from "node:test";
 import { chromium, type Browser } from "playwright";
@@ -16,6 +20,7 @@ import {
 
 let browser: Browser | undefined;
 
+// 所有用例复用同一个浏览器进程，每个用例创建独立页面避免 DOM 状态互相污染。
 before(async () => {
   browser = await chromium.launch({ channel: "chrome", headless: true });
 });
@@ -142,7 +147,7 @@ test("千问只点击新增的 link-title 入口并解析可见 list 的直接�
   await page.close();
 });
 
-test("千问重新生成只点击最新回答中带 reg_svg 图标的操作按钮", async () => {
+test("千问重新生成先打开外层容器再点击菜单中的重新生成项", async () => {
   assert.ok(browser);
   const page = await browser.newPage();
   const actionClass = "hover:bg-tag flex size-6 cursor-pointer items-center justify-center rounded transition-colors duration-200";
@@ -150,18 +155,34 @@ test("千问重新生成只点击最新回答中带 reg_svg 图标的操作按�
     <div id="actions">
       <div id="like" class="${actionClass}"><svg><defs><clipPath id="good_svg__a"></clipPath></defs></svg></div>
       <div id="share" class="${actionClass}"><svg><defs><clipPath id="share_svg__a"></clipPath></defs></svg></div>
-      <div id="regenerate" class="${actionClass}"><svg><defs><clipPath id="reg_svg__a"></clipPath></defs></svg></div>
+      <div id="regenerate-wrapper" class="flex items-center rounded">
+        <div id="regenerate-icon" class="${actionClass}"><svg><defs><clipPath id="reg_svg__a"></clipPath></defs></svg></div>
+      </div>
       <div id="more" class="${actionClass}"><svg><defs><clipPath id="more_svg__a"></clipPath></defs></svg></div>
     </div>
+    <div
+      id="regenerate-menu-item"
+      role="menuitem"
+      style="display:none"
+      class="relative min-w-0 flex h-9 cursor-pointer select-none items-center gap-2 rounded-8 px-3 py-1.5 text-sm outline-none transition-colors text-primary"
+    >重新生成</div>
     <script>
-      for (const element of document.querySelectorAll("#actions > div")) {
-        element.addEventListener("click", () => document.body.dataset.clicked = element.id);
-      }
+      document.querySelector("#like").addEventListener("click", () => document.body.dataset.clicked = "like");
+      document.querySelector("#share").addEventListener("click", () => document.body.dataset.clicked = "share");
+      document.querySelector("#more").addEventListener("click", () => document.body.dataset.clicked = "more");
+      document.querySelector("#regenerate-wrapper").addEventListener("click", () => {
+        document.body.dataset.menuOpened = "true";
+        document.querySelector("#regenerate-menu-item").style.display = "flex";
+      });
+      document.querySelector("#regenerate-menu-item").addEventListener("click", () => {
+        document.body.dataset.clicked = "regenerate-menu-item";
+      });
     </script>
   `);
 
   assert.equal(await clickLatestQianwenRegenerate(page), true);
-  assert.equal(await page.locator("body").getAttribute("data-clicked"), "regenerate");
+  assert.equal(await page.locator("body").getAttribute("data-menu-opened"), "true");
+  assert.equal(await page.locator("body").getAttribute("data-clicked"), "regenerate-menu-item");
 
   await page.close();
 });

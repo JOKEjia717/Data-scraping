@@ -1,3 +1,7 @@
+/**
+ * 浏览器编排模块：连接已登录的 Chrome 标签页，逐题发送、判断回答生命周期、
+ * 展开本题引用并调用平台解析器。这里负责时序和失败保护，不负责具体卡片字段解析。
+ */
 import { chromium, type Locator, type Page } from "playwright";
 import {
   clickLatestQianwenRegenerate,
@@ -29,12 +33,17 @@ export interface CrawlPlatformOptions {
   timeoutMs: number;
 }
 
+/** 提问前的页面快照，用于区分历史内容与本题新增回答。 */
 interface TrackedAnswerBaseline {
   bodyText: string;
   documentBottom: number;
   referenceCount: number;
 }
 
+/**
+ * 抓取单个平台的全部问题。任何结构化平台出现零引用或定位不确定时都会停止，
+ * 宁可保留已完成题目，也不继续产生问题与引用错位的数据。
+ */
 export async function crawlPlatform(
   config: PlatformConfig,
   options: CrawlPlatformOptions,
@@ -52,9 +61,12 @@ export async function crawlPlatform(
 
   for (const [index, question] of options.questions.entries()) {
     console.log(`\n[${config.name}] ${index + 1}/${options.questions.length} ${question}`);
+    // 元宝引用抽屉会遮挡页面并污染下一题基线，因此提问前后都主动关闭。
     if (config.id === "yuanbao") await closeYuanbaoReferencePanel(page);
     await waitForReadyToSend(page, config, options.timeoutMs);
     await activateWebSearch(page, config);
+
+    // 所有基线必须在发送问题前采集，之后只接受相对基线新增的回答和引用入口。
     const baselineBottom = await snapshotDocumentBottom(page);
     const baselineDoubaoSearchBlockCount = config.id === "doubao"
       ? await countDoubaoSearchResultBlocks(page)
@@ -67,6 +79,8 @@ export async function crawlPlatform(
     await submitQuestion(page, config, submittedQuestion);
     await waitForAnswerComplete(page, config, options.timeoutMs, trackedBaseline, submittedQuestion);
     await scrollToBottom(page);
+
+    // 各平台引用面板结构不同，分别执行“打开最新面板 + 等待列表稳定”的流程。
     if (config.id === "doubao") {
       const revealed = await revealLatestDoubaoReferenceList(
         page,
@@ -120,7 +134,12 @@ export async function crawlPlatform(
         const regenerationBaseline = await snapshotTrackedAnswerBaseline(page, "qianwen");
         const clicked = await clickLatestQianwenRegenerate(page);
         if (!clicked) {
-          throw new Error("[千问] 首次回答没有参考入口，且未找到最新回答的 reg_svg 重新生成按钮，已停止后续问题。");
+          throw new Error("[千问] 首次回答没有参考入口，但未能完成‘打开重新生成菜单并点击重新生成项’，已停止后续问题。");
+        }
+
+        const regenerationStarted = await waitForQianwenRegenerationStart(page, regenerationBaseline, 15_000);
+        if (!regenerationStarted) {
+          throw new Error("[千问] 已点击重新生成菜单项，但 15 秒内未检测到生成启动，已停止以避免空等和数据错位。");
         }
 
         await waitForAnswerComplete(page, config, options.timeoutMs, regenerationBaseline, "");
@@ -154,17 +173,20 @@ export async function crawlPlatform(
       console.log(`[${config.name}] 提醒：页面有参考入口，但本题没有抽取到外部链接，可能需要补充 ${config.name} 的引用面板选择器。`);
     }
     records.push(...questionRecords);
+    // 每完成一道题就通知入口层写盘，而不是等待整个平台全部结束。
     await onProgress?.(records);
   }
 
   return records;
 }
 
+/** 将视口移到最新回答区域，避免引用入口因懒加载而尚未挂载。 */
 async function scrollToBottom(page: Page): Promise<void> {
   await page.evaluate("window.scrollTo(0, document.body.scrollHeight)").catch(() => undefined);
   await page.waitForTimeout(500);
 }
 
+/** 关闭元宝已打开的引用抽屉；按钮失败时再尝试 Escape。 */
 async function closeYuanbaoReferencePanel(page: Page): Promise<void> {
   const openDrawer = page.locator(".t-drawer--open").last();
   if (await openDrawer.count().catch(() => 0) === 0) return;
@@ -190,6 +212,7 @@ async function closeYuanbaoReferencePanel(page: Page): Promise<void> {
   }
 }
 
+/** 在当前 CDP 浏览器的所有标签页中按主域名/兼容域名寻找目标平台。 */
 function findExistingPage(pages: Page[], config: PlatformConfig): Page | null {
   const targetHosts = (config.hostnames || [new URL(config.url).hostname])
     .map((host) => host.replace(/^www\./, ""));
@@ -203,6 +226,7 @@ function findExistingPage(pages: Page[], config: PlatformConfig): Page | null {
   }) ?? null;
 }
 
+/** 启动前快速确认页面已登录且存在可用输入框。 */
 async function ensureReadyForInput(page: Page, config: PlatformConfig): Promise<void> {
   const inputBox = await findInput(page, config.inputSelectors, 8_000);
   if (inputBox) return;
@@ -210,6 +234,7 @@ async function ensureReadyForInput(page: Page, config: PlatformConfig): Promise<
   throw new Error(`没有在已打开的 ${config.name} 标签页找到聊天输入框，请确认页面已登录并停留在可提问界面。`);
 }
 
+/** 尝试打开平台联网搜索能力；已处于 pressed/checked 状态时不重复点击。 */
 async function activateWebSearch(page: Page, config: PlatformConfig): Promise<void> {
   for (const selector of config.webSearchButtonSelectors) {
     const locators = await page.locator(selector).all().catch(() => []);
@@ -229,6 +254,7 @@ async function activateWebSearch(page: Page, config: PlatformConfig): Promise<vo
   }
 }
 
+/** 兼容 textarea/input 与 contenteditable，并优先点击发送按钮、回退 Enter。 */
 async function submitQuestion(page: Page, config: PlatformConfig, question: string): Promise<void> {
   const inputBox = await findInput(page, config.inputSelectors, 30_000);
   if (!inputBox) throw new Error(`没有在 ${config.name} 页面找到聊天输入框。`);
@@ -249,6 +275,7 @@ async function submitQuestion(page: Page, config: PlatformConfig, question: stri
   await page.keyboard.press("Enter");
 }
 
+/** 从后向前寻找最新且可点击的发送控件。 */
 async function clickSendButton(page: Page, selectors: string[]): Promise<boolean> {
   for (const selector of selectors) {
     const locators = await page.locator(selector).all().catch(() => []);
@@ -263,6 +290,7 @@ async function clickSendButton(page: Page, selectors: string[]): Promise<boolean
   return false;
 }
 
+/** 轮询多个输入框选择器，返回页面中最后一个可见且启用的输入控件。 */
 async function findInput(page: Page, selectors: string[], timeoutMs: number): Promise<Locator | null> {
   const startedAt = Date.now();
   while (Date.now() - startedAt < timeoutMs) {
@@ -279,6 +307,7 @@ async function findInput(page: Page, selectors: string[], timeoutMs: number): Pr
   return null;
 }
 
+/** 同时满足“有输入框”和“未生成回答”才允许发送下一题。 */
 async function waitForReadyToSend(page: Page, config: PlatformConfig, timeoutMs: number): Promise<void> {
   const startedAt = Date.now();
   while (Date.now() - startedAt < timeoutMs) {
@@ -292,6 +321,7 @@ async function waitForReadyToSend(page: Page, config: PlatformConfig, timeoutMs:
   throw new Error(`${config.name} 长时间没有恢复到可提问状态，请确认上一条回答已经结束。`);
 }
 
+/** 为已支持的平台使用结构化基线判断；保留通用正文稳定等待作为兼容路径。 */
 async function waitForAnswerComplete(
   page: Page,
   config: PlatformConfig,
@@ -316,6 +346,7 @@ async function waitForAnswerComplete(
   await waitForAnswerStable(page, timeoutMs, 5_000, 8_000);
 }
 
+/** 采集正文、高度和平台专属引用结构数量，形成回答前基线。 */
 async function snapshotTrackedAnswerBaseline(
   page: Page,
   platformId: "doubao" | "deepseek" | "qianwen" | "yuanbao"
@@ -337,6 +368,42 @@ async function snapshotTrackedAnswerBaseline(
   };
 }
 
+/**
+ * 千问点击“重新生成”后快速确认动作真正生效，避免点击失败后继续等待完整超时。
+ */
+async function waitForQianwenRegenerationStart(
+  page: Page,
+  baseline: TrackedAnswerBaseline,
+  timeoutMs: number
+): Promise<boolean> {
+  const startedAt = Date.now();
+  let lastSnapshot = baseline.bodyText;
+  let meaningfulChanges = 0;
+
+  while (Date.now() - startedAt < timeoutMs) {
+    const [snapshot, busy, referenceCount] = await Promise.all([
+      page.locator("body").innerText({ timeout: 3_000 }).catch(() => ""),
+      isAnswerGenerating(page),
+      countQianwenReferenceTriggers(page)
+    ]);
+
+    if (busy || referenceCount > baseline.referenceCount) return true;
+    if (snapshot && snapshot !== lastSnapshot) {
+      lastSnapshot = snapshot;
+      meaningfulChanges += 1;
+      if (meaningfulChanges >= 2 && Math.abs(snapshot.length - baseline.bodyText.length) >= 30) return true;
+    }
+
+    await page.waitForTimeout(250);
+  }
+
+  return false;
+}
+
+/**
+ * 综合停止按钮、正文变化、页面高度、问题回显和引用结构变化判断回答生命周期。
+ * 单一信号容易受平台流式渲染影响，因此必须先确认回答开始，再等待稳定窗口。
+ */
 async function waitForTrackedAnswerComplete(
   page: Page,
   timeoutMs: number,
@@ -409,6 +476,7 @@ async function waitForTrackedAnswerComplete(
 
     const elapsed = Date.now() - startedAt;
     const stableFor = Date.now() - stableSince;
+    // 元宝出现新增引用入口即可确认回答阶段完成；其他平台继续等待正文稳定窗口。
     if (platformId === "yuanbao" && referenceCount > baseline.referenceCount && !busy) return;
     if (sawAnswerStart && !busy && stableFor >= stableWindowMs && elapsed >= minWaitMs) return;
 
@@ -428,11 +496,13 @@ async function waitForTrackedAnswerComplete(
   throw new Error(`[${platformName}] 等待本题回答完整结束超时，已停止后续问题以避免题目与来源数据错位。可增大 --timeout-ms 后重试。`);
 }
 
+/** 统计问题文本在页面中的出现次数，用于识别本轮问题是否已经回显。 */
 function countTextOccurrences(text: string, value: string): number {
   if (!value) return 0;
   return text.split(value).length - 1;
 }
 
+/** 从可见按钮文案中识别平台是否仍在生成回答。 */
 async function isAnswerGenerating(page: Page): Promise<boolean> {
   return page.evaluate<boolean>(`
 (() => {
@@ -457,6 +527,7 @@ async function isAnswerGenerating(page: Page): Promise<boolean> {
 `).catch(() => false);
 }
 
+/** 没有平台专属信号时，以整页正文连续不变作为回答完成的通用兜底。 */
 async function waitForAnswerStable(page: Page, timeoutMs: number, stableWindowMs: number, minWaitMs: number): Promise<void> {
   const startedAt = Date.now();
   let lastSnapshot = "";

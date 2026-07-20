@@ -1,3 +1,10 @@
+/**
+ * 引用面板展开、稳定性检测与字段抽取模块。
+ *
+ * 结构化平台只读取“当前回答最新引用容器”的直接子节点，避免历史回答、正文链接
+ * 和导航链接混入结果。文件中的字符串脚本在浏览器页面上下文执行，外层函数负责
+ * Playwright 定位、等待与最终标准化。
+ */
 import type { Locator, Page } from "playwright";
 import type { RawReferenceCandidate, ReferenceRecord, SearchResultCandidate } from "./types.js";
 import {
@@ -9,6 +16,7 @@ import {
   unwrapUrl
 } from "./text.js";
 
+// 平台专属稳定选择器。class 变化时需同步更新 README 和测试夹具。
 const DOUBAO_SEARCH_BLOCK_SELECTOR = '[data-plugin-identifier*="search_query_result_block"]';
 const DOUBAO_REFERENCE_CONTAINER_SELECTOR =
   '[class~="relative"][class~="mt-[-8px]"][class~="flex-col"]';
@@ -19,12 +27,17 @@ const QIANWEN_ANSWER_ACTION_SELECTOR =
   '[class~="hover:bg-tag"][class~="flex"][class~="size-6"][class~="cursor-pointer"]' +
   '[class~="items-center"][class~="justify-center"][class~="rounded"]' +
   '[class~="transition-colors"][class~="duration-200"]';
+const QIANWEN_REGENERATE_MENU_ITEM_SELECTOR =
+  '[role="menuitem"][class~="relative"][class~="min-w-0"][class~="flex"][class~="h-9"]' +
+  '[class~="cursor-pointer"][class~="select-none"][class~="items-center"][class~="gap-2"]' +
+  '[class~="rounded-8"][class~="px-3"][class~="py-1.5"][class~="text-sm"]';
 const YUANBAO_REFERENCE_TRIGGER_SELECTOR =
   ".ToolbarSearchGuid_searchGuidTool__M81L2.Toolbar_icon__xGP8b";
 const YUANBAO_REFERENCE_LIST_SELECTOR = ".agent-dialogue-references__list";
 const YUANBAO_OPEN_REFERENCE_LIST_SELECTOR =
   ".t-drawer--open .agent-dialogue-references__list";
 
+/** 豆包列表的轻量快照，用于判断容器是否命中以及引用是否加载稳定。 */
 interface DoubaoReferenceListSnapshot {
   found: boolean;
   visible: boolean;
@@ -40,6 +53,7 @@ interface DoubaoReferenceExtraction extends DoubaoReferenceListSnapshot {
   items: SearchResultCandidate[];
 }
 
+// AI 平台自身或内部跳转域名不能作为外部参考文章输出。
 const INTERNAL_HOST_PATTERNS = [
   /(^|\.)doubao\.com$/,
   /(^|\.)deepseek\.com$/,
@@ -53,6 +67,7 @@ const INTERNAL_HOST_PATTERNS = [
   /(^|\.)bytedance\.com$/
 ];
 
+// 以下脚本在浏览器页面上下文执行，返回值必须保持可序列化。
 const COUNT_HTTP_ANCHORS_SCRIPT = `
 (() => {
   return Array.from(document.querySelectorAll("a[href]"))
@@ -61,6 +76,7 @@ const COUNT_HTTP_ANCHORS_SCRIPT = `
 })()
 `;
 
+/** 通用兼容路径：扫描页面链接并收集邻近文本，不用于四个平台的主流程。 */
 const EXTRACT_REFERENCES_SCRIPT = `
 (() => {
   const scoreAnchor = (anchor) => {
@@ -150,6 +166,7 @@ const EXTRACT_REFERENCES_SCRIPT = `
 })()
 `;
 
+/** DeepSeek：只解析最后一个可见 _223dd7b 容器的直接引用卡片。 */
 const EXTRACT_DEEPSEEK_SEARCH_RESULTS_SCRIPT = `
 (() => {
   const clean = (text) => (text || "").replace(/\\s+/g, " ").trim();
@@ -264,6 +281,7 @@ const EXTRACT_DEEPSEEK_SEARCH_RESULTS_SCRIPT = `
 })()
 `;
 
+/** 千问：解析最后一个可见 list-XPxyL2 的直接子 div 和埋点数据属性。 */
 const EXTRACT_QIANWEN_SEARCH_RESULTS_SCRIPT = `
 (() => {
   const clean = (text) => (text || "").replace(/\\s+/g, " ").trim();
@@ -381,6 +399,7 @@ const EXTRACT_QIANWEN_SEARCH_RESULTS_SCRIPT = `
 })()
 `;
 
+/** 元宝：解析已打开引用抽屉中主列表的直接子 li。 */
 const EXTRACT_YUANBAO_REFERENCES_SCRIPT = `
 (() => {
   const clean = (text) => (text || "").replace(/\\s+/g, " ").trim();
@@ -465,6 +484,10 @@ const EXTRACT_YUANBAO_REFERENCES_SCRIPT = `
 })()
 `;
 
+/**
+ * 从提问前搜索块数量之后寻找豆包最新引用容器。currentQuestion 用于长会话
+ * 删除旧 DOM、复用块数量时重新定位当前回答；includeItems 控制是否解析完整卡片。
+ */
 async function evaluateDoubaoReferenceList(
   page: Page,
   minBlockIndex: number,
@@ -625,6 +648,7 @@ async function evaluateDoubaoReferenceList(
   };
 }
 
+/** 判断豆包引用直接子节点自身或后代是否携带 URL。 */
 async function hasDoubaoUrlNode(child: Locator): Promise<boolean> {
   const ownValues = await Promise.all([
     child.getAttribute("href").catch(() => null),
@@ -635,6 +659,7 @@ async function hasDoubaoUrlNode(child: Locator): Promise<boolean> {
   return await child.locator("a[href], [data-url], [data-href]").count().catch(() => 0) > 0;
 }
 
+/** 返回豆包子卡片内第一个有效 HTTP(S) URL 节点。 */
 async function findDoubaoUrlNode(child: Locator): Promise<{ node: Locator; href: string } | null> {
   const nodes = [child, ...await child.locator("a[href], [data-url], [data-href]").all().catch(() => [])];
   for (const node of nodes) {
@@ -652,6 +677,7 @@ async function findDoubaoUrlNode(child: Locator): Promise<{ node: Locator; href:
   return null;
 }
 
+/** 只展开基线之后、属于当前回答的豆包“参考 N 篇资料”入口。 */
 export async function revealLatestDoubaoReferenceList(
   page: Page,
   selectors: string[],
@@ -737,6 +763,7 @@ export async function revealLatestDoubaoReferenceList(
   return false;
 }
 
+/** 等待豆包引用数量与 URL 集合连续稳定，避免懒加载期间提前解析。 */
 export async function waitForDoubaoReferenceListStable(
   page: Page,
   minBlockIndex: number,
@@ -780,6 +807,7 @@ export async function waitForDoubaoReferenceListStable(
   return false;
 }
 
+/** 等待 DeepSeek 最后一个可见引用容器达到预期数量或持续稳定。 */
 export async function waitForDeepSeekReferenceListStable(
   page: Page,
   timeoutMs: number,
@@ -834,6 +862,7 @@ export async function waitForDeepSeekReferenceListStable(
   return false;
 }
 
+/** 千问当前可见引用列表的数量和 URL 快照。 */
 interface QianwenReferenceListSnapshot {
   found: boolean;
   directChildCount: number;
@@ -841,6 +870,7 @@ interface QianwenReferenceListSnapshot {
   urls: string[];
 }
 
+/** 只统计千问最后一个可见列表的直接子 div。 */
 async function snapshotQianwenReferenceList(page: Page): Promise<QianwenReferenceListSnapshot> {
   const lists = page.locator(`${QIANWEN_REFERENCE_LIST_SELECTOR}:visible`);
   const count = await lists.count().catch(() => 0);
@@ -883,10 +913,15 @@ async function snapshotQianwenReferenceList(page: Page): Promise<QianwenReferenc
   };
 }
 
+/** 统计千问参考入口总数，供提问前后差值识别本题入口。 */
 export async function countQianwenReferenceTriggers(page: Page): Promise<number> {
   return page.locator(QIANWEN_REFERENCE_TRIGGER_SELECTOR).count().catch(() => 0);
 }
 
+/**
+ * 在千问最新回答操作区打开重新生成菜单，再点击文字严格匹配的菜单项。
+ * 图标、外层按钮和菜单项三重约束用于避免误点点赞或分享等相邻控件。
+ */
 export async function clickLatestQianwenRegenerate(page: Page): Promise<boolean> {
   const actions = await page.locator(QIANWEN_ANSWER_ACTION_SELECTOR).all().catch(() => []);
   for (const action of actions.slice().reverse()) {
@@ -901,12 +936,30 @@ export async function clickLatestQianwenRegenerate(page: Page): Promise<boolean>
     ]);
     if (!visible || !enabled) continue;
 
-    await action.scrollIntoViewIfNeeded({ timeout: 5_000 }).catch(() => undefined);
-    return action.click({ timeout: 5_000 }).then(() => true).catch(() => false);
+    const wrapper = action.locator("..");
+    const wrapperClass = await wrapper.getAttribute("class").catch(() => "") || "";
+    const wrapperTokens = new Set(wrapperClass.split(/\s+/).filter(Boolean));
+    const menuTrigger = ["flex", "items-center", "rounded"].every((token) => wrapperTokens.has(token))
+      ? wrapper
+      : action;
+    await menuTrigger.scrollIntoViewIfNeeded({ timeout: 5_000 }).catch(() => undefined);
+    const menuOpened = await menuTrigger.click({ timeout: 5_000 }).then(() => true).catch(() => false);
+    if (!menuOpened) return false;
+
+    const regenerateItem = page.locator(QIANWEN_REGENERATE_MENU_ITEM_SELECTOR)
+      .filter({ hasText: /^重新生成$/ })
+      .last();
+    const itemVisible = await regenerateItem.waitFor({ state: "visible", timeout: 5_000 })
+      .then(() => true)
+      .catch(() => false);
+    if (!itemVisible) return false;
+
+    return regenerateItem.click({ timeout: 5_000 }).then(() => true).catch(() => false);
   }
   return false;
 }
 
+/** 点击基线之后最新的千问参考入口，返回入口标注的预期引用数。 */
 export async function revealLatestQianwenReferenceList(
   page: Page,
   baselineTriggerCount: number,
@@ -951,6 +1004,7 @@ export async function revealLatestQianwenReferenceList(
   return 0;
 }
 
+/** 等待千问卡片达到入口标注数量，或在数量未知时持续稳定。 */
 export async function waitForQianwenReferenceListStable(
   page: Page,
   timeoutMs: number,
@@ -985,6 +1039,7 @@ export async function waitForQianwenReferenceListStable(
   return false;
 }
 
+/** 点击页面位置最靠后的 DeepSeek“X个网页”按钮，并返回 X。 */
 export async function revealLatestDeepSeekReferenceList(
   page: Page,
   timeoutMs = 30_000
@@ -1039,6 +1094,7 @@ export async function revealLatestDeepSeekReferenceList(
   return 0;
 }
 
+// 通用/旧版引用面板可能使用虚拟滚动，先复位再分段扫描才能收集完整列表。
 const RESET_SOURCE_PANEL_SCROLL_SCRIPT = `
 (() => {
   const visibleQianwenLists = Array.from(document.querySelectorAll('[class~="list-XPxyL2"]')).filter((element) => {
@@ -1109,6 +1165,7 @@ const SCROLL_SOURCE_PANEL_SCRIPT = `
 })()
 `;
 
+/** 兼容性入口：依次点击页面上可见的小型引用按钮。 */
 export async function revealReferencePanels(page: Page, selectors: string[]): Promise<void> {
   for (const selector of selectors) {
     const locators = await page.locator(selector).all().catch(() => []);
@@ -1138,10 +1195,12 @@ export async function revealReferencePanels(page: Page, selectors: string[]): Pr
   }
 }
 
+/** 统计元宝参考入口总数，供提问前基线与本轮新增入口切片使用。 */
 export async function countYuanbaoReferenceTriggers(page: Page): Promise<number> {
   return page.locator(YUANBAO_REFERENCE_TRIGGER_SELECTOR).count().catch(() => 0);
 }
 
+/** 点击本轮新增的最新元宝入口，并确认打开抽屉中已挂载首条 li。 */
 export async function revealLatestYuanbaoReferenceList(
   page: Page,
   baselineTriggerCount: number,
@@ -1198,6 +1257,7 @@ export async function revealLatestYuanbaoReferenceList(
   return false;
 }
 
+/** 等待元宝直接子 li 的数量、URL 和标题签名连续稳定。 */
 export async function waitForYuanbaoReferenceListStable(
   page: Page,
   timeoutMs = 15_000
@@ -1249,6 +1309,7 @@ export async function waitForYuanbaoReferenceListStable(
   return false;
 }
 
+/** 通用入口：点击页面最靠后的引用按钮，并可等待指定面板出现。 */
 export async function revealLatestReferencePanel(
   page: Page,
   selectors: string[],
@@ -1296,6 +1357,7 @@ export async function revealLatestReferencePanel(
   return false;
 }
 
+/** 通用入口：只点击基线数量之后新增的引用按钮。 */
 export async function revealNewReferencePanels(page: Page, selectors: string[], baselineCount: number): Promise<void> {
   const locators = await page.locator(selectors.join(", ")).all().catch(() => []);
   for (const [index, locator] of locators.entries()) {
@@ -1308,10 +1370,12 @@ export async function revealNewReferencePanels(page: Page, selectors: string[], 
   }
 }
 
+/** 统计整页 HTTP(S) 链接数，仅供兼容流程观测页面变化。 */
 export async function countHttpAnchors(page: Page): Promise<number> {
   return page.evaluate(COUNT_HTTP_ANCHORS_SCRIPT);
 }
 
+/** 获取当前页面外部链接集合，用于比较引用面板展开前后的变化。 */
 export async function snapshotReferenceUrls(page: Page): Promise<Set<string>> {
   const urls = await page.evaluate<string[]>(`
     (() => {
@@ -1328,22 +1392,30 @@ export async function snapshotReferenceUrls(page: Page): Promise<Set<string>> {
   );
 }
 
+/** 返回文档高度，作为通用抽取判断新内容位置的提问前基线。 */
 export async function snapshotDocumentBottom(page: Page): Promise<number> {
   return page.evaluate<number>("document.body.scrollHeight").catch(() => 0);
 }
 
+/** 按平台配置的选择器统计潜在引用入口。 */
 export async function countReferenceRevealButtons(page: Page, selectors: string[]): Promise<number> {
   return page.locator(selectors.join(", ")).count().catch(() => 0);
 }
 
+/** 统计豆包结构化搜索结果块数量。 */
 export async function countDoubaoSearchResultBlocks(page: Page): Promise<number> {
   return page.locator(DOUBAO_SEARCH_BLOCK_SELECTOR).count().catch(() => 0);
 }
 
+/** 统计 DeepSeek 已挂载的引用容器数量。 */
 export async function countDeepSeekReferenceContainers(page: Page): Promise<number> {
   return page.locator(DEEPSEEK_REFERENCE_CONTAINER_SELECTOR).count().catch(() => 0);
 }
 
+/**
+ * 平台抽取总入口。四个已适配平台走严格结构化解析；只有未知平台才使用
+ * 基于页面位置的通用链接候选流程。
+ */
 export async function extractReferences(
   page: Page,
   question: string,
@@ -1419,6 +1491,7 @@ export async function extractReferences(
   }));
 }
 
+/** 从 DeepSeek 最新可见容器提取并记录诊断信息，不扫描容器外链接。 */
 async function extractDeepSeekReferenceList(
   page: Page,
   question: string,
@@ -1461,6 +1534,7 @@ async function extractDeepSeekReferenceList(
   return records;
 }
 
+/** 将豆包当前引用容器转换为标准记录，并按规范化 URL 去重。 */
 async function extractDoubaoReferenceList(
   page: Page,
   question: string,
@@ -1512,12 +1586,14 @@ async function extractDoubaoReferenceList(
   return records;
 }
 
+/** 清除豆包卡片标题前的列表序号。 */
 function cleanDoubaoReferenceTitle(value: string): string {
   return cleanText(value)
     .replace(/^(?:\[?\d+\]?\s*[.、):：-]\s*|第\s*\d+\s*条\s*)/, "")
     .trim();
 }
 
+/** 只从元宝已打开抽屉的主列表直接子 li 生成标准记录。 */
 async function extractYuanbaoReferenceList(
   page: Page,
   question: string,
@@ -1593,6 +1669,10 @@ async function extractYuanbaoReferenceList(
   return records;
 }
 
+/**
+ * 将浏览器脚本返回的平台候选统一清洗为 ReferenceRecord：解跳转、去跟踪参数、
+ * 过滤内部域名、按 URL 去重，并补齐来源和日期。
+ */
 async function extractStructuredSearchResults(
   page: Page,
   question: string,
@@ -1629,6 +1709,7 @@ async function extractStructuredSearchResults(
   });
 }
 
+/** 分段滚动虚拟列表并合并每一屏候选，最多扫描 12 屏。 */
 async function collectScrollableStructuredResults(page: Page, script: string): Promise<SearchResultCandidate[]> {
   const collected = new Map<string, SearchResultCandidate>();
   await page.evaluate(RESET_SOURCE_PANEL_SCROLL_SCRIPT).catch(() => undefined);
@@ -1655,6 +1736,7 @@ async function collectScrollableStructuredResults(page: Page, script: string): P
   );
 }
 
+/** 移除常见营销跟踪参数和 hash，形成稳定的去重键。 */
 function normalizeUrl(url: string): string {
   try {
     const parsed = new URL(url);
@@ -1669,6 +1751,7 @@ function normalizeUrl(url: string): string {
   }
 }
 
+/** 过滤 AI 平台自身链接；无法解析的 URL 也按无效内部链接处理。 */
 function isInternalUrl(url: string): boolean {
   try {
     const hostname = new URL(url).hostname.replace(/^www\./, "");

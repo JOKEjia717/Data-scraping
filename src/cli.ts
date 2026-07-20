@@ -1,3 +1,7 @@
+/**
+ * CLI 参数与问题文件解析。命令行统一采用 --key=value，问题文件支持
+ * JSON 字符串数组或一行一个问题的纯文本格式。
+ */
 import fs from "node:fs/promises";
 import type { CliOptions, PlatformId } from "./types.js";
 
@@ -5,6 +9,7 @@ const DEFAULT_PLATFORMS: PlatformId[] = ["doubao", "deepseek", "qianwen", "yuanb
 const ALL_PLATFORMS: PlatformId[] = ["doubao", "deepseek", "qianwen", "yuanbao"];
 const DEFAULT_PROMPT_PREFIX = "";
 
+/** 将原始命令行参数转换为带默认值、可直接传给爬虫的配置。 */
 export async function parseCli(argv: string[]): Promise<CliOptions> {
   const args = new Map<string, string>();
   for (const item of argv) {
@@ -23,6 +28,7 @@ export async function parseCli(argv: string[]): Promise<CliOptions> {
   };
 }
 
+/** 读取自定义问题库；JSON 会额外校验顶层必须是字符串数组。 */
 export async function readQuestionFile(filePath: string): Promise<string[]> {
   const content = await fs.readFile(filePath, "utf8");
   if (filePath.endsWith(".json")) {
@@ -39,6 +45,7 @@ export async function readQuestionFile(filePath: string): Promise<string[]> {
     .filter(Boolean);
 }
 
+/** 校验逗号分隔的平台 ID，防止未知值在运行中才触发空配置错误。 */
 function parsePlatforms(value?: string): PlatformId[] {
   if (!value) return DEFAULT_PLATFORMS;
   const platforms = value.split(",").map((item) => item.trim()).filter(Boolean) as PlatformId[];
