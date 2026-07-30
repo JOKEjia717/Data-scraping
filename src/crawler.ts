@@ -4,6 +4,7 @@
  */
 import { chromium, type Locator, type Page } from "playwright";
 import {
+  clickLatestDoubaoRegenerate,
   clickLatestQianwenRegenerate,
   countDeepSeekReferenceContainers,
   countDoubaoSearchResultBlocks,
@@ -11,6 +12,8 @@ import {
   countReferenceRevealButtons,
   countYuanbaoReferenceTriggers,
   extractReferences,
+  hasCurrentDoubaoReferenceEntry,
+  markDoubaoSearchResultBaseline,
   revealLatestDeepSeekReferenceList,
   revealLatestDoubaoReferenceList,
   revealLatestQianwenReferenceList,
@@ -41,13 +44,17 @@ interface TrackedAnswerBaseline {
 }
 
 const REFERENCE_CHECK_ATTEMPTS = 3;
+const DOUBAO_REGENERATION_ATTEMPTS = 3;
 const REFERENCE_REVEAL_TIMEOUT_MS = 10_000;
 const REFERENCE_STABLE_TIMEOUT_MS = 5_000;
+const DOUBAO_REFERENCE_REVEAL_TIMEOUT_MS = 30_000;
+const DOUBAO_REFERENCE_STABLE_TIMEOUT_MS = 15_000;
+const DOUBAO_REFERENCE_READY_STABLE_MS = 4_000;
 const REFERENCE_CHECK_INTERVAL_MS = 1_500;
 
 /**
- * 抓取单个平台的全部问题。单题引用缺失会在三次检查后跳过，登录失效、
- * 输入框不可用或回答生命周期无法确认等平台级错误仍会停止当前任务。
+ * 抓取单个平台的全部问题。单题引用缺失时豆包最多重新生成三次，其他平台
+ * 最多检查三次后跳过；登录失效或回答生命周期无法确认等错误仍会停止当前任务。
  */
 export async function crawlPlatform(
   config: PlatformConfig,
@@ -81,11 +88,14 @@ export async function crawlPlatform(
     const trackedBaseline = config.id === "doubao" || config.id === "deepseek" || config.id === "qianwen" || config.id === "yuanbao"
       ? await snapshotTrackedAnswerBaseline(page, config.id)
       : undefined;
+    // 豆包长会话会同时回收问题气泡和历史搜索块，因此在真正发送前保存现存
+    // 搜索块的元素身份；后续可识别数量减少或索引前移后的本题新入口。
+    if (config.id === "doubao") await markDoubaoSearchResultBaseline(page);
     await submitQuestion(page, config, submittedQuestion);
     await waitForAnswerComplete(page, config, options.timeoutMs, trackedBaseline, submittedQuestion);
     await scrollToBottom(page);
 
-    // 引用入口缺失或列表未稳定只影响当前题；三次检查失败后保留空结果并继续。
+    // 引用入口缺失或列表未稳定只影响当前题；平台恢复策略失败后保留空结果并继续。
     const referenceReady = await prepareCurrentReferenceList(
       page,
       config,
@@ -97,7 +107,9 @@ export async function crawlPlatform(
     if (!referenceReady) {
       if (config.id === "yuanbao") await closeYuanbaoReferencePanel(page);
       console.log(
-        `[${config.name}] 跳过本题：检查 ${REFERENCE_CHECK_ATTEMPTS} 次后仍没有可用参考资料。`
+        config.id === "doubao"
+          ? `[豆包] 跳过本题：原始回答及 ${DOUBAO_REGENERATION_ATTEMPTS} 次重新生成后仍没有可用参考资料。`
+          : `[${config.name}] 跳过本题：检查 ${REFERENCE_CHECK_ATTEMPTS} 次后仍没有可用参考资料。`
       );
       if (baselineRevealButtonCount > 0) {
         console.log(`[${config.name}] 页面存在历史参考入口，但没有确认到属于本题的有效引用列表。`);
@@ -147,8 +159,8 @@ export async function crawlPlatform(
 }
 
 /**
- * 最多检查三次当前题的引用入口和列表稳定性。千问第一次没有入口时仍允许
- * 自动重新生成一次，但重新生成也计入这三次检查流程，不会无限重试。
+ * 豆包使用专属三次重新生成流程；其他平台最多检查三次当前题的引用入口和
+ * 列表稳定性。千问第一次没有入口时允许重新生成一次，但仍计入三次检查。
  */
 async function prepareCurrentReferenceList(
   page: Page,
@@ -158,6 +170,16 @@ async function prepareCurrentReferenceList(
   baselineDoubaoSearchBlockCount: number,
   submittedQuestion: string
 ): Promise<boolean> {
+  if (config.id === "doubao") {
+    return prepareDoubaoReferenceList(
+      page,
+      config,
+      answerTimeoutMs,
+      baselineDoubaoSearchBlockCount,
+      submittedQuestion
+    );
+  }
+
   let referenceTriggerBaseline = trackedBaseline?.referenceCount ?? 0;
   let qianwenRegenerated = false;
 
@@ -203,6 +225,87 @@ async function prepareCurrentReferenceList(
   return false;
 }
 
+/**
+ * 豆包原始回答没有引用时，最多重新生成三次。每次必须确认生成真正开始并完整结束，
+ * 然后只检查当前问题的新引用；三次仍为空时交给外层跳过本题。
+ */
+async function prepareDoubaoReferenceList(
+  page: Page,
+  config: PlatformConfig,
+  answerTimeoutMs: number,
+  baselineDoubaoSearchBlockCount: number,
+  submittedQuestion: string
+): Promise<boolean> {
+  const originalReady = await checkCurrentReferenceListOnce(
+    page,
+    config,
+    0,
+    baselineDoubaoSearchBlockCount,
+    submittedQuestion
+  ).catch((error) => {
+    console.log(`[豆包] 原始回答参考资料检查异常：${formatError(error)}`);
+    return false;
+  });
+  if (originalReady) return true;
+
+  console.log("[豆包] 原始回答没有可用参考资料，开始自动重新生成。");
+  for (let attempt = 1; attempt <= DOUBAO_REGENERATION_ATTEMPTS; attempt += 1) {
+    const regenerationBaseline = await snapshotTrackedAnswerBaseline(page, "doubao");
+    console.log(`[豆包] 正在执行第 ${attempt}/${DOUBAO_REGENERATION_ATTEMPTS} 次重新生成。`);
+    const clicked = await clickLatestDoubaoRegenerate(page);
+    if (!clicked) {
+      console.log(`[豆包] 第 ${attempt} 次未能安全定位或点击当前回答的重新生成按钮。`);
+      if (attempt < DOUBAO_REGENERATION_ATTEMPTS) {
+        await page.waitForTimeout(REFERENCE_CHECK_INTERVAL_MS);
+        await scrollToBottom(page);
+      }
+      continue;
+    }
+
+    const started = await waitForDoubaoRegenerationStart(page, regenerationBaseline, 15_000);
+    if (!started) {
+      console.log(`[豆包] 第 ${attempt} 次点击后 15 秒内未检测到重新生成启动。`);
+      if (attempt < DOUBAO_REGENERATION_ATTEMPTS) {
+        await page.waitForTimeout(REFERENCE_CHECK_INTERVAL_MS);
+        await scrollToBottom(page);
+      }
+      continue;
+    }
+
+    await waitForAnswerComplete(
+      page,
+      config,
+      answerTimeoutMs,
+      regenerationBaseline,
+      submittedQuestion,
+      true
+    );
+    await scrollToBottom(page);
+    const ready = await checkCurrentReferenceListOnce(
+      page,
+      config,
+      0,
+      baselineDoubaoSearchBlockCount,
+      submittedQuestion
+    ).catch((error) => {
+      console.log(`[豆包] 第 ${attempt} 次重新生成后的参考资料检查异常：${formatError(error)}`);
+      return false;
+    });
+    if (ready) {
+      console.log(`[豆包] 第 ${attempt} 次重新生成后已找到可用参考资料。`);
+      return true;
+    }
+
+    console.log(`[豆包] 第 ${attempt}/${DOUBAO_REGENERATION_ATTEMPTS} 次重新生成后仍没有可用参考资料。`);
+    if (attempt < DOUBAO_REGENERATION_ATTEMPTS) {
+      await page.waitForTimeout(REFERENCE_CHECK_INTERVAL_MS);
+      await scrollToBottom(page);
+    }
+  }
+
+  return false;
+}
+
 /** 执行一次平台专属的“展开最新引用 + 等待列表稳定”。 */
 async function checkCurrentReferenceListOnce(
   page: Page,
@@ -217,12 +320,12 @@ async function checkCurrentReferenceListOnce(
       config.referenceRevealSelectors,
       baselineDoubaoSearchBlockCount,
       submittedQuestion,
-      REFERENCE_REVEAL_TIMEOUT_MS
+      DOUBAO_REFERENCE_REVEAL_TIMEOUT_MS
     );
     return revealed && await waitForDoubaoReferenceListStable(
       page,
       baselineDoubaoSearchBlockCount,
-      REFERENCE_STABLE_TIMEOUT_MS,
+      DOUBAO_REFERENCE_STABLE_TIMEOUT_MS,
       submittedQuestion
     );
   }
@@ -523,7 +626,8 @@ async function waitForAnswerComplete(
   config: PlatformConfig,
   timeoutMs: number,
   trackedBaseline?: TrackedAnswerBaseline,
-  submittedQuestion = ""
+  submittedQuestion = "",
+  answerStartAlreadyConfirmed = false
 ): Promise<void> {
   if (config.id === "doubao" || config.id === "deepseek" || config.id === "qianwen" || config.id === "yuanbao") {
     if (!trackedBaseline) throw new Error(`[${config.name}] 缺少回答前页面快照，无法安全判断本题是否完成。`);
@@ -533,7 +637,8 @@ async function waitForAnswerComplete(
       trackedBaseline,
       submittedQuestion,
       config.id,
-      config.name
+      config.name,
+      answerStartAlreadyConfirmed
     );
     await waitForReadyToSend(page, config, 30_000);
     return;
@@ -562,6 +667,29 @@ async function snapshotTrackedAnswerBaseline(
           ? await countYuanbaoReferenceTriggers(page)
         : bodyText.split(referenceLabel).length - 1
   };
+}
+
+/** 豆包点击“重新生成”后快速确认回答正文、页面高度或引用结构已经开始变化。 */
+async function waitForDoubaoRegenerationStart(
+  page: Page,
+  baseline: TrackedAnswerBaseline,
+  timeoutMs: number
+): Promise<boolean> {
+  const startedAt = Date.now();
+
+  while (Date.now() - startedAt < timeoutMs) {
+    const [snapshot, busy] = await Promise.all([
+      snapshotTrackedAnswerBaseline(page, "doubao"),
+      isAnswerGenerating(page)
+    ]);
+    const textChanged = Math.abs(snapshot.bodyText.length - baseline.bodyText.length) >= 30;
+    const layoutChanged = Math.abs(snapshot.documentBottom - baseline.documentBottom) >= 120;
+    const referencesChanged = snapshot.referenceCount !== baseline.referenceCount;
+    if (busy || textChanged || layoutChanged || referencesChanged) return true;
+    await page.waitForTimeout(250);
+  }
+
+  return false;
 }
 
 /**
@@ -606,14 +734,16 @@ async function waitForTrackedAnswerComplete(
   baseline: TrackedAnswerBaseline,
   submittedQuestion: string,
   platformId: "doubao" | "deepseek" | "qianwen" | "yuanbao",
-  platformName: string
+  platformName: string,
+  answerStartAlreadyConfirmed = false
 ): Promise<void> {
   const startedAt = Date.now();
   let lastSnapshot = baseline.bodyText;
   let stableSince = Date.now();
   let sawGenerating = false;
   let meaningfulChanges = 0;
-  let sawAnswerStart = false;
+  let sawAnswerStart = answerStartAlreadyConfirmed;
+  let doubaoReferenceReadySince = 0;
   const referenceLabel = platformId === "qianwen" ? "参考来源" : "引用来源";
   const stableWindowMs = platformId === "yuanbao"
     ? 15_000
@@ -626,7 +756,7 @@ async function waitForTrackedAnswerComplete(
 
   await page.waitForTimeout(1_000);
   while (Date.now() - startedAt < timeoutMs) {
-    const [snapshot, busy, documentBottom, structuredReferenceCount] = await Promise.all([
+    const [snapshot, busy, documentBottom, structuredReferenceCount, currentDoubaoHasReferences] = await Promise.all([
       page.locator("body").innerText({ timeout: 3_000 }).catch(() => ""),
       isAnswerGenerating(page),
       snapshotDocumentBottom(page),
@@ -638,7 +768,10 @@ async function waitForTrackedAnswerComplete(
             ? countQianwenReferenceTriggers(page)
           : platformId === "yuanbao"
             ? countYuanbaoReferenceTriggers(page)
-            : Promise.resolve(0)
+            : Promise.resolve(0),
+      platformId === "doubao" && submittedQuestion
+        ? hasCurrentDoubaoReferenceEntry(page, submittedQuestion, baseline.referenceCount)
+        : Promise.resolve(false)
     ]);
 
     if (busy) sawGenerating = true;
@@ -664,6 +797,7 @@ async function waitForTrackedAnswerComplete(
     sawAnswerStart ||=
       sawGenerating ||
       sawSubmittedQuestion ||
+      currentDoubaoHasReferences ||
       referenceCount > baseline.referenceCount ||
       (platformId === "yuanbao" && meaningfulChanges >= 3) ||
       ((platformId === "doubao" || platformId === "deepseek") && meaningfulChanges >= 3 && Math.abs(textGrowth) >= 60) ||
@@ -672,8 +806,27 @@ async function waitForTrackedAnswerComplete(
 
     const elapsed = Date.now() - startedAt;
     const stableFor = Date.now() - stableSince;
+    if (platformId === "doubao" && currentDoubaoHasReferences && !busy) {
+      if (doubaoReferenceReadySince === 0) doubaoReferenceReadySince = Date.now();
+    } else {
+      doubaoReferenceReadySince = 0;
+    }
+    const doubaoReferenceReadyFor = doubaoReferenceReadySince > 0
+      ? Date.now() - doubaoReferenceReadySince
+      : 0;
     // 元宝出现新增引用入口即可确认回答阶段完成；其他平台继续等待正文稳定窗口。
     if (platformId === "yuanbao" && referenceCount > baseline.referenceCount && !busy) return;
+    // 豆包的搜索入口属于当前回答且正文已短暂稳定时即可放行。这个信号不依赖
+    // 搜索块总数递增，可兼容长会话回收旧 DOM、复用搜索块数量的情况。
+    if (
+      platformId === "doubao" &&
+      sawAnswerStart &&
+      currentDoubaoHasReferences &&
+      !busy &&
+      stableFor >= DOUBAO_REFERENCE_READY_STABLE_MS &&
+      doubaoReferenceReadyFor >= DOUBAO_REFERENCE_READY_STABLE_MS &&
+      elapsed >= minWaitMs
+    ) return;
     if (sawAnswerStart && !busy && stableFor >= stableWindowMs && elapsed >= minWaitMs) return;
 
     if ((platformId === "doubao" || platformId === "deepseek" || platformId === "qianwen") && elapsed >= nextProgressLogAt) {
@@ -681,6 +834,9 @@ async function waitForTrackedAnswerComplete(
         `[${platformName}] 回答仍在处理中，已等待 ${Math.round(elapsed / 1000)} 秒` +
         `（生成状态=${busy ? "生成中" : "阶段性稳定"}` +
         `，当前问题=${sawSubmittedQuestion ? "已出现" : "未出现"}` +
+        (platformId === "doubao"
+          ? `，当前引用入口=${currentDoubaoHasReferences ? "已出现" : "未出现"}`
+          : "") +
         `，引用结构变化=${referenceCount - baseline.referenceCount}）`
       );
       nextProgressLogAt += 30_000;

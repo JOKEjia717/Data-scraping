@@ -20,6 +20,25 @@ import {
 const DOUBAO_SEARCH_BLOCK_SELECTOR = '[data-plugin-identifier*="search_query_result_block"]';
 const DOUBAO_REFERENCE_CONTAINER_SELECTOR =
   '[class~="relative"][class~="mt-[-8px]"][class~="flex-col"]';
+const DOUBAO_BASELINE_BLOCKS_KEY = "__codexDoubaoBaselineSearchBlocks";
+const DOUBAO_ANSWER_ACTION_SELECTOR =
+  '[class~="flex"][class~="shrink-0"][class~="items-center"][class~="justify-center"]' +
+  '[class~="whitespace-nowrap"][class~="select-none"][class~="rounded-dbx-sm"]' +
+  '[class~="bg-transparent"][class~="relative"][class~="h-fit"][class~="cursor-pointer"]' +
+  '[class~="text-dbx-text-secondary"]';
+const DOUBAO_REGENERATE_SEMANTIC_SELECTOR = [
+  "button[aria-label*='重新生成']",
+  "[role='button'][aria-label*='重新生成']",
+  "button[aria-label*='重新回答']",
+  "[role='button'][aria-label*='重新回答']",
+  "[title*='重新生成']",
+  "[title*='重新回答']",
+  "[data-testid*='regenerat' i]",
+  "[data-testid*='retry' i]",
+  "[data-dbx-name*='regenerat' i]",
+  "[data-dbx-name*='retry' i]",
+  "[data-dbx-name*='refresh' i]"
+].join(", ");
 const DEEPSEEK_REFERENCE_CONTAINER_SELECTOR = '[class~="_223dd7b"]';
 const QIANWEN_REFERENCE_TRIGGER_SELECTOR = '[class~="link-title-igf0OC"]';
 const QIANWEN_REFERENCE_LIST_SELECTOR = '[class~="list-XPxyL2"]';
@@ -51,6 +70,13 @@ interface DoubaoReferenceListSnapshot {
 
 interface DoubaoReferenceExtraction extends DoubaoReferenceListSnapshot {
   items: SearchResultCandidate[];
+}
+
+interface DoubaoBlockScope {
+  allBlocks: Locator[];
+  firstBlockIndex: number;
+  anchoredByQuestion: boolean;
+  anchoredByBaseline: boolean;
 }
 
 // AI 平台自身或内部跳转域名不能作为外部参考文章输出。
@@ -485,8 +511,155 @@ const EXTRACT_YUANBAO_REFERENCES_SCRIPT = `
 `;
 
 /**
- * 从提问前搜索块数量之后寻找豆包最新引用容器。currentQuestion 用于长会话
- * 删除旧 DOM、复用块数量时重新定位当前回答；includeItems 控制是否解析完整卡片。
+ * 优先以当前问题文本节点为锚点，返回它之后的搜索结果块起始位置。提问前的
+ * 搜索块数量只作为问题节点暂时未渲染时的后备，不能假设豆包块数量单调递增。
+ */
+async function resolveDoubaoBlockScope(
+  page: Page,
+  minBlockIndex: number,
+  currentQuestion = ""
+): Promise<DoubaoBlockScope> {
+  const allBlocks = await page.locator(DOUBAO_SEARCH_BLOCK_SELECTOR).all().catch(() => []);
+  if (allBlocks.length === 0) {
+    return {
+      allBlocks,
+      firstBlockIndex: 0,
+      anchoredByQuestion: false,
+      anchoredByBaseline: false
+    };
+  }
+
+  const questionAnchoredIndex = currentQuestion
+    ? await page.evaluate(
+        ({ selector, question }) => {
+          const expected = (question || "").replace(/\s+/g, " ").trim();
+          if (!expected || !document.body) return -1;
+
+          const blocks = Array.from(document.querySelectorAll(selector));
+          const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+          let node: Node | null = walker.nextNode();
+          let exactMatchIndex = -1;
+          let compatibleMatchIndex = -1;
+
+          while (node) {
+            const text = (node.textContent || "").replace(/\s+/g, " ").trim();
+            const isExact = text === expected;
+            const isCompatible =
+              !isExact &&
+              text.includes(expected) &&
+              text.length <= expected.length + 20;
+            if (isExact || isCompatible) {
+              const anchor = node.parentElement;
+              if (anchor) {
+                const followingBlockIndex = blocks.findIndex((block) =>
+                  Boolean(anchor.compareDocumentPosition(block) & Node.DOCUMENT_POSITION_FOLLOWING)
+                );
+                if (followingBlockIndex >= 0) {
+                  if (isExact) exactMatchIndex = followingBlockIndex;
+                  else compatibleMatchIndex = followingBlockIndex;
+                }
+              }
+            }
+            node = walker.nextNode();
+          }
+
+          return exactMatchIndex >= 0 ? exactMatchIndex : compatibleMatchIndex;
+        },
+        { selector: DOUBAO_SEARCH_BLOCK_SELECTOR, question: currentQuestion }
+      ).catch((error) => {
+        console.log(`[豆包] 当前问题 DOM 锚点定位异常：${error instanceof Error ? error.message : String(error)}`);
+        return -1;
+      })
+    : -1;
+
+  if (questionAnchoredIndex >= 0) {
+    return {
+      allBlocks,
+      firstBlockIndex: questionAnchoredIndex,
+      anchoredByQuestion: true,
+      anchoredByBaseline: false
+    };
+  }
+
+  const baselineAnchoredIndex = await page.evaluate(
+    ({ selector, baselineKey }) => {
+      const state = window as unknown as Record<string, WeakSet<Element> | undefined>;
+      const baselineBlocks = state[baselineKey];
+      if (!(baselineBlocks instanceof WeakSet)) return -1;
+
+      const blocks = Array.from(document.querySelectorAll(selector));
+      let latestNewReferenceBlock = -1;
+      for (let index = 0; index < blocks.length; index += 1) {
+        const block = blocks[index];
+        if (baselineBlocks.has(block)) continue;
+        const text = (block.textContent || "").replace(/\s+/g, " ").trim();
+        if (/搜索\s*\d+\s*个关键词，\s*参考\s*\d+\s*篇资料/.test(text)) {
+          latestNewReferenceBlock = index;
+        }
+      }
+      return latestNewReferenceBlock;
+    },
+    {
+      selector: DOUBAO_SEARCH_BLOCK_SELECTOR,
+      baselineKey: DOUBAO_BASELINE_BLOCKS_KEY
+    }
+  ).catch((error) => {
+    console.log(`[豆包] 提问前搜索块身份比较异常：${error instanceof Error ? error.message : String(error)}`);
+    return -1;
+  });
+
+  if (baselineAnchoredIndex >= 0) {
+    return {
+      allBlocks,
+      firstBlockIndex: baselineAnchoredIndex,
+      anchoredByQuestion: false,
+      anchoredByBaseline: true
+    };
+  }
+
+  let firstBlockIndex = Math.max(minBlockIndex, 0);
+  if (firstBlockIndex >= allBlocks.length && currentQuestion) {
+    const bodyText = await page.locator("body").innerText({ timeout: 3_000 }).catch(() => "");
+    const questionIndex = bodyText.lastIndexOf(currentQuestion);
+    const currentAnswerText = questionIndex >= 0
+      ? bodyText.slice(questionIndex + currentQuestion.length)
+      : "";
+    if (/搜索\s*\d+\s*个关键词，\s*参考\s*\d+\s*篇资料/.test(currentAnswerText)) {
+      // 极端情况下问题文本节点被框架合并，仍只检查 DOM 末尾的结果块和占位块。
+      firstBlockIndex = Math.max(allBlocks.length - 2, 0);
+    }
+  }
+
+  return {
+    allBlocks,
+    firstBlockIndex,
+    anchoredByQuestion: false,
+    anchoredByBaseline: false
+  };
+}
+
+/**
+ * 判断严格属于当前问题之后的搜索结果块是否已经出现参考资料入口。回答完成等待
+ * 使用该语义信号，避免因长会话回收旧 DOM 后搜索块总数不增加而一直等待。
+ */
+export async function hasCurrentDoubaoReferenceEntry(
+  page: Page,
+  currentQuestion: string,
+  minBlockIndex = 0
+): Promise<boolean> {
+  if (!currentQuestion) return false;
+  const scope = await resolveDoubaoBlockScope(page, minBlockIndex, currentQuestion);
+  if (!scope.anchoredByQuestion && !scope.anchoredByBaseline) return false;
+
+  for (const block of scope.allBlocks.slice(scope.firstBlockIndex)) {
+    const text = cleanText(await block.innerText().catch(() => ""));
+    if (/搜索\s*\d+\s*个关键词，\s*参考\s*\d+\s*篇资料/.test(text)) return true;
+  }
+  return false;
+}
+
+/**
+ * 从当前问题锚点之后寻找豆包最新引用容器；includeItems 控制是否解析完整卡片。
  */
 async function evaluateDoubaoReferenceList(
   page: Page,
@@ -505,18 +678,11 @@ async function evaluateDoubaoReferenceList(
     urls: [],
     items: []
   };
-  const allBlocks = await page.locator(DOUBAO_SEARCH_BLOCK_SELECTOR).all().catch(() => []);
-  let firstBlockIndex = Math.max(minBlockIndex, 0);
-  if (firstBlockIndex >= allBlocks.length && allBlocks.length > 0 && currentQuestion) {
-    const bodyText = await page.locator("body").innerText({ timeout: 3_000 }).catch(() => "");
-    const questionIndex = bodyText.lastIndexOf(currentQuestion);
-    const currentAnswerText = questionIndex >= 0 ? bodyText.slice(questionIndex + currentQuestion.length) : "";
-    const currentAnswerHasReferences = /搜索\s*\d+\s*个关键词，\s*参考\s*\d+\s*篇资料/.test(currentAnswerText);
-    if (currentAnswerHasReferences) {
-      // 豆包长会话会移除最早回答并复用列表长度；当前回答通常对应末尾的“结果块 + 空占位块”。
-      firstBlockIndex = Math.max(allBlocks.length - 2, 0);
-    }
-  }
+  const { allBlocks, firstBlockIndex } = await resolveDoubaoBlockScope(
+    page,
+    minBlockIndex,
+    currentQuestion
+  );
   const blocks = allBlocks.slice(firstBlockIndex);
   const candidates: Array<{
     block: Locator;
@@ -695,16 +861,11 @@ export async function revealLatestDoubaoReferenceList(
     ).catch(() => null);
     if (existing?.found && existing.visible && existing.linkedChildCount > 0) return true;
 
-    const allBlocks = await page.locator(DOUBAO_SEARCH_BLOCK_SELECTOR).all().catch(() => []);
-    let firstBlockIndex = Math.max(minBlockIndex, 0);
-    if (firstBlockIndex >= allBlocks.length && allBlocks.length > 0 && currentQuestion) {
-      const bodyText = await page.locator("body").innerText({ timeout: 3_000 }).catch(() => "");
-      const questionIndex = bodyText.lastIndexOf(currentQuestion);
-      const currentAnswerText = questionIndex >= 0 ? bodyText.slice(questionIndex + currentQuestion.length) : "";
-      if (/搜索\s*\d+\s*个关键词，\s*参考\s*\d+\s*篇资料/.test(currentAnswerText)) {
-        firstBlockIndex = Math.max(allBlocks.length - 2, 0);
-      }
-    }
+    const { allBlocks, firstBlockIndex } = await resolveDoubaoBlockScope(
+      page,
+      minBlockIndex,
+      currentQuestion
+    );
     const currentBlocks = allBlocks.slice(firstBlockIndex);
     const candidates: Array<{ locator: Locator; blockIndex: number; priority: number; area: number }> = [];
 
@@ -912,6 +1073,74 @@ async function snapshotQianwenReferenceList(page: Page): Promise<QianwenReferenc
     linkedChildCount: data.urls.length,
     urls: data.urls
   };
+}
+
+/** 点击豆包最新回答的重新生成按钮，避免误点历史回答中的同类操作。 */
+export async function clickLatestDoubaoRegenerate(page: Page): Promise<boolean> {
+  const styledActions = await page.locator(DOUBAO_ANSWER_ACTION_SELECTOR).all().catch(() => []);
+  const visibleActions: Locator[] = [];
+  for (const action of styledActions) {
+    const [visible, enabled] = await Promise.all([
+      action.isVisible().catch(() => false),
+      action.isEnabled().catch(() => false)
+    ]);
+    if (visible && enabled) visibleActions.push(action);
+  }
+
+  // 新版豆包的相邻操作按钮共用样式，因此先从图标和数据属性中识别重新生成语义。
+  for (const action of visibleActions.slice().reverse()) {
+    const markedAsRegenerate = await action.evaluate((element) => {
+      const nodes = [element, ...Array.from(element.querySelectorAll("*"))];
+      const marker = nodes.flatMap((node) => [
+        node.textContent || "",
+        node.getAttribute("aria-label") || "",
+        node.getAttribute("title") || "",
+        node.getAttribute("data-testid") || "",
+        node.getAttribute("data-dbx-name") || "",
+        node.getAttribute("data-icon") || "",
+        node.getAttribute("id") || "",
+        node.getAttribute("class") || "",
+        node.getAttribute("href") || ""
+      ]).join(" ");
+      return /重新生成|重新回答|regenerat|retry|refresh/i.test(marker);
+    }).catch(() => false);
+    if (markedAsRegenerate && await clickVisibleDoubaoAction(action)) return true;
+  }
+
+  // 无可读属性时逐个悬浮，通过豆包显示的工具提示确认按钮用途。
+  for (const action of visibleActions.slice().reverse()) {
+    await action.hover({ timeout: 2_000 }).catch(() => undefined);
+    await page.waitForTimeout(500);
+    const tooltips = await page.locator("[role='tooltip']:visible").all().catch(() => []);
+    const tooltipTexts = await Promise.all(
+      tooltips.map((tooltip) => tooltip.innerText().catch(() => ""))
+    );
+    if (tooltipTexts.some((text) => /^(?:重新生成|重新回答)$/.test(text.trim())) &&
+        await clickVisibleDoubaoAction(action)) return true;
+  }
+
+  // 兼容旧版或带 aria/title/data 属性的按钮，并始终从 DOM 末尾的最新回答开始。
+  const semanticActions = await page.locator(DOUBAO_REGENERATE_SEMANTIC_SELECTOR).all().catch(() => []);
+  for (const action of semanticActions.slice().reverse()) {
+    if (await clickVisibleDoubaoAction(action)) return true;
+  }
+
+  // 只有一个匹配用户提供样式的操作时可安全使用；多个无语义按钮时不冒险误点。
+  if (visibleActions.length === 1) {
+    return clickVisibleDoubaoAction(visibleActions[0]);
+  }
+  return false;
+}
+
+/** 滚动并点击一个已确认的豆包回答操作。 */
+async function clickVisibleDoubaoAction(action: Locator): Promise<boolean> {
+  const [visible, enabled] = await Promise.all([
+    action.isVisible().catch(() => false),
+    action.isEnabled().catch(() => false)
+  ]);
+  if (!visible || !enabled) return false;
+  await action.scrollIntoViewIfNeeded({ timeout: 5_000 }).catch(() => undefined);
+  return action.click({ timeout: 5_000 }).then(() => true).catch(() => false);
 }
 
 /** 统计千问参考入口总数，供提问前后差值识别本题入口。 */
@@ -1406,6 +1635,23 @@ export async function countReferenceRevealButtons(page: Page, selectors: string[
 /** 统计豆包结构化搜索结果块数量。 */
 export async function countDoubaoSearchResultBlocks(page: Page): Promise<number> {
   return page.locator(DOUBAO_SEARCH_BLOCK_SELECTOR).count().catch(() => 0);
+}
+
+/**
+ * 提问前在页面上下文保存现有搜索块的元素身份。WeakSet 不修改豆包 DOM，也不会
+ * 阻止旧节点被回收；提问后即使块总数减少，仍可识别本题新挂载的参考入口。
+ */
+export async function markDoubaoSearchResultBaseline(page: Page): Promise<void> {
+  await page.evaluate(
+    ({ selector, baselineKey }) => {
+      const state = window as unknown as Record<string, WeakSet<Element> | undefined>;
+      state[baselineKey] = new WeakSet(document.querySelectorAll(selector));
+    },
+    {
+      selector: DOUBAO_SEARCH_BLOCK_SELECTOR,
+      baselineKey: DOUBAO_BASELINE_BLOCKS_KEY
+    }
+  );
 }
 
 /** 统计 DeepSeek 已挂载的引用容器数量。 */

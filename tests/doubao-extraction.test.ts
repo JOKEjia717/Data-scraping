@@ -7,13 +7,19 @@ import { after, before, test } from "node:test";
 import { chromium, type Browser } from "playwright";
 import { openNewConversation } from "../src/crawler.js";
 import {
+  clickLatestDoubaoRegenerate,
   clickLatestQianwenRegenerate,
+  countDoubaoSearchResultBlocks,
   countQianwenReferenceTriggers,
   countYuanbaoReferenceTriggers,
   extractReferences,
+  hasCurrentDoubaoReferenceEntry,
+  markDoubaoSearchResultBaseline,
   revealLatestDeepSeekReferenceList,
+  revealLatestDoubaoReferenceList,
   revealLatestQianwenReferenceList,
   revealLatestYuanbaoReferenceList,
+  waitForDoubaoReferenceListStable,
   waitForQianwenReferenceListStable,
   waitForYuanbaoReferenceListStable,
   waitForDeepSeekReferenceListStable
@@ -88,6 +94,42 @@ test("豆包只抽取最新搜索结果块的直接引用子节点", async () =>
   assert.ok(records.every((record) => !record.url.includes("old.example.com")));
   assert.ok(records.every((record) => !record.url.includes("body.example.net")));
 
+  await page.close();
+});
+
+test("豆包只点击最新回答中带重新生成语义的操作按钮", async () => {
+  assert.ok(browser);
+  const page = await browser.newPage();
+  const actionClass = [
+    "flex", "shrink-0", "items-center", "justify-center", "font-[400]",
+    "whitespace-nowrap", "select-none", "text-[14px]", "leading-[22px]",
+    "gap-[4px]", "rounded-dbx-sm", "p-[4px]", "transition-colors",
+    "duration-150", "ease-out", "bg-transparent", "relative", "h-fit",
+    "cursor-pointer", "text-dbx-text-secondary"
+  ].join(" ");
+
+  await page.setContent(`
+    <section id="old-answer">
+      <button id="old-regenerate" class="${actionClass}" aria-label="重新生成">
+        <svg data-dbx-name="refresh"></svg>
+      </button>
+    </section>
+    <section id="current-answer">
+      <button id="copy" class="${actionClass}" aria-label="复制"><svg data-dbx-name="copy"></svg></button>
+      <button id="current-regenerate" class="${actionClass}">
+        <svg data-dbx-name="refresh"></svg>
+      </button>
+      <button id="more" class="${actionClass}" aria-label="更多"><svg data-dbx-name="more"></svg></button>
+    </section>
+    <script>
+      for (const button of document.querySelectorAll("button")) {
+        button.addEventListener("click", () => document.body.dataset.clicked = button.id);
+      }
+    </script>
+  `);
+
+  assert.equal(await clickLatestDoubaoRegenerate(page), true);
+  assert.equal(await page.locator("body").getAttribute("data-clicked"), "current-regenerate");
   await page.close();
 });
 
@@ -236,6 +278,139 @@ test("豆包长会话复用搜索块数量时仍能定位当前问题的引用",
   assert.equal(records.length, 1);
   assert.equal(records[0].title, "当前问题引用");
   assert.equal(records[0].url, "https://current.example.com/products");
+  await page.close();
+});
+
+test("豆包旧块回收导致当前块索引前移时按问题锚点展开并抽取", async () => {
+  assert.ok(browser);
+  const page = await browser.newPage();
+  const question = "适合多孩家庭使用的新能源SUV该怎么挑选";
+  const searchBlock = "block_type:10025 | search_query_result_block.search_type:1";
+
+  await page.setContent(`
+    <main>
+      <div data-plugin-identifier="${searchBlock}"></div>
+      <div data-plugin-identifier="${searchBlock}"></div>
+      <div data-plugin-identifier="${searchBlock}"></div>
+      <div data-plugin-identifier="${searchBlock}"></div>
+      <div data-plugin-identifier="${searchBlock}">
+        <div id="old-entry" class="cursor-pointer">搜索 3 个关键词，参考 1 篇资料</div>
+      </div>
+
+      <div class="question">${question}</div>
+      <div id="current-block" data-plugin-identifier="${searchBlock}">
+        <div id="current-entry" class="relative cursor-pointer">
+          搜索 3 个关键词，参考 2 篇资料
+        </div>
+      </div>
+      <div data-plugin-identifier="${searchBlock}"></div>
+    </main>
+    <script>
+      document.querySelector("#old-entry").addEventListener("click", () => {
+        document.body.dataset.oldClicked = "true";
+      });
+      document.querySelector("#current-entry").addEventListener("click", () => {
+        document.body.dataset.currentClicked = "true";
+        const list = document.createElement("div");
+        list.className = "relative mt-[-8px] flex w-full min-w-0 flex-col";
+        list.innerHTML = [
+          '<div><a href="https://current.example.com/one">1. 当前引用一</a></div>',
+          '<div><a href="https://current.example.com/two">2. 当前引用二</a></div>'
+        ].join("");
+        document.querySelector("#current-block").append(list);
+      });
+    </script>
+  `);
+
+  // 提问前共有 6 个块；旧块回收后当前块前移到了索引 5，但总数仍为 7。
+  // 旧逻辑从索引 6 开始只会看到空占位块。
+  const baselineBlockCount = 6;
+  assert.equal(
+    await hasCurrentDoubaoReferenceEntry(page, question, baselineBlockCount),
+    true
+  );
+  assert.equal(
+    await revealLatestDoubaoReferenceList(page, [], baselineBlockCount, question, 3_000),
+    true
+  );
+  assert.equal(await page.locator("body").getAttribute("data-current-clicked"), "true");
+  assert.equal(await page.locator("body").getAttribute("data-old-clicked"), null);
+  assert.equal(
+    await waitForDoubaoReferenceListStable(page, baselineBlockCount, 4_000, question),
+    true
+  );
+
+  const records = await extractReferences(page, question, "豆包", baselineBlockCount);
+  assert.deepEqual(
+    records.map((record) => [record.title, record.url]),
+    [
+      ["当前引用一", "https://current.example.com/one"],
+      ["当前引用二", "https://current.example.com/two"]
+    ]
+  );
+  await page.close();
+});
+
+test("豆包问题气泡被回收时通过提问前元素身份识别当前引用", async () => {
+  assert.ok(browser);
+  const page = await browser.newPage();
+  const question = "30到40万价位新能源家庭SUV选购指南";
+  const searchBlock = "block_type:10025 | search_query_result_block.search_type:1";
+
+  await page.setContent(`
+    <main id="conversation">
+      <div id="old-a" data-plugin-identifier="${searchBlock}"></div>
+      <div id="old-b" data-plugin-identifier="${searchBlock}"></div>
+      <div id="old-reference" data-plugin-identifier="${searchBlock}">
+        <div id="old-entry" class="cursor-pointer">搜索 3 个关键词，参考 1 篇资料</div>
+      </div>
+      <div id="old-placeholder" data-plugin-identifier="${searchBlock}"></div>
+    </main>
+    <script>
+      document.querySelector("#old-entry").addEventListener("click", () => {
+        document.body.dataset.oldClicked = "true";
+      });
+    </script>
+  `);
+  await markDoubaoSearchResultBaseline(page);
+
+  // 豆包回收两个旧块和当前问题气泡，再挂载本题的新回答；搜索块总数由 4
+  // 下降到 3，页面中完全不存在当前问题文本。
+  await page.evaluate(({ searchBlock }) => {
+    document.querySelector("#old-a")?.remove();
+    document.querySelector("#old-b")?.remove();
+    const current = document.createElement("div");
+    current.id = "current-reference";
+    current.setAttribute("data-plugin-identifier", searchBlock);
+    current.innerHTML = `
+      <div id="current-entry" class="relative cursor-pointer">
+        搜索 3 个关键词，参考 1 篇资料
+      </div>
+    `;
+    document.querySelector("#conversation")?.append(current);
+    document.querySelector("#current-entry")?.addEventListener("click", () => {
+      document.body.dataset.currentClicked = "true";
+      const list = document.createElement("div");
+      list.className = "relative mt-[-8px] flex w-full min-w-0 flex-col";
+      list.innerHTML = '<div><a href="https://current.example.com/suv">1. 当前SUV引用</a></div>';
+      current.append(list);
+    });
+  }, { searchBlock });
+
+  assert.equal((await page.locator("body").innerText()).includes(question), false);
+  assert.equal(await countDoubaoSearchResultBlocks(page), 3);
+  assert.equal(await hasCurrentDoubaoReferenceEntry(page, question, 4), true);
+  assert.equal(
+    await revealLatestDoubaoReferenceList(page, [], 4, question, 3_000),
+    true
+  );
+  assert.equal(await page.locator("body").getAttribute("data-current-clicked"), "true");
+  assert.equal(await page.locator("body").getAttribute("data-old-clicked"), null);
+
+  const records = await extractReferences(page, question, "豆包", 4);
+  assert.equal(records.length, 1);
+  assert.equal(records[0].title, "当前SUV引用");
+  assert.equal(records[0].url, "https://current.example.com/suv");
   await page.close();
 });
 
