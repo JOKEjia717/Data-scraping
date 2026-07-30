@@ -21,24 +21,9 @@ const DOUBAO_SEARCH_BLOCK_SELECTOR = '[data-plugin-identifier*="search_query_res
 const DOUBAO_REFERENCE_CONTAINER_SELECTOR =
   '[class~="relative"][class~="mt-[-8px]"][class~="flex-col"]';
 const DOUBAO_BASELINE_BLOCKS_KEY = "__codexDoubaoBaselineSearchBlocks";
-const DOUBAO_ANSWER_ACTION_SELECTOR =
-  '[class~="flex"][class~="shrink-0"][class~="items-center"][class~="justify-center"]' +
-  '[class~="whitespace-nowrap"][class~="select-none"][class~="rounded-dbx-sm"]' +
-  '[class~="bg-transparent"][class~="relative"][class~="h-fit"][class~="cursor-pointer"]' +
-  '[class~="text-dbx-text-secondary"]';
-const DOUBAO_REGENERATE_SEMANTIC_SELECTOR = [
-  "button[aria-label*='重新生成']",
-  "[role='button'][aria-label*='重新生成']",
-  "button[aria-label*='重新回答']",
-  "[role='button'][aria-label*='重新回答']",
-  "[title*='重新生成']",
-  "[title*='重新回答']",
-  "[data-testid*='regenerat' i]",
-  "[data-testid*='retry' i]",
-  "[data-dbx-name*='regenerat' i]",
-  "[data-dbx-name*='retry' i]",
-  "[data-dbx-name*='refresh' i]"
-].join(", ");
+const DOUBAO_ANSWER_CONTAINER_SELECTOR = '[data-container-type="block-v2"]';
+const DOUBAO_ANSWER_BLOCK_SELECTOR = '[data-plugin-identifier*="block_type:10000"]';
+const DOUBAO_BASELINE_ANSWERS_KEY = "__codexDoubaoBaselineAnswerContainers";
 const DEEPSEEK_REFERENCE_CONTAINER_SELECTOR = '[class~="_223dd7b"]';
 const QIANWEN_REFERENCE_TRIGGER_SELECTOR = '[class~="link-title-igf0OC"]';
 const QIANWEN_REFERENCE_LIST_SELECTOR = '[class~="list-XPxyL2"]';
@@ -52,6 +37,7 @@ const QIANWEN_REGENERATE_MENU_ITEM_SELECTOR =
   '[class~="rounded-8"][class~="px-3"][class~="py-1.5"][class~="text-sm"]';
 const YUANBAO_REFERENCE_TRIGGER_SELECTOR =
   ".ToolbarSearchGuid_searchGuidTool__M81L2.Toolbar_icon__xGP8b";
+const YUANBAO_REFERENCE_BASELINE_ATTRIBUTE = "data-codex-yuanbao-baseline";
 const YUANBAO_REFERENCE_LIST_SELECTOR = ".agent-dialogue-references__list";
 const YUANBAO_OPEN_REFERENCE_LIST_SELECTOR =
   ".t-drawer--open .agent-dialogue-references__list";
@@ -1075,74 +1061,6 @@ async function snapshotQianwenReferenceList(page: Page): Promise<QianwenReferenc
   };
 }
 
-/** 点击豆包最新回答的重新生成按钮，避免误点历史回答中的同类操作。 */
-export async function clickLatestDoubaoRegenerate(page: Page): Promise<boolean> {
-  const styledActions = await page.locator(DOUBAO_ANSWER_ACTION_SELECTOR).all().catch(() => []);
-  const visibleActions: Locator[] = [];
-  for (const action of styledActions) {
-    const [visible, enabled] = await Promise.all([
-      action.isVisible().catch(() => false),
-      action.isEnabled().catch(() => false)
-    ]);
-    if (visible && enabled) visibleActions.push(action);
-  }
-
-  // 新版豆包的相邻操作按钮共用样式，因此先从图标和数据属性中识别重新生成语义。
-  for (const action of visibleActions.slice().reverse()) {
-    const markedAsRegenerate = await action.evaluate((element) => {
-      const nodes = [element, ...Array.from(element.querySelectorAll("*"))];
-      const marker = nodes.flatMap((node) => [
-        node.textContent || "",
-        node.getAttribute("aria-label") || "",
-        node.getAttribute("title") || "",
-        node.getAttribute("data-testid") || "",
-        node.getAttribute("data-dbx-name") || "",
-        node.getAttribute("data-icon") || "",
-        node.getAttribute("id") || "",
-        node.getAttribute("class") || "",
-        node.getAttribute("href") || ""
-      ]).join(" ");
-      return /重新生成|重新回答|regenerat|retry|refresh/i.test(marker);
-    }).catch(() => false);
-    if (markedAsRegenerate && await clickVisibleDoubaoAction(action)) return true;
-  }
-
-  // 无可读属性时逐个悬浮，通过豆包显示的工具提示确认按钮用途。
-  for (const action of visibleActions.slice().reverse()) {
-    await action.hover({ timeout: 2_000 }).catch(() => undefined);
-    await page.waitForTimeout(500);
-    const tooltips = await page.locator("[role='tooltip']:visible").all().catch(() => []);
-    const tooltipTexts = await Promise.all(
-      tooltips.map((tooltip) => tooltip.innerText().catch(() => ""))
-    );
-    if (tooltipTexts.some((text) => /^(?:重新生成|重新回答)$/.test(text.trim())) &&
-        await clickVisibleDoubaoAction(action)) return true;
-  }
-
-  // 兼容旧版或带 aria/title/data 属性的按钮，并始终从 DOM 末尾的最新回答开始。
-  const semanticActions = await page.locator(DOUBAO_REGENERATE_SEMANTIC_SELECTOR).all().catch(() => []);
-  for (const action of semanticActions.slice().reverse()) {
-    if (await clickVisibleDoubaoAction(action)) return true;
-  }
-
-  // 只有一个匹配用户提供样式的操作时可安全使用；多个无语义按钮时不冒险误点。
-  if (visibleActions.length === 1) {
-    return clickVisibleDoubaoAction(visibleActions[0]);
-  }
-  return false;
-}
-
-/** 滚动并点击一个已确认的豆包回答操作。 */
-async function clickVisibleDoubaoAction(action: Locator): Promise<boolean> {
-  const [visible, enabled] = await Promise.all([
-    action.isVisible().catch(() => false),
-    action.isEnabled().catch(() => false)
-  ]);
-  if (!visible || !enabled) return false;
-  await action.scrollIntoViewIfNeeded({ timeout: 5_000 }).catch(() => undefined);
-  return action.click({ timeout: 5_000 }).then(() => true).catch(() => false);
-}
-
 /** 统计千问参考入口总数，供提问前后差值识别本题入口。 */
 export async function countQianwenReferenceTriggers(page: Page): Promise<number> {
   return page.locator(QIANWEN_REFERENCE_TRIGGER_SELECTOR).count().catch(() => 0);
@@ -1430,18 +1348,143 @@ export async function countYuanbaoReferenceTriggers(page: Page): Promise<number>
   return page.locator(YUANBAO_REFERENCE_TRIGGER_SELECTOR).count().catch(() => 0);
 }
 
+/**
+ * 在发送问题前标记当前已经存在的元宝参考入口。长会话会回收历史 DOM，元素标记
+ * 比单纯记录总数更可靠；后续还会结合当前问题的 DOM 顺序处理节点复用。
+ */
+export async function markYuanbaoReferenceTriggerBaseline(
+  page: Page
+): Promise<{ marker: string; count: number }> {
+  const marker = `yb-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+  const selector = JSON.stringify(YUANBAO_REFERENCE_TRIGGER_SELECTOR);
+  const attribute = JSON.stringify(YUANBAO_REFERENCE_BASELINE_ATTRIBUTE);
+  const markerValue = JSON.stringify(marker);
+  const count = await page.evaluate<number>(`
+(() => {
+  const elements = Array.from(document.querySelectorAll(${selector}));
+  for (const element of elements) element.setAttribute(${attribute}, ${markerValue});
+  return elements.length;
+})()
+`).catch(() => 0);
+  return { marker, count };
+}
+
+interface YuanbaoTriggerCandidates {
+  indexes: number[];
+  total: number;
+  unmarkedCount: number;
+  questionFound: boolean;
+  afterQuestionCount: number;
+}
+
+async function locateCurrentYuanbaoTriggerCandidates(
+  page: Page,
+  baselineMarker: string,
+  currentQuestion: string
+): Promise<YuanbaoTriggerCandidates> {
+  const selector = JSON.stringify(YUANBAO_REFERENCE_TRIGGER_SELECTOR);
+  const attribute = JSON.stringify(YUANBAO_REFERENCE_BASELINE_ATTRIBUTE);
+  const marker = JSON.stringify(baselineMarker);
+  const question = JSON.stringify(cleanText(currentQuestion));
+  return page.evaluate<YuanbaoTriggerCandidates>(`
+(() => {
+  const clean = (value) => (value || "").replace(/\\s+/g, " ").trim();
+  const isVisible = (element) => {
+    if (!(element instanceof HTMLElement)) return false;
+    const rect = element.getBoundingClientRect();
+    const style = window.getComputedStyle(element);
+    return rect.width > 0 && rect.height > 0 && style.display !== "none" && style.visibility !== "hidden";
+  };
+  const triggers = Array.from(document.querySelectorAll(${selector}));
+  const questionText = ${question};
+  const questionCandidates = questionText
+    ? Array.from(document.querySelectorAll("body *"))
+        .map((element, index) => ({ element, index }))
+        .filter(({ element }) => isVisible(element))
+        .filter(({ element }) => clean(element.textContent) === questionText)
+        .sort((a, b) => {
+          const aRect = a.element.getBoundingClientRect();
+          const bRect = b.element.getBoundingClientRect();
+          return (aRect.width * aRect.height) - (bRect.width * bRect.height) ||
+            b.index - a.index;
+        })
+    : [];
+  const questionElement = questionCandidates[0]?.element || null;
+  const statuses = triggers.map((trigger, index) => ({
+    index,
+    marked: trigger.getAttribute(${attribute}) === ${marker},
+    afterQuestion: Boolean(
+      questionElement &&
+      (questionElement.compareDocumentPosition(trigger) & Node.DOCUMENT_POSITION_FOLLOWING)
+    )
+  }));
+  const unmarkedAfterQuestion = statuses.filter((item) => !item.marked && item.afterQuestion);
+  const afterQuestion = statuses.filter((item) => item.afterQuestion);
+  const unmarked = statuses.filter((item) => !item.marked);
+  const selected = questionElement
+    ? unmarkedAfterQuestion.length > 0
+      ? unmarkedAfterQuestion
+      : afterQuestion
+    : unmarked;
+  return {
+    indexes: selected.map((item) => item.index),
+    total: triggers.length,
+    unmarkedCount: unmarked.length,
+    questionFound: Boolean(questionElement),
+    afterQuestionCount: afterQuestion.length
+  };
+})()
+`).catch(() => ({
+    indexes: [],
+    total: 0,
+    unmarkedCount: 0,
+    questionFound: false,
+    afterQuestionCount: 0
+  }));
+}
+
+/** 统计相对本题基线新出现的入口，供回答生命周期提前结束判断使用。 */
+export async function countNewYuanbaoReferenceTriggers(
+  page: Page,
+  baselineMarker: string
+): Promise<number> {
+  if (!baselineMarker) return countYuanbaoReferenceTriggers(page);
+  const selector = JSON.stringify(YUANBAO_REFERENCE_TRIGGER_SELECTOR);
+  const attribute = JSON.stringify(YUANBAO_REFERENCE_BASELINE_ATTRIBUTE);
+  const marker = JSON.stringify(baselineMarker);
+  return page.evaluate<number>(`
+(() => Array.from(document.querySelectorAll(${selector}))
+  .filter((element) => element.getAttribute(${attribute}) !== ${marker})
+  .length)()
+`).catch(() => 0);
+}
+
 /** 点击本轮新增的最新元宝入口，并确认打开抽屉中已挂载首条 li。 */
 export async function revealLatestYuanbaoReferenceList(
   page: Page,
-  baselineTriggerCount: number,
+  baselineMarker: string,
+  currentQuestion: string,
   timeoutMs = 30_000
 ): Promise<boolean> {
   const startedAt = Date.now();
+  let lastCandidateSnapshot: YuanbaoTriggerCandidates = {
+    indexes: [],
+    total: 0,
+    unmarkedCount: 0,
+    questionFound: false,
+    afterQuestionCount: 0
+  };
 
   while (Date.now() - startedAt < timeoutMs) {
     const triggers = await page.locator(YUANBAO_REFERENCE_TRIGGER_SELECTOR).all().catch(() => []);
-    const newTriggers = triggers.slice(Math.max(baselineTriggerCount, 0));
-    for (const [offset, trigger] of Array.from(newTriggers.entries()).reverse()) {
+    lastCandidateSnapshot = await locateCurrentYuanbaoTriggerCandidates(
+      page,
+      baselineMarker,
+      currentQuestion
+    );
+    for (const triggerIndex of lastCandidateSnapshot.indexes.slice().reverse()) {
+      const trigger = triggers[triggerIndex];
+      if (!trigger) continue;
       const [visible, enabled] = await Promise.all([
         trigger.isVisible().catch(() => false),
         trigger.isEnabled().catch(() => false)
@@ -1452,9 +1495,8 @@ export async function revealLatestYuanbaoReferenceList(
       const clicked = await trigger.click({ timeout: 5_000 }).then(() => true).catch(() => false);
       if (!clicked) continue;
 
-      const triggerIndex = baselineTriggerCount + offset;
       console.log(
-        `[元宝] 已点击本轮新增参考入口 ${triggerIndex + 1}/${triggers.length}` +
+        `[元宝] 已点击当前问题参考入口 ${triggerIndex + 1}/${triggers.length}` +
         `（class="ToolbarSearchGuid_searchGuidTool__M81L2 Toolbar_icon__xGP8b"）`
       );
 
@@ -1483,6 +1525,14 @@ export async function revealLatestYuanbaoReferenceList(
 
     await page.waitForTimeout(250);
   }
+
+  console.log(
+    "[元宝] 当前问题参考入口定位失败：" +
+    `Toolbar总数=${lastCandidateSnapshot.total}` +
+    `，未标记入口=${lastCandidateSnapshot.unmarkedCount}` +
+    `，问题锚点=${lastCandidateSnapshot.questionFound ? "已找到" : "未找到"}` +
+    `，问题之后入口=${lastCandidateSnapshot.afterQuestionCount}`
+  );
 
   return false;
 }
@@ -1643,15 +1693,117 @@ export async function countDoubaoSearchResultBlocks(page: Page): Promise<number>
  */
 export async function markDoubaoSearchResultBaseline(page: Page): Promise<void> {
   await page.evaluate(
-    ({ selector, baselineKey }) => {
+    ({ selector, baselineKey, answerContainerSelector, answerBaselineKey }) => {
       const state = window as unknown as Record<string, WeakSet<Element> | undefined>;
       state[baselineKey] = new WeakSet(document.querySelectorAll(selector));
+      state[answerBaselineKey] = new WeakSet(
+        document.querySelectorAll(answerContainerSelector)
+      );
     },
     {
       selector: DOUBAO_SEARCH_BLOCK_SELECTOR,
-      baselineKey: DOUBAO_BASELINE_BLOCKS_KEY
+      baselineKey: DOUBAO_BASELINE_BLOCKS_KEY,
+      answerContainerSelector: DOUBAO_ANSWER_CONTAINER_SELECTOR,
+      answerBaselineKey: DOUBAO_BASELINE_ANSWERS_KEY
     }
   );
+}
+
+/**
+ * 提取本题最后一次挂载的豆包回答正文。只读取 block-v2 下的 block_type:10000，
+ * 因而不会混入搜索入口(10025)、相关视频(10050)、引用列表或回答操作按钮。
+ */
+export async function extractLatestDoubaoAnswer(page: Page): Promise<string> {
+  const containerIndex = await page.evaluate(
+    ({ containerSelector, answerBlockSelector, answerBaselineKey }) => {
+      const state = window as unknown as Record<string, WeakSet<Element> | undefined>;
+      const baselineAnswers = state[answerBaselineKey];
+      if (!(baselineAnswers instanceof WeakSet)) return -1;
+
+      const containers = Array.from(document.querySelectorAll(containerSelector));
+      for (let index = containers.length - 1; index >= 0; index -= 1) {
+        const container = containers[index];
+        if (baselineAnswers.has(container)) continue;
+        if (container.querySelector(answerBlockSelector)) return index;
+      }
+      return -1;
+    },
+    {
+      containerSelector: DOUBAO_ANSWER_CONTAINER_SELECTOR,
+      answerBlockSelector: DOUBAO_ANSWER_BLOCK_SELECTOR,
+      answerBaselineKey: DOUBAO_BASELINE_ANSWERS_KEY
+    }
+  ).catch((error) => {
+    console.log(`[豆包] 当前回答容器身份比较异常：${error instanceof Error ? error.message : String(error)}`);
+    return -1;
+  });
+  let container: Locator | null = containerIndex >= 0
+    ? page.locator(DOUBAO_ANSWER_CONTAINER_SELECTOR).nth(containerIndex)
+    : null;
+  if (!container) {
+    // 极少数版本可能复用外层 block-v2，但会为本题重新挂载搜索块。此时利用
+    // 提问前搜索块 WeakSet 找到当前入口，再反向取得它所属的回答容器。
+    const scope = await resolveDoubaoBlockScope(page, 0);
+    if (scope.anchoredByBaseline) {
+      const currentBlocks = scope.allBlocks.slice(scope.firstBlockIndex);
+      for (const block of currentBlocks.slice().reverse()) {
+        const text = cleanText(await block.innerText().catch(() => ""));
+        if (!/参考\s*\d+\s*篇资料/.test(text)) continue;
+        const ancestor = block.locator(
+          "xpath=ancestor::*[@data-container-type='block-v2'][1]"
+        );
+        if (await ancestor.count().catch(() => 0) > 0) {
+          container = ancestor;
+          break;
+        }
+      }
+    }
+  }
+  if (!container) return "";
+
+  let answerBlocks = container.locator(`:scope > ${DOUBAO_ANSWER_BLOCK_SELECTOR}`);
+  if (await answerBlocks.count().catch(() => 0) === 0) {
+    answerBlocks = container.locator(DOUBAO_ANSWER_BLOCK_SELECTOR);
+  }
+
+  const texts: string[] = [];
+  for (const block of await answerBlocks.all().catch(() => [])) {
+    const rawText = await block.evaluate((element) => {
+      const clone = element.cloneNode(true) as HTMLElement;
+      const removable = clone.querySelectorAll(
+        "button, [role='button'], [data-copy-ignore], script, style, noscript, [contenteditable='true']"
+      );
+      for (let index = 0; index < removable.length; index += 1) {
+        removable[index].remove();
+      }
+
+      // detached 节点的 innerText 在 Chromium 中可能为空，短暂挂到屏幕外计算布局，
+      // 读取后立即移除；不会改动豆包原始回答节点。
+      const wrapper = document.createElement("div");
+      wrapper.style.cssText =
+        "position:fixed;left:-100000px;top:0;width:1000px;opacity:0;" +
+        "pointer-events:none;z-index:-1;";
+      wrapper.appendChild(clone);
+      document.body.appendChild(wrapper);
+      const text = clone.innerText;
+      wrapper.remove();
+      return text;
+    }).catch(() => "");
+    const text = cleanDoubaoAnswerText(rawText);
+    if (text) texts.push(text);
+  }
+  return cleanDoubaoAnswerText(texts.join("\n\n"));
+}
+
+/** 保留回答段落和表格换行，同时清理行尾空白与过多空行。 */
+function cleanDoubaoAnswerText(value: string): string {
+  return value
+    .replace(/\r\n?/g, "\n")
+    .split("\n")
+    .map((line) => line.replace(/[ \t]+/g, " ").trim())
+    .join("\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
 }
 
 /** 统计 DeepSeek 已挂载的引用容器数量。 */

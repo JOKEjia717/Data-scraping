@@ -4,11 +4,12 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  answersToCsv,
   groupPlatformRecordsByQuestion,
   groupRecordsByPlatform,
   groupRecordsByQuestion
 } from "../src/output.js";
-import type { ReferenceRecord } from "../src/types.js";
+import type { AnswerRecord, ReferenceRecord } from "../src/types.js";
 
 test("汇总记录按问题和平台分组，并移除平台记录中重复的问题字段", () => {
   const questions = ["问题一", "问题二"];
@@ -67,4 +68,23 @@ test("汇总记录按问题和平台分组，并移除平台记录中重复的�
       元宝: []
     }
   });
+});
+
+test("最终回答 CSV 保留固定字段并正确转义多行正文", () => {
+  const answers: AnswerRecord[] = [{
+    question: "问题一",
+    crawlPlatform: "豆包",
+    answer: "第一段，包含逗号\n第二段包含\"引号\"",
+    generationNumber: 3,
+    referenceCount: 15,
+    extractedAt: "2026-07-30T10:00:00.000Z"
+  }];
+
+  const csv = answersToCsv(answers);
+  assert.equal(
+    csv.split("\n")[0],
+    "question,crawlPlatform,answer,generationNumber,referenceCount,extractedAt"
+  );
+  assert.ok(csv.includes('"第一段，包含逗号\n第二段包含""引号"""'));
+  assert.ok(csv.includes(",3,15,2026-07-30T10:00:00.000Z"));
 });

@@ -16,18 +16,28 @@ async function main(): Promise<void> {
 
   // 平台串行运行，避免四个动态页面同时生成回答而争抢浏览器和网络资源。
   for (const platformId of options.platforms) {
-    const platformRecords = await crawlPlatform(
+    const platformResult = await crawlPlatform(
       PLATFORMS[platformId],
       { ...options, questions },
-      async (partialRecords) => {
+      async (partialResult) => {
         // onProgress 在每道题完成后触发；此时立即落盘，异常退出时也能保留进度。
-        await writePlatformOutputs(options.outDir, platformId, partialRecords);
-        await writeOutputs(options.outDir, [...allRecords, ...partialRecords], questions);
+        await writePlatformOutputs(
+          options.outDir,
+          platformId,
+          partialResult.references,
+          partialResult.answers
+        );
+        await writeOutputs(options.outDir, [...allRecords, ...partialResult.references], questions);
       }
     );
 
-    allRecords.push(...platformRecords);
-    await writePlatformOutputs(options.outDir, platformId, platformRecords);
+    allRecords.push(...platformResult.references);
+    await writePlatformOutputs(
+      options.outDir,
+      platformId,
+      platformResult.references,
+      platformResult.answers
+    );
     await writeOutputs(options.outDir, allRecords, questions);
   }
 

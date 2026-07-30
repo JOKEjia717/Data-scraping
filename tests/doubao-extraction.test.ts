@@ -5,13 +5,13 @@
 import assert from "node:assert/strict";
 import { after, before, test } from "node:test";
 import { chromium, type Browser } from "playwright";
-import { openNewConversation } from "../src/crawler.js";
+import { detectQianwenAnswerLoop, openNewConversation } from "../src/crawler.js";
 import {
-  clickLatestDoubaoRegenerate,
   clickLatestQianwenRegenerate,
   countDoubaoSearchResultBlocks,
   countQianwenReferenceTriggers,
   countYuanbaoReferenceTriggers,
+  extractLatestDoubaoAnswer,
   extractReferences,
   hasCurrentDoubaoReferenceEntry,
   markDoubaoSearchResultBaseline,
@@ -27,6 +27,27 @@ import {
 import { PLATFORMS } from "../src/platforms.js";
 
 let browser: Browser | undefined;
+
+test("千问回答重复循环检测能识别崩坏正文且不误判正常长回答", () => {
+  const repeatedLines = [
+    "关于钛7的座椅配置，材料未提及座椅加热通风按摩等功能。",
+    "关于钛7的车身结构，材料未提及高强度笼式车身。",
+    "关于钛7的屏幕尺寸，材料未提及具体屏幕尺寸。",
+    "关于钛7的底盘悬架，材料未提及具体悬架类型。",
+    "关于钛7的纯电续航，材料未提及具体数值。",
+    "关于钛7的亏电油耗，材料未提及具体数值。"
+  ];
+  const brokenAnswer = Array.from({ length: 5 }, () => repeatedLines).flat().join("\n");
+  const brokenResult = detectQianwenAnswerLoop(brokenAnswer);
+  assert.equal(brokenResult.detected, true);
+  assert.equal(brokenResult.maxRepeatCount, 5);
+
+  const normalAnswer = Array.from(
+    { length: 30 },
+    (_, index) => `这是正常回答的第${index + 1}项，每一项都包含不同且有意义的产品信息。`
+  ).join("\n");
+  assert.equal(detectQianwenAnswerLoop(normalAnswer).detected, false);
+});
 
 // 所有用例复用同一个浏览器进程，每个用例创建独立页面避免 DOM 状态互相污染。
 before(async () => {
@@ -94,42 +115,6 @@ test("豆包只抽取最新搜索结果块的直接引用子节点", async () =>
   assert.ok(records.every((record) => !record.url.includes("old.example.com")));
   assert.ok(records.every((record) => !record.url.includes("body.example.net")));
 
-  await page.close();
-});
-
-test("豆包只点击最新回答中带重新生成语义的操作按钮", async () => {
-  assert.ok(browser);
-  const page = await browser.newPage();
-  const actionClass = [
-    "flex", "shrink-0", "items-center", "justify-center", "font-[400]",
-    "whitespace-nowrap", "select-none", "text-[14px]", "leading-[22px]",
-    "gap-[4px]", "rounded-dbx-sm", "p-[4px]", "transition-colors",
-    "duration-150", "ease-out", "bg-transparent", "relative", "h-fit",
-    "cursor-pointer", "text-dbx-text-secondary"
-  ].join(" ");
-
-  await page.setContent(`
-    <section id="old-answer">
-      <button id="old-regenerate" class="${actionClass}" aria-label="重新生成">
-        <svg data-dbx-name="refresh"></svg>
-      </button>
-    </section>
-    <section id="current-answer">
-      <button id="copy" class="${actionClass}" aria-label="复制"><svg data-dbx-name="copy"></svg></button>
-      <button id="current-regenerate" class="${actionClass}">
-        <svg data-dbx-name="refresh"></svg>
-      </button>
-      <button id="more" class="${actionClass}" aria-label="更多"><svg data-dbx-name="more"></svg></button>
-    </section>
-    <script>
-      for (const button of document.querySelectorAll("button")) {
-        button.addEventListener("click", () => document.body.dataset.clicked = button.id);
-      }
-    </script>
-  `);
-
-  assert.equal(await clickLatestDoubaoRegenerate(page), true);
-  assert.equal(await page.locator("body").getAttribute("data-clicked"), "current-regenerate");
   await page.close();
 });
 
@@ -414,6 +399,62 @@ test("豆包问题气泡被回收时通过提问前元素身份识别当前引�
   await page.close();
 });
 
+test("豆包只提取最后一次生成的正文块并排除搜索、视频和操作按钮", async () => {
+  assert.ok(browser);
+  const page = await browser.newPage();
+  await page.setContent(`
+    <main id="conversation">
+      <div data-container-type="block-v2" id="historical-answer">
+        <div data-plugin-identifier="block_type:10000">历史回答正文</div>
+      </div>
+    </main>
+  `);
+  await markDoubaoSearchResultBaseline(page);
+
+  await page.locator("#conversation").evaluate((conversation) => {
+    conversation.insertAdjacentHTML("beforeend", `
+      <div data-container-type="block-v2" id="original-answer">
+        <div data-plugin-identifier="block_type:10025 | search_query_result_block.search_type:1">
+          搜索 3 个关键词，参考 2 篇资料
+        </div>
+        <div data-plugin-identifier="block_type:10000">
+          <h2>原始回答标题</h2>
+          <p>原始回答正文。</p>
+          <button>复制</button>
+        </div>
+        <div data-plugin-identifier="block_type:10050">相关视频，不应保存</div>
+      </div>
+    `);
+  });
+  assert.equal(
+    await extractLatestDoubaoAnswer(page),
+    "原始回答标题\n\n原始回答正文。"
+  );
+
+  // 模拟重新提问后挂载新版本；旧版本仍在 DOM 中，但最终只读取最后一个新容器。
+  await page.locator("#conversation").evaluate((conversation) => {
+    conversation.insertAdjacentHTML("beforeend", `
+      <div data-container-type="block-v2" id="regenerated-answer">
+        <div data-plugin-identifier="block_type:10025 | search_query_result_block.search_type:1">
+          搜索 3 个关键词，参考 1 篇资料
+        </div>
+        <div data-plugin-identifier="block_type:10000">
+          <h2>最后一次答案</h2>
+          <p>这是重新提问后的最终正文。</p>
+          <div role="button">重新生成</div>
+        </div>
+        <div data-plugin-identifier="block_type:10050">最终相关视频</div>
+      </div>
+    `);
+  });
+
+  const finalAnswer = await extractLatestDoubaoAnswer(page);
+  assert.equal(finalAnswer, "最后一次答案\n\n这是重新提问后的最终正文。");
+  assert.equal(finalAnswer.includes("参考"), false);
+  assert.equal(finalAnswer.includes("视频"), false);
+  await page.close();
+});
+
 test("DeepSeek 只抽取最新可见 _223dd7b 容器的直接引用子节点", async () => {
   assert.ok(browser);
   const page = await browser.newPage();
@@ -531,7 +572,11 @@ test("元宝点击最新 ToolbarSearchGuid 入口并只解析主列表的直接�
     <main>
       <section>
         <div>历史回答</div>
-        <div id="old-yuanbao-source" class="ToolbarSearchGuid_searchGuidTool__M81L2 Toolbar_icon__xGP8b">源</div>
+        <div
+          id="old-yuanbao-source"
+          class="ToolbarSearchGuid_searchGuidTool__M81L2 Toolbar_icon__xGP8b"
+          data-codex-yuanbao-baseline="test-marker"
+        >源</div>
       </section>
       <section>
         <div>当前回答</div>
@@ -568,7 +613,10 @@ test("元宝点击最新 ToolbarSearchGuid 入口并只解析主列表的直接�
   `);
 
   assert.equal(await countYuanbaoReferenceTriggers(page), 2);
-  assert.equal(await revealLatestYuanbaoReferenceList(page, 1, 5_000), true);
+  assert.equal(
+    await revealLatestYuanbaoReferenceList(page, "test-marker", "当前回答", 5_000),
+    true
+  );
   assert.equal(await page.locator("body").getAttribute("data-clicked"), "current");
   assert.equal(await waitForYuanbaoReferenceListStable(page, 5_000), true);
 
@@ -582,6 +630,48 @@ test("元宝点击最新 ToolbarSearchGuid 入口并只解析主列表的直接�
     "https://news.example.com/b"
   ]);
   assert.ok(records.every((record) => !record.url.includes("outside.example.com")));
+  await page.close();
+});
+
+test("元宝长会话复用已标记入口时按当前问题 DOM 锚点点击", async () => {
+  assert.ok(browser);
+  const page = await browser.newPage();
+  await page.setContent(`
+    <main>
+      <section>
+        <div>当前问题</div>
+        <div>当前回答正文</div>
+        <div
+          id="recycled-yuanbao-source"
+          class="ToolbarSearchGuid_searchGuidTool__M81L2 Toolbar_icon__xGP8b"
+          data-codex-yuanbao-baseline="recycled-marker"
+        >源</div>
+      </section>
+    </main>
+    <script>
+      document.querySelector("#recycled-yuanbao-source").addEventListener("click", () => {
+        document.body.dataset.clicked = "recycled-current";
+        const list = document.createElement("ul");
+        list.className = "agent-dialogue-references__list";
+        list.innerHTML =
+          '<li><div data-url="https://news.example.com/recycled">' +
+            '<h4>复用入口引用</h4>' +
+          '</div></li>';
+        document.body.append(list);
+      });
+    </script>
+  `);
+
+  assert.equal(
+    await revealLatestYuanbaoReferenceList(
+      page,
+      "recycled-marker",
+      "当前问题",
+      5_000
+    ),
+    true
+  );
+  assert.equal(await page.locator("body").getAttribute("data-clicked"), "recycled-current");
   await page.close();
 });
 

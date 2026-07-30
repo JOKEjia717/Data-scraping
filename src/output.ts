@@ -7,6 +7,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import type {
+  AnswerRecord,
   CrawlPlatformName,
   GroupedQuestionReferences,
   GroupedReferenceRecord,
@@ -41,9 +42,14 @@ export async function writeOutputs(
 export async function writePlatformOutputs(
   outDir: string,
   platformId: PlatformId,
-  records: ReferenceRecord[]
+  records: ReferenceRecord[],
+  answers: AnswerRecord[] = []
 ): Promise<void> {
-  await writeFlatOutputs(path.join(outDir, platformId), records);
+  const platformDir = path.join(outDir, platformId);
+  await writeFlatOutputs(platformDir, records);
+  if (platformId === "doubao") {
+    await writeAnswerOutputs(platformDir, answers);
+  }
 }
 
 /**
@@ -115,6 +121,13 @@ async function writeFlatOutputs(outDir: string, records: ReferenceRecord[]): Pro
   await fs.writeFile(path.join(outDir, "references.csv"), toCsv(records), "utf8");
 }
 
+/** 豆包最终回答使用独立文件，避免在每条参考文献记录中重复存储长正文。 */
+async function writeAnswerOutputs(outDir: string, answers: AnswerRecord[]): Promise<void> {
+  await fs.mkdir(outDir, { recursive: true });
+  await fs.writeFile(path.join(outDir, "answers.json"), `${JSON.stringify(answers, null, 2)}\n`, "utf8");
+  await fs.writeFile(path.join(outDir, "answers.csv"), answersToCsv(answers), "utf8");
+}
+
 /** 创建包含四个平台键的空扁平分桶，保证后续访问不需要判空。 */
 function createEmptyPlatformRecordGroups(): PlatformRecordGroups {
   return {
@@ -159,6 +172,23 @@ function toCsv(records: ReferenceRecord[]): string {
   ];
 
   const rows = records.map((record) => headers.map((header) => escapeCsv(String(record[header] ?? ""))).join(","));
+  return `${headers.join(",")}\n${rows.join("\n")}\n`;
+}
+
+/** 将最终回答序列化为固定列顺序的 CSV，正文中的换行由 RFC 4180 引号保护。 */
+export function answersToCsv(answers: AnswerRecord[]): string {
+  const headers: Array<keyof AnswerRecord> = [
+    "question",
+    "crawlPlatform",
+    "answer",
+    "generationNumber",
+    "referenceCount",
+    "extractedAt"
+  ];
+
+  const rows = answers.map((record) =>
+    headers.map((header) => escapeCsv(String(record[header] ?? ""))).join(",")
+  );
   return `${headers.join(",")}\n${rows.join("\n")}\n`;
 }
 

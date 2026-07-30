@@ -67,6 +67,16 @@ export interface ReferenceRecord {
   extractedAt: string;
 }
 
+/** 单题最终回答记录；generationNumber 从 1 开始，1 表示原始回答。 */
+export interface AnswerRecord {
+  question: string;
+  crawlPlatform: string;
+  answer: string;
+  generationNumber: number;
+  referenceCount: number;
+  extractedAt: string;
+}
+
 /** 汇总 JSON 中固定展示的平台名称。 */
 export type CrawlPlatformName = "豆包" | "DeepSeek" | "千问" | "元宝";
 
