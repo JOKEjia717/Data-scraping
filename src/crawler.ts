@@ -40,9 +40,14 @@ interface TrackedAnswerBaseline {
   referenceCount: number;
 }
 
+const REFERENCE_CHECK_ATTEMPTS = 3;
+const REFERENCE_REVEAL_TIMEOUT_MS = 10_000;
+const REFERENCE_STABLE_TIMEOUT_MS = 5_000;
+const REFERENCE_CHECK_INTERVAL_MS = 1_500;
+
 /**
- * 抓取单个平台的全部问题。任何结构化平台出现零引用或定位不确定时都会停止，
- * 宁可保留已完成题目，也不继续产生问题与引用错位的数据。
+ * 抓取单个平台的全部问题。单题引用缺失会在三次检查后跳过，登录失效、
+ * 输入框不可用或回答生命周期无法确认等平台级错误仍会停止当前任务。
  */
 export async function crawlPlatform(
   config: PlatformConfig,
@@ -80,104 +85,295 @@ export async function crawlPlatform(
     await waitForAnswerComplete(page, config, options.timeoutMs, trackedBaseline, submittedQuestion);
     await scrollToBottom(page);
 
-    // 各平台引用面板结构不同，分别执行“打开最新面板 + 等待列表稳定”的流程。
-    if (config.id === "doubao") {
-      const revealed = await revealLatestDoubaoReferenceList(
-        page,
-        config.referenceRevealSelectors,
-        baselineDoubaoSearchBlockCount,
-        submittedQuestion
+    // 引用入口缺失或列表未稳定只影响当前题；三次检查失败后保留空结果并继续。
+    const referenceReady = await prepareCurrentReferenceList(
+      page,
+      config,
+      options.timeoutMs,
+      trackedBaseline,
+      baselineDoubaoSearchBlockCount,
+      submittedQuestion
+    );
+    if (!referenceReady) {
+      if (config.id === "yuanbao") await closeYuanbaoReferencePanel(page);
+      console.log(
+        `[${config.name}] 跳过本题：检查 ${REFERENCE_CHECK_ATTEMPTS} 次后仍没有可用参考资料。`
       );
-      if (!revealed) {
-        throw new Error("[豆包] 当前回答结束后仍未找到最新的参考文献容器或展开入口，已停止，避免下一题数据错位。");
+      if (baselineRevealButtonCount > 0) {
+        console.log(`[${config.name}] 页面存在历史参考入口，但没有确认到属于本题的有效引用列表。`);
       }
-      const stable = await waitForDoubaoReferenceListStable(
-        page,
-        baselineDoubaoSearchBlockCount,
-        15_000,
-        submittedQuestion
-      );
-      if (!stable) {
-        throw new Error("[豆包] 当前回答的参考文献列表在 15 秒内没有加载稳定，已停止，避免漏抓或跨题抓取。");
-      }
-    } else if (config.id === "deepseek") {
-      const expectedCount = await revealLatestDeepSeekReferenceList(page, 30_000);
-      if (expectedCount === 0) {
-        throw new Error("[DeepSeek] 没有找到当前回答末尾 class=f93f59e4 的‘X个网页’按钮，或点击后未打开 ._223dd7b 引用列表，已停止后续问题。");
-      }
-      const stable = await waitForDeepSeekReferenceListStable(page, 15_000, expectedCount);
-      if (!stable) {
-        throw new Error(`[DeepSeek] ._223dd7b 参考文献列表在 15 秒内没有加载稳定（按钮标注 ${expectedCount} 个网页），已停止，避免漏抓或跨题抓取。`);
-      }
-    } else if (config.id === "yuanbao") {
-      const baselineTriggerCount = trackedBaseline?.referenceCount ?? 0;
-      const revealed = await revealLatestYuanbaoReferenceList(
-        page,
-        baselineTriggerCount,
-        30_000
-      );
-      if (!revealed) {
-        throw new Error(
-          "[元宝] 没有找到当前回答最新的 ToolbarSearchGuid_searchGuidTool__M81L2.Toolbar_icon__xGP8b 入口，" +
-          "或点击后未加载 agent-dialogue-references__list，已停止后续问题。"
-        );
-      }
-      const stable = await waitForYuanbaoReferenceListStable(page, 15_000);
-      if (!stable) {
-        throw new Error("[元宝] agent-dialogue-references__list 的直接子 li 在 15 秒内没有加载稳定，已停止以避免漏抓。");
-      }
-    } else if (config.id === "qianwen") {
-      let baselineTriggerCount = trackedBaseline?.referenceCount ?? 0;
-      let expectedCount = await revealLatestQianwenReferenceList(page, baselineTriggerCount, 30_000);
-      if (expectedCount === 0) {
-        console.log("[千问] 本题首次回答没有出现 link-title-igf0OC 参考入口，自动重新生成一次。");
-        const regenerationBaseline = await snapshotTrackedAnswerBaseline(page, "qianwen");
-        const clicked = await clickLatestQianwenRegenerate(page);
-        if (!clicked) {
-          throw new Error("[千问] 首次回答没有参考入口，但未能完成‘打开重新生成菜单并点击重新生成项’，已停止后续问题。");
-        }
-
-        const regenerationStarted = await waitForQianwenRegenerationStart(page, regenerationBaseline, 15_000);
-        if (!regenerationStarted) {
-          throw new Error("[千问] 已点击重新生成菜单项，但 15 秒内未检测到生成启动，已停止以避免空等和数据错位。");
-        }
-
-        await waitForAnswerComplete(page, config, options.timeoutMs, regenerationBaseline, "");
-        await scrollToBottom(page);
-        baselineTriggerCount = regenerationBaseline.referenceCount;
-        expectedCount = await revealLatestQianwenReferenceList(page, baselineTriggerCount, 30_000);
-      }
-      if (expectedCount === 0) {
-        throw new Error("[千问] 重新生成一次后仍没有 link-title-igf0OC 参考入口，或点击后未打开 list-XPxyL2，已停止后续问题。");
-      }
-      const stable = await waitForQianwenReferenceListStable(page, 15_000, expectedCount);
-      if (!stable) {
-        throw new Error(`[千问] list-XPxyL2 的直接子 div 在 15 秒内没有加载稳定（入口标注 ${expectedCount} 条），已停止以避免漏抓或跨题抓取。`);
-      }
-    } else {
-      await revealReferencePanels(page, config.referenceRevealSelectors);
-      await page.waitForTimeout(800);
+      await onProgress?.(records);
+      continue;
     }
 
     const extractionBaseline = config.id === "doubao" ? baselineDoubaoSearchBlockCount : baselineBottom;
-    const extractedRecords = await extractReferences(page, question, config.name, extractionBaseline);
+    const extractedRecords = await extractReferencesWithRetries(
+      page,
+      question,
+      config.name,
+      extractionBaseline
+    );
     if (config.id === "yuanbao") await closeYuanbaoReferencePanel(page);
     const questionRecords = options.resolveTitles && config.id === "deepseek"
       ? await resolveRecordTitles(extractedRecords)
       : extractedRecords;
     console.log(`[${config.name}] 抽取到 ${questionRecords.length} 条参考链接`);
-    if ((config.id === "doubao" || config.id === "deepseek" || config.id === "qianwen" || config.id === "yuanbao") && questionRecords.length === 0) {
-      throw new Error(`[${config.name}] 本题没有抽取到引用数据，已停止后续问题，避免问题与数据错位。`);
-    }
-    if (questionRecords.length === 0 && baselineRevealButtonCount > 0) {
-      console.log(`[${config.name}] 提醒：页面有参考入口，但本题没有抽取到外部链接，可能需要补充 ${config.name} 的引用面板选择器。`);
+    if (questionRecords.length === 0) {
+      console.log(
+        `[${config.name}] 跳过本题：引用面板已打开，但连续 ${REFERENCE_CHECK_ATTEMPTS} 次没有解析到有效外部链接。`
+      );
+      await onProgress?.(records);
+      continue;
     }
     records.push(...questionRecords);
     // 每完成一道题就通知入口层写盘，而不是等待整个平台全部结束。
     await onProgress?.(records);
   }
 
+  if (options.questions.length > 0) {
+    const opened = await openNewConversation(
+      page,
+      config,
+      options.questions[options.questions.length - 1]
+    );
+    console.log(
+      opened
+        ? `[${config.name}] 本轮问题已完成，已自动创建新对话。`
+        : `[${config.name}] 本轮问题已完成，但没有找到可用的新对话入口；数据已正常保存。`
+    );
+  }
+
   return records;
+}
+
+/**
+ * 最多检查三次当前题的引用入口和列表稳定性。千问第一次没有入口时仍允许
+ * 自动重新生成一次，但重新生成也计入这三次检查流程，不会无限重试。
+ */
+async function prepareCurrentReferenceList(
+  page: Page,
+  config: PlatformConfig,
+  answerTimeoutMs: number,
+  trackedBaseline: TrackedAnswerBaseline | undefined,
+  baselineDoubaoSearchBlockCount: number,
+  submittedQuestion: string
+): Promise<boolean> {
+  let referenceTriggerBaseline = trackedBaseline?.referenceCount ?? 0;
+  let qianwenRegenerated = false;
+
+  for (let attempt = 1; attempt <= REFERENCE_CHECK_ATTEMPTS; attempt += 1) {
+    const ready = await checkCurrentReferenceListOnce(
+      page,
+      config,
+      referenceTriggerBaseline,
+      baselineDoubaoSearchBlockCount,
+      submittedQuestion
+    ).catch((error) => {
+      console.log(`[${config.name}] 第 ${attempt} 次参考资料检查异常：${formatError(error)}`);
+      return false;
+    });
+    if (ready) return true;
+
+    if (config.id === "qianwen" && !qianwenRegenerated) {
+      qianwenRegenerated = true;
+      console.log("[千问] 首次检查没有参考入口，自动重新生成一次后继续检查。");
+      const regenerationBaseline = await snapshotTrackedAnswerBaseline(page, "qianwen");
+      const clicked = await clickLatestQianwenRegenerate(page);
+      if (clicked) {
+        const started = await waitForQianwenRegenerationStart(page, regenerationBaseline, 15_000);
+        if (started) {
+          await waitForAnswerComplete(page, config, answerTimeoutMs, regenerationBaseline, "");
+          await scrollToBottom(page);
+          referenceTriggerBaseline = regenerationBaseline.referenceCount;
+        } else {
+          console.log("[千问] 已点击重新生成，但 15 秒内未检测到生成启动。");
+        }
+      } else {
+        console.log("[千问] 未能打开重新生成菜单或点击重新生成项。");
+      }
+    }
+
+    console.log(`[${config.name}] 第 ${attempt}/${REFERENCE_CHECK_ATTEMPTS} 次未找到可用参考资料。`);
+    if (attempt < REFERENCE_CHECK_ATTEMPTS) {
+      await page.waitForTimeout(REFERENCE_CHECK_INTERVAL_MS);
+      await scrollToBottom(page);
+    }
+  }
+
+  return false;
+}
+
+/** 执行一次平台专属的“展开最新引用 + 等待列表稳定”。 */
+async function checkCurrentReferenceListOnce(
+  page: Page,
+  config: PlatformConfig,
+  referenceTriggerBaseline: number,
+  baselineDoubaoSearchBlockCount: number,
+  submittedQuestion: string
+): Promise<boolean> {
+  if (config.id === "doubao") {
+    const revealed = await revealLatestDoubaoReferenceList(
+      page,
+      config.referenceRevealSelectors,
+      baselineDoubaoSearchBlockCount,
+      submittedQuestion,
+      REFERENCE_REVEAL_TIMEOUT_MS
+    );
+    return revealed && await waitForDoubaoReferenceListStable(
+      page,
+      baselineDoubaoSearchBlockCount,
+      REFERENCE_STABLE_TIMEOUT_MS,
+      submittedQuestion
+    );
+  }
+
+  if (config.id === "deepseek") {
+    const expectedCount = await revealLatestDeepSeekReferenceList(page, REFERENCE_REVEAL_TIMEOUT_MS);
+    return expectedCount > 0 && await waitForDeepSeekReferenceListStable(
+      page,
+      REFERENCE_STABLE_TIMEOUT_MS,
+      expectedCount
+    );
+  }
+
+  if (config.id === "qianwen") {
+    const expectedCount = await revealLatestQianwenReferenceList(
+      page,
+      referenceTriggerBaseline,
+      REFERENCE_REVEAL_TIMEOUT_MS
+    );
+    return expectedCount > 0 && await waitForQianwenReferenceListStable(
+      page,
+      REFERENCE_STABLE_TIMEOUT_MS,
+      expectedCount
+    );
+  }
+
+  if (config.id === "yuanbao") {
+    const revealed = await revealLatestYuanbaoReferenceList(
+      page,
+      referenceTriggerBaseline,
+      REFERENCE_REVEAL_TIMEOUT_MS
+    );
+    return revealed && await waitForYuanbaoReferenceListStable(
+      page,
+      REFERENCE_STABLE_TIMEOUT_MS
+    );
+  }
+
+  await revealReferencePanels(page, config.referenceRevealSelectors);
+  await page.waitForTimeout(800);
+  return true;
+}
+
+/** 引用面板已经就绪但解析为空时，原地再解析两次，不重新发送问题。 */
+async function extractReferencesWithRetries(
+  page: Page,
+  question: string,
+  platformName: string,
+  extractionBaseline: number
+): Promise<ReferenceRecord[]> {
+  for (let attempt = 1; attempt <= REFERENCE_CHECK_ATTEMPTS; attempt += 1) {
+    const records = await extractReferences(page, question, platformName, extractionBaseline)
+      .catch((error) => {
+        console.log(`[${platformName}] 第 ${attempt} 次解析参考资料异常：${formatError(error)}`);
+        return [];
+      });
+    if (records.length > 0) return records;
+
+    console.log(`[${platformName}] 第 ${attempt}/${REFERENCE_CHECK_ATTEMPTS} 次解析结果为空。`);
+    if (attempt < REFERENCE_CHECK_ATTEMPTS) {
+      await page.waitForTimeout(REFERENCE_CHECK_INTERVAL_MS);
+    }
+  }
+  return [];
+}
+
+/** 将未知异常转换为适合终端日志的一行文本。 */
+function formatError(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+/**
+ * 一个平台完成整轮问题后创建空白会话。
+ *
+ * 仅在点击后确认“会话地址变化、旧问题数量减少或旧问题消失”之一成立，
+ * 并且页面重新出现可用输入框时才返回成功，避免把侧栏普通容器误判为新对话。
+ */
+export async function openNewConversation(
+  page: Page,
+  config: PlatformConfig,
+  previousQuestion = "",
+  timeoutMs = 15_000
+): Promise<boolean> {
+  const beforeUrl = page.url();
+  const beforeBody = await page.locator("body").innerText({ timeout: 3_000 }).catch(() => "");
+  const beforeQuestionCount = countTextOccurrences(beforeBody, previousQuestion);
+  const startedAt = Date.now();
+
+  for (const selector of config.newConversationButtonSelectors) {
+    if (Date.now() - startedAt >= timeoutMs) break;
+    const locators = await page.locator(selector).all().catch(() => []);
+
+    for (const locator of locators.slice().reverse()) {
+      if (Date.now() - startedAt >= timeoutMs) break;
+      const [visible, enabled, box] = await Promise.all([
+        locator.isVisible().catch(() => false),
+        locator.isEnabled().catch(() => false),
+        locator.boundingBox().catch(() => null)
+      ]);
+      // 新对话入口通常是按钮或较小的侧栏控件，过滤覆盖整页的大容器。
+      if (!visible || !enabled || !box || box.width > 500 || box.height > 180) continue;
+
+      const clicked = await locator.click({ timeout: 2_000 })
+        .then(() => true)
+        .catch(() => false);
+      if (!clicked) continue;
+
+      const remainingMs = timeoutMs - (Date.now() - startedAt);
+      if (remainingMs <= 0) return false;
+      const ready = await waitForNewConversationReady(
+        page,
+        config,
+        beforeUrl,
+        beforeQuestionCount,
+        previousQuestion,
+        Math.min(remainingMs, 6_000)
+      );
+      if (ready) return true;
+    }
+  }
+
+  return false;
+}
+
+/** 等待新会话完成切换，并确认空白会话的输入框已经可用。 */
+async function waitForNewConversationReady(
+  page: Page,
+  config: PlatformConfig,
+  beforeUrl: string,
+  beforeQuestionCount: number,
+  previousQuestion: string,
+  timeoutMs: number
+): Promise<boolean> {
+  const startedAt = Date.now();
+
+  while (Date.now() - startedAt < timeoutMs) {
+    const [bodyText, inputBox] = await Promise.all([
+      page.locator("body").innerText({ timeout: 2_000 }).catch(() => ""),
+      findInput(page, config.inputSelectors, 500)
+    ]);
+    const currentQuestionCount = countTextOccurrences(bodyText, previousQuestion);
+    const conversationChanged =
+      page.url() !== beforeUrl ||
+      (beforeQuestionCount > 0 && currentQuestionCount < beforeQuestionCount) ||
+      (Boolean(previousQuestion) && !bodyText.includes(previousQuestion));
+
+    if (inputBox && conversationChanged && !await isAnswerGenerating(page)) return true;
+    await page.waitForTimeout(300);
+  }
+
+  return false;
 }
 
 /** 将视口移到最新回答区域，避免引用入口因懒加载而尚未挂载。 */

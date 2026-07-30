@@ -682,10 +682,11 @@ export async function revealLatestDoubaoReferenceList(
   page: Page,
   selectors: string[],
   minBlockIndex: number,
-  currentQuestion = ""
+  currentQuestion = "",
+  timeoutMs = 30_000
 ): Promise<boolean> {
   const revealStartedAt = Date.now();
-  while (Date.now() - revealStartedAt < 30_000) {
+  while (Date.now() - revealStartedAt < timeoutMs) {
     const existing = await evaluateDoubaoReferenceList(
       page,
       minBlockIndex,

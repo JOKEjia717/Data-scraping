@@ -5,6 +5,7 @@
 import assert from "node:assert/strict";
 import { after, before, test } from "node:test";
 import { chromium, type Browser } from "playwright";
+import { openNewConversation } from "../src/crawler.js";
 import {
   clickLatestQianwenRegenerate,
   countQianwenReferenceTriggers,
@@ -17,6 +18,7 @@ import {
   waitForYuanbaoReferenceListStable,
   waitForDeepSeekReferenceListStable
 } from "../src/extractReferences.js";
+import { PLATFORMS } from "../src/platforms.js";
 
 let browser: Browser | undefined;
 
@@ -405,5 +407,41 @@ test("元宝点击最新 ToolbarSearchGuid 入口并只解析主列表的直接�
     "https://news.example.com/b"
   ]);
   assert.ok(records.every((record) => !record.url.includes("outside.example.com")));
+  await page.close();
+});
+
+test("一轮问题结束后点击新建对话并等待空白输入界面", async () => {
+  assert.ok(browser);
+  const page = await browser.newPage();
+  const previousQuestion = "抖音有哪些竞品？";
+
+  await page.setContent(`
+    <aside>
+      <button aria-label="新建对话" id="new-chat">新建对话</button>
+    </aside>
+    <main id="conversation">
+      <div>${previousQuestion}</div>
+      <div>上一轮回答内容</div>
+    </main>
+    <textarea aria-label="聊天输入框"></textarea>
+    <script>
+      document.querySelector("#new-chat").addEventListener("click", () => {
+        document.body.dataset.newConversation = "true";
+        document.querySelector("#conversation").innerHTML = "<div>开始新的对话</div>";
+      });
+    </script>
+  `);
+
+  const opened = await openNewConversation(
+    page,
+    PLATFORMS.doubao,
+    previousQuestion,
+    3_000
+  );
+
+  assert.equal(opened, true);
+  assert.equal(await page.locator("body").getAttribute("data-new-conversation"), "true");
+  assert.equal(await page.getByText(previousQuestion).count(), 0);
+  assert.equal(await page.locator("textarea").isEnabled(), true);
   await page.close();
 });

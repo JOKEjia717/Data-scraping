@@ -6,6 +6,20 @@
  */
 import type { PlatformConfig, PlatformId } from "./types.js";
 
+/** 各平台均优先使用语义属性定位新对话入口，文本选择器只作为页面改版兜底。 */
+const COMMON_NEW_CONVERSATION_SELECTORS = [
+  "button[aria-label*='新对话']",
+  "button[aria-label*='新建对话']",
+  "button[title*='新对话']",
+  "button[title*='新建对话']",
+  "[role='button'][aria-label*='新对话']",
+  "[role='button'][aria-label*='新建对话']",
+  "button:has-text('新对话')",
+  "button:has-text('新建对话')",
+  "[role='button']:has-text('新对话')",
+  "[role='button']:has-text('新建对话')"
+];
+
 /** 平台 ID 到页面配置的唯一映射，crawler.ts 不直接硬编码输入框和按钮。 */
 export const PLATFORMS: Record<PlatformId, PlatformConfig> = {
   doubao: {
@@ -22,6 +36,11 @@ export const PLATFORMS: Record<PlatformId, PlatformConfig> = {
       "button[title*='发送']",
       "button:has-text('发送')",
       "[role='button'][aria-label*='发送']"
+    ],
+    newConversationButtonSelectors: [
+      "[data-testid*='new-chat']",
+      "[class*='new-chat']",
+      ...COMMON_NEW_CONVERSATION_SELECTORS
     ],
     webSearchButtonSelectors: [
       "button:has-text('联网搜索')",
@@ -56,6 +75,13 @@ export const PLATFORMS: Record<PlatformId, PlatformConfig> = {
       "button:has-text('发送')",
       "button[aria-label*='Send']",
       "button[title*='Send']"
+    ],
+    newConversationButtonSelectors: [
+      "[data-testid*='new-chat']",
+      "[class*='new-chat']",
+      "button:has-text('开启新对话')",
+      "[role='button']:has-text('开启新对话')",
+      ...COMMON_NEW_CONVERSATION_SELECTORS
     ],
     webSearchButtonSelectors: [
       "button:has-text('联网搜索')",
@@ -105,6 +131,12 @@ export const PLATFORMS: Record<PlatformId, PlatformConfig> = {
       "button:has-text('Send')",
       "[role='button'][aria-label*='发送']",
       "[role='button'][title*='发送']"
+    ],
+    newConversationButtonSelectors: [
+      "[data-testid*='new-chat']",
+      "[class*='new-chat']",
+      "[class*='new-conversation']",
+      ...COMMON_NEW_CONVERSATION_SELECTORS
     ],
     webSearchButtonSelectors: [
       "button:has-text('联网搜索')",
@@ -165,6 +197,12 @@ export const PLATFORMS: Record<PlatformId, PlatformConfig> = {
       "button[title*='Send']",
       "[role='button'][aria-label*='发送']",
       "[role='button'][title*='发送']"
+    ],
+    newConversationButtonSelectors: [
+      "[data-testid*='new-chat']",
+      "[class*='new-chat']",
+      "[class*='create-chat']",
+      ...COMMON_NEW_CONVERSATION_SELECTORS
     ],
     webSearchButtonSelectors: [
       "button:has-text('联网搜索')",

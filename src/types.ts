@@ -25,6 +25,7 @@ export interface PlatformConfig {
   hostnames?: string[];
   inputSelectors: string[];
   sendButtonSelectors: string[];
+  newConversationButtonSelectors: string[];
   webSearchButtonSelectors: string[];
   referenceRevealSelectors: string[];
 }
