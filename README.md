@@ -45,11 +45,35 @@ npm install
 
 先退出普通 Chrome，再在终端 A 中执行：
 
+#### macOS
+
 ```bash
 /Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome \
   --remote-debugging-port=9222 \
   --user-data-dir=/tmp/chrome-ai-crawler
 ```
+
+#### Windows PowerShell
+
+Chrome 安装在系统默认目录时执行：
+
+```powershell
+& "C:\Program Files\Google\Chrome\Application\chrome.exe" --remote-debugging-port=9222 --user-data-dir="$env:TEMP\chrome-ai-crawler"
+```
+
+如果提示找不到 `chrome.exe`，Chrome 可能安装在当前用户目录，改用：
+
+```powershell
+& "$env:LOCALAPPDATA\Google\Chrome\Application\chrome.exe" --remote-debugging-port=9222 --user-data-dir="$env:TEMP\chrome-ai-crawler"
+```
+
+保持这个 Chrome 窗口打开。另开一个 PowerShell 窗口，可以用下面的命令确认调试端口已经启动：
+
+```powershell
+Invoke-RestMethod http://127.0.0.1:9222/json/version
+```
+
+看到浏览器版本和 `webSocketDebuggerUrl` 等信息即表示启动成功。
 
 ### 3. 打开平台并登录
 
@@ -214,6 +238,23 @@ npm run crawl:qianwen -- --questions=questions.json --timeout-ms=600000
 ```
 
 ## 常见问题
+
+### Windows PowerShell 禁止执行 npm.ps1
+
+如果运行 `npm install` 时出现“在此系统上禁止运行脚本”，可为当前用户允许本地脚本：
+
+```powershell
+Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned
+```
+
+确认后关闭并重新打开 PowerShell，再运行 `npm install`。如果电脑受公司或学校的组策略限制，无法修改执行策略，可在当前窗口让 `npm` 直接调用同目录下的 `npm.cmd`：
+
+```powershell
+Set-Alias npm npm.cmd
+npm install
+```
+
+`npm.ps1` 和 `npm.cmd` 都是 npm 的 Windows 启动入口，不影响项目功能。
 
 ### 找不到平台标签页或输入框
 
