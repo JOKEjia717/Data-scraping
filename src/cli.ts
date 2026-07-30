@@ -7,7 +7,7 @@ import type { CliOptions, PlatformId } from "./types.js";
 
 const DEFAULT_PLATFORMS: PlatformId[] = ["doubao", "deepseek", "qianwen", "yuanbao"];
 const ALL_PLATFORMS: PlatformId[] = ["doubao", "deepseek", "qianwen", "yuanbao"];
-const DEFAULT_PROMPT_PREFIX = "";
+const DEFAULT_PROMPT_PREFIX = "请联网搜索后回答，并提供可点击的参考来源。问题：";
 
 /** 将原始命令行参数转换为带默认值、可直接传给爬虫的配置。 */
 export async function parseCli(argv: string[]): Promise<CliOptions> {

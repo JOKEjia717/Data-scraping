@@ -251,7 +251,7 @@ npm run crawl:yuanbao
 | `--out` | 修改输出目录 | `--out=results-2026-07-17` |
 | `--cdp` | 修改 CDP 地址，默认 `http://127.0.0.1:9222` | `--cdp=http://127.0.0.1:9333` |
 | `--timeout-ms` | 修改单题最长等待时间，默认 300000（5 分钟） | `--timeout-ms=600000` |
-| `--prompt-prefix` | 在每个问题前添加提示词；默认不添加 | `--prompt-prefix="请联网搜索并保留参考来源。问题："` |
+| `--prompt-prefix` | 覆盖全局提问前缀；默认使用“请联网搜索后回答，并提供可点击的参考来源。问题：” | `--prompt-prefix="请联网搜索并保留参考来源。问题："` |
 | `--resolve-titles=false` | 关闭 DeepSeek 文章标题补全 | `npm run crawl:deepseek -- --resolve-titles=false` |
 
 参数需要放在 npm 脚本后的 `--` 之后，例如：
@@ -285,7 +285,7 @@ npm install
 
 ### 回答完成后找不到引用入口
 
-先确认页面上确实出现了当前题的参考来源入口。程序默认不追加联网提示词；如需临时对特定任务启用，可显式传入 `--prompt-prefix`。如果页面上已有引用但程序无法识别，通常是平台更新了 DOM class，需要同步调整 `src/platforms.ts` 或 `src/extractReferences.ts`。
+先确认页面上确实出现了当前题的参考来源入口。程序默认会在每道题前添加“请联网搜索后回答，并提供可点击的参考来源。问题：”。如果页面上已有引用但程序无法识别，通常是平台更新了 DOM class，需要同步调整 `src/platforms.ts` 或 `src/extractReferences.ts`。
 
 ### 等待回答超时
 
