@@ -47,9 +47,7 @@ export async function writePlatformOutputs(
 ): Promise<void> {
   const platformDir = path.join(outDir, platformId);
   await writeFlatOutputs(platformDir, records);
-  if (platformId === "doubao") {
-    await writeAnswerOutputs(platformDir, answers);
-  }
+  await writeAnswerOutputs(platformDir, answers);
 }
 
 /**
@@ -121,7 +119,7 @@ async function writeFlatOutputs(outDir: string, records: ReferenceRecord[]): Pro
   await fs.writeFile(path.join(outDir, "references.csv"), toCsv(records), "utf8");
 }
 
-/** 豆包最终回答使用独立文件，避免在每条参考文献记录中重复存储长正文。 */
+/** 各平台最终回答使用独立文件，避免在每条参考文献记录中重复存储长正文。 */
 async function writeAnswerOutputs(outDir: string, answers: AnswerRecord[]): Promise<void> {
   await fs.mkdir(outDir, { recursive: true });
   await fs.writeFile(path.join(outDir, "answers.json"), `${JSON.stringify(answers, null, 2)}\n`, "utf8");

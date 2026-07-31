@@ -7,11 +7,9 @@ import {
   clickLatestQianwenRegenerate,
   countDeepSeekReferenceContainers,
   countDoubaoSearchResultBlocks,
-  countNewYuanbaoReferenceTriggers,
   countQianwenReferenceTriggers,
   countReferenceRevealButtons,
-  countYuanbaoReferenceTriggers,
-  extractLatestDoubaoAnswer,
+  extractLatestPlatformAnswer,
   extractReferences,
   hasCurrentDoubaoReferenceEntry,
   markDoubaoSearchResultBaseline,
@@ -121,22 +119,29 @@ export async function crawlPlatform(
     }
     await scrollToBottom(page);
 
-    let finalDoubaoAnswer = "";
-    let finalDoubaoGeneration = 1;
-    let finalDoubaoAnswerExtractedAt = new Date().toISOString();
-    const captureDoubaoAnswer = async (generationNumber: number): Promise<void> => {
-      if (config.id !== "doubao") return;
-      const answer = await captureLatestDoubaoAnswerWithRetries(page);
+    let finalAnswer = "";
+    let finalGeneration = 1;
+    let finalAnswerExtractedAt = new Date().toISOString();
+    const captureAnswer = async (generationNumber: number): Promise<void> => {
+      const answer = await captureLatestPlatformAnswerWithRetries(
+        page,
+        config.id,
+        config.name
+      );
       if (!answer) {
-        console.log(`[豆包] 第 ${generationNumber} 版回答正文未能解析，暂时保留上一版缓存。`);
+        console.log(
+          `[${config.name}] 第 ${generationNumber} 版回答正文未能解析，暂时保留上一版缓存。`
+        );
         return;
       }
-      finalDoubaoAnswer = answer;
-      finalDoubaoGeneration = generationNumber;
-      finalDoubaoAnswerExtractedAt = new Date().toISOString();
-      console.log(`[豆包] 已缓存第 ${generationNumber} 版回答正文（${answer.length} 字符）。`);
+      finalAnswer = answer;
+      finalGeneration = generationNumber;
+      finalAnswerExtractedAt = new Date().toISOString();
+      console.log(
+        `[${config.name}] 已缓存第 ${generationNumber} 版回答正文（${answer.length} 字符）。`
+      );
     };
-    await captureDoubaoAnswer(1);
+    await captureAnswer(1);
 
     // 引用入口缺失或列表未稳定只影响当前题；平台恢复策略失败后保留空结果并继续。
     const referenceReady = await prepareCurrentReferenceList(
@@ -146,21 +151,20 @@ export async function crawlPlatform(
       trackedBaseline,
       baselineDoubaoSearchBlockCount,
       submittedQuestion,
-      captureDoubaoAnswer
+      captureAnswer
     );
-    const appendFinalDoubaoAnswer = (referenceCount: number): void => {
-      if (config.id !== "doubao") return;
+    const appendFinalAnswer = (referenceCount: number): void => {
       answers.push({
         question,
         crawlPlatform: config.name,
-        answer: finalDoubaoAnswer,
-        generationNumber: finalDoubaoGeneration,
+        answer: finalAnswer,
+        generationNumber: finalGeneration,
         referenceCount,
-        extractedAt: finalDoubaoAnswerExtractedAt
+        extractedAt: finalAnswerExtractedAt
       });
       console.log(
-        `[豆包] 已保存最终第 ${finalDoubaoGeneration} 版回答` +
-        `（正文=${finalDoubaoAnswer.length} 字符，参考=${referenceCount} 条）。`
+        `[${config.name}] 已保存最终第 ${finalGeneration} 版回答` +
+        `（正文=${finalAnswer.length} 字符，参考=${referenceCount} 条）。`
       );
     };
     if (!referenceReady) {
@@ -173,7 +177,7 @@ export async function crawlPlatform(
       if (baselineRevealButtonCount > 0) {
         console.log(`[${config.name}] 页面存在历史参考入口，但没有确认到属于本题的有效引用列表。`);
       }
-      appendFinalDoubaoAnswer(0);
+      appendFinalAnswer(0);
       await onProgress?.({ references: records, answers });
       continue;
     }
@@ -194,12 +198,12 @@ export async function crawlPlatform(
       console.log(
         `[${config.name}] 跳过本题：引用面板已打开，但连续 ${REFERENCE_CHECK_ATTEMPTS} 次没有解析到有效外部链接。`
       );
-      appendFinalDoubaoAnswer(0);
+      appendFinalAnswer(0);
       await onProgress?.({ references: records, answers });
       continue;
     }
     records.push(...questionRecords);
-    appendFinalDoubaoAnswer(questionRecords.length);
+    appendFinalAnswer(questionRecords.length);
     // 每完成一道题就通知入口层写盘，而不是等待整个平台全部结束。
     await onProgress?.({ references: records, answers });
   }
@@ -231,7 +235,7 @@ async function prepareCurrentReferenceList(
   trackedBaseline: TrackedAnswerBaseline | undefined,
   baselineDoubaoSearchBlockCount: number,
   submittedQuestion: string,
-  onDoubaoGenerationComplete?: (generationNumber: number) => Promise<void>
+  onGenerationComplete?: (generationNumber: number) => Promise<void>
 ): Promise<boolean> {
   if (config.id === "doubao") {
     return prepareDoubaoReferenceList(
@@ -240,7 +244,7 @@ async function prepareCurrentReferenceList(
       answerTimeoutMs,
       baselineDoubaoSearchBlockCount,
       submittedQuestion,
-      onDoubaoGenerationComplete
+      onGenerationComplete
     );
   }
 
@@ -287,6 +291,7 @@ async function prepareCurrentReferenceList(
             throw error;
           }
           await scrollToBottom(page);
+          await onGenerationComplete?.(2);
           referenceTriggerBaseline = regenerationBaseline.referenceCount;
         } else {
           console.log("[千问] 已点击重新生成，但 15 秒内未检测到生成启动。");
@@ -467,11 +472,15 @@ async function extractReferencesWithRetries(
   return [];
 }
 
-/** 回答刚结束时短暂重试正文节点，避免最后一批 block-v2 尚未挂载完成。 */
-async function captureLatestDoubaoAnswerWithRetries(page: Page): Promise<string> {
+/** 回答刚结束时短暂重试正文节点，避免最后一批 Markdown/block 节点尚未挂载。 */
+async function captureLatestPlatformAnswerWithRetries(
+  page: Page,
+  platformId: PlatformConfig["id"],
+  platformName: string
+): Promise<string> {
   for (let attempt = 1; attempt <= REFERENCE_CHECK_ATTEMPTS; attempt += 1) {
-    const answer = await extractLatestDoubaoAnswer(page).catch((error) => {
-      console.log(`[豆包] 第 ${attempt} 次解析回答正文异常：${formatError(error)}`);
+    const answer = await extractLatestPlatformAnswer(page, platformId).catch((error) => {
+      console.log(`[${platformName}] 第 ${attempt} 次解析回答正文异常：${formatError(error)}`);
       return "";
     });
     if (answer) return answer;
@@ -621,8 +630,14 @@ async function ensureReadyForInput(page: Page, config: PlatformConfig): Promise<
   throw new Error(`没有在已打开的 ${config.name} 标签页找到聊天输入框，请确认页面已登录并停留在可提问界面。`);
 }
 
-/** 尝试打开平台联网搜索能力；已处于 pressed/checked 状态时不重复点击。 */
+/**
+ * 尝试打开平台联网搜索能力；点击失败时继续检查其他候选，不再把吞掉的点击
+ * 异常当作成功。对带 aria 状态的开关还会验证点击后确实进入启用状态。
+ */
 async function activateWebSearch(page: Page, config: PlatformConfig): Promise<void> {
+  const clickErrors: string[] = [];
+  let sawCandidate = false;
+
   for (const selector of config.webSearchButtonSelectors) {
     const locators = await page.locator(selector).all().catch(() => []);
     for (const locator of locators.slice(0, 4)) {
@@ -630,14 +645,45 @@ async function activateWebSearch(page: Page, config: PlatformConfig): Promise<vo
       const enabled = await locator.isEnabled().catch(() => false);
       if (!visible || !enabled) continue;
 
+      const text = (await locator.innerText({ timeout: 1_000 }).catch(() => ""))
+        .replace(/\s+/g, " ")
+        .trim();
+      // 过滤包含整块页面文字的宽泛 :has-text 命中，避免误点非搜索控件。
+      if (text.length > 24) continue;
+      sawCandidate = true;
+
       const pressed = await locator.getAttribute("aria-pressed").catch(() => null);
       const checked = await locator.getAttribute("aria-checked").catch(() => null);
       if (pressed === "true" || checked === "true") return;
 
-      await locator.click({ timeout: 1000 }).catch(() => undefined);
+      const clicked = await locator.click({ timeout: 1_500 })
+        .then(() => true)
+        .catch((error) => {
+          const message = error instanceof Error ? error.message : String(error);
+          clickErrors.push(`${selector}:${message.split("\n")[0]}`);
+          return false;
+        });
+      if (!clicked) continue;
+
       await page.waitForTimeout(400);
+      if (pressed !== null || checked !== null) {
+        const [nextPressed, nextChecked] = await Promise.all([
+          locator.getAttribute("aria-pressed").catch(() => null),
+          locator.getAttribute("aria-checked").catch(() => null)
+        ]);
+        if (nextPressed !== "true" && nextChecked !== "true") {
+          clickErrors.push(`${selector}:点击后 aria 状态仍未启用`);
+          continue;
+        }
+      }
       return;
     }
+  }
+
+  if (config.id === "yuanbao" && sawCandidate && clickErrors.length > 0) {
+    console.log(
+      `[元宝] 联网搜索控件未能确认启用：${clickErrors.slice(-3).join(" | ")}`
+    );
   }
 }
 
@@ -717,7 +763,17 @@ async function waitForAnswerComplete(
   submittedQuestion = "",
   answerStartAlreadyConfirmed = false
 ): Promise<void> {
-  if (config.id === "doubao" || config.id === "deepseek" || config.id === "qianwen" || config.id === "yuanbao") {
+  if (config.id === "yuanbao") {
+    await waitForYuanbaoCurrentAnswerComplete(
+      page,
+      submittedQuestion,
+      timeoutMs
+    );
+    await waitForReadyToSend(page, config, 30_000);
+    return;
+  }
+
+  if (config.id === "doubao" || config.id === "deepseek" || config.id === "qianwen") {
     if (!trackedBaseline) throw new Error(`[${config.name}] 缺少回答前页面快照，无法安全判断本题是否完成。`);
     await waitForTrackedAnswerComplete(
       page,
@@ -733,6 +789,154 @@ async function waitForAnswerComplete(
   }
 
   await waitForAnswerStable(page, timeoutMs, 5_000, 8_000);
+}
+
+interface YuanbaoCurrentAnswerSnapshot {
+  questionFound: boolean;
+  answerFound: boolean;
+  text: string;
+}
+
+/**
+ * 只读取当前问题之后最后一个元宝 AI 正文节点。来源入口和回答操作栏会在流式
+ * 输出期间提前挂载，不能用于判断完成；问题锚点可避免读到上一题的稳定正文。
+ */
+async function snapshotCurrentYuanbaoAnswer(
+  page: Page,
+  submittedQuestion: string
+): Promise<YuanbaoCurrentAnswerSnapshot> {
+  const question = JSON.stringify(submittedQuestion.replace(/\s+/g, " ").trim());
+  return page.evaluate<YuanbaoCurrentAnswerSnapshot>(`
+(() => {
+  const clean = (value) => (value || "").replace(/\\s+/g, " ").trim();
+  const isRendered = (element) => {
+    if (!(element instanceof HTMLElement)) return false;
+    const rect = element.getBoundingClientRect();
+    const style = window.getComputedStyle(element);
+    return rect.width > 0 && rect.height > 0 &&
+      style.display !== "none" && style.visibility !== "hidden";
+  };
+  const expectedQuestion = ${question};
+  const questionCandidates = expectedQuestion
+    ? Array.from(document.querySelectorAll("body *"))
+        .map((element, index) => ({ element, index }))
+        .filter(({ element }) => isRendered(element))
+        .filter(({ element }) => clean(element.textContent) === expectedQuestion)
+        .sort((a, b) => {
+          const aRect = a.element.getBoundingClientRect();
+          const bRect = b.element.getBoundingClientRect();
+          return (aRect.width * aRect.height) - (bRect.width * bRect.height) ||
+            b.index - a.index;
+        })
+    : [];
+  const questionElement = questionCandidates[0]?.element || null;
+  if (!questionElement) {
+    return { questionFound: false, answerFound: false, text: "" };
+  }
+
+  const answers = Array.from(document.querySelectorAll(
+    "[data-conv-speaker='ai'] .agent-chat__speech-card__text"
+  )).filter((element) =>
+    isRendered(element) &&
+    Boolean(questionElement.compareDocumentPosition(element) & Node.DOCUMENT_POSITION_FOLLOWING)
+  );
+  const answer = answers[answers.length - 1];
+  if (!(answer instanceof HTMLElement)) {
+    return { questionFound: true, answerFound: false, text: "" };
+  }
+
+  return {
+    questionFound: true,
+    answerFound: true,
+    text: clean(answer.innerText || answer.textContent || "")
+  };
+})()
+`).catch(() => ({
+    questionFound: false,
+    answerFound: false,
+    text: ""
+  }));
+}
+
+/**
+ * 等待元宝当前题正文连续稳定。即使“源”入口已经出现，只要正文仍在增长就继续
+ * 等待；这防止引用准备完成后过早缓存半句回答并提交下一题。
+ */
+export async function waitForYuanbaoCurrentAnswerComplete(
+  page: Page,
+  submittedQuestion: string,
+  timeoutMs: number,
+  stableWindowMs = 15_000,
+  minWaitMs = 20_000
+): Promise<void> {
+  const startedAt = Date.now();
+  let lastAnswerText = "";
+  let answerStableSince = Date.now();
+  let sawCurrentAnswer = false;
+  let nextProgressLogAt = 30_000;
+  let lastSnapshot: YuanbaoCurrentAnswerSnapshot = {
+    questionFound: false,
+    answerFound: false,
+    text: ""
+  };
+
+  await page.waitForTimeout(500);
+  while (Date.now() - startedAt < timeoutMs) {
+    const [snapshot, busy] = await Promise.all([
+      snapshotCurrentYuanbaoAnswer(page, submittedQuestion),
+      isAnswerGenerating(page)
+    ]);
+    lastSnapshot = snapshot;
+
+    if (snapshot.answerFound && snapshot.text) {
+      sawCurrentAnswer = true;
+      if (snapshot.text !== lastAnswerText) {
+        lastAnswerText = snapshot.text;
+        answerStableSince = Date.now();
+      }
+    } else if (sawCurrentAnswer) {
+      // 当前回答节点短暂重挂载时重新计算稳定窗口，避免把旧文本当作最终结果。
+      answerStableSince = Date.now();
+    }
+
+    const elapsed = Date.now() - startedAt;
+    const stableFor = Date.now() - answerStableSince;
+    if (
+      sawCurrentAnswer &&
+      snapshot.answerFound &&
+      snapshot.text.length > 0 &&
+      !busy &&
+      elapsed >= minWaitMs &&
+      stableFor >= stableWindowMs
+    ) {
+      console.log(
+        `[元宝] 当前回答正文已连续稳定 ${Math.round(stableFor / 1000)} 秒` +
+        `（${snapshot.text.length} 字符），确认本题回答完成。`
+      );
+      return;
+    }
+
+    if (elapsed >= nextProgressLogAt) {
+      console.log(
+        "[元宝] 当前回答仍在生成或等待稳定：" +
+        `问题锚点=${snapshot.questionFound ? "已找到" : "未找到"}` +
+        `，正文节点=${snapshot.answerFound ? "已找到" : "未找到"}` +
+        `，正文字符=${snapshot.text.length}` +
+        `，连续稳定=${Math.round(stableFor / 1000)}秒` +
+        `，生成状态=${busy ? "生成中" : "未检测到停止按钮"}`
+      );
+      nextProgressLogAt += 30_000;
+    }
+
+    await page.waitForTimeout(500);
+  }
+
+  throw new Error(
+    "[元宝] 等待本题回答完整结束超时，已停止后续问题以避免题目与来源数据错位。" +
+    `最后状态：问题锚点=${lastSnapshot.questionFound ? "已找到" : "未找到"}` +
+    `，正文节点=${lastSnapshot.answerFound ? "已找到" : "未找到"}` +
+    `，正文字符=${lastSnapshot.text.length}。可增大 --timeout-ms 后重试。`
+  );
 }
 
 /** 采集正文、高度和平台专属引用结构数量，形成回答前基线。 */
@@ -802,7 +1006,7 @@ async function waitForTrackedAnswerComplete(
   timeoutMs: number,
   baseline: TrackedAnswerBaseline,
   submittedQuestion: string,
-  platformId: "doubao" | "deepseek" | "qianwen" | "yuanbao",
+  platformId: "doubao" | "deepseek" | "qianwen",
   platformName: string,
   answerStartAlreadyConfirmed = false
 ): Promise<void> {
@@ -814,12 +1018,8 @@ async function waitForTrackedAnswerComplete(
   let sawAnswerStart = answerStartAlreadyConfirmed;
   let doubaoReferenceReadySince = 0;
   const referenceLabel = platformId === "qianwen" ? "参考来源" : "引用来源";
-  const stableWindowMs = platformId === "yuanbao"
-    ? 15_000
-    : platformId === "doubao" || platformId === "deepseek" || platformId === "qianwen"
-      ? 12_000
-      : 10_000;
-  const minWaitMs = platformId === "yuanbao" ? 20_000 : 15_000;
+  const stableWindowMs = 12_000;
+  const minWaitMs = 15_000;
   let nextProgressLogAt = 30_000;
   const baselineQuestionOccurrences = countTextOccurrences(baseline.bodyText, submittedQuestion);
 
@@ -835,12 +1035,7 @@ async function waitForTrackedAnswerComplete(
           ? countDeepSeekReferenceContainers(page)
           : platformId === "qianwen"
             ? countQianwenReferenceTriggers(page)
-          : platformId === "yuanbao"
-            ? baseline.referenceMarker
-              ? countNewYuanbaoReferenceTriggers(page, baseline.referenceMarker)
-                .then((count) => baseline.referenceCount + count)
-              : countYuanbaoReferenceTriggers(page)
-            : Promise.resolve(0),
+          : Promise.resolve(0),
       platformId === "doubao" && submittedQuestion
         ? hasCurrentDoubaoReferenceEntry(page, submittedQuestion, baseline.referenceCount)
         : Promise.resolve(false)
@@ -859,9 +1054,7 @@ async function waitForTrackedAnswerComplete(
         ? structuredReferenceCount
         : platformId === "qianwen"
           ? structuredReferenceCount
-        : platformId === "yuanbao"
-          ? structuredReferenceCount
-          : snapshot.split(referenceLabel).length - 1;
+        : snapshot.split(referenceLabel).length - 1;
     const textGrowth = snapshot.length - baseline.bodyText.length - submittedQuestion.length;
     const bottomGrowth = documentBottom - baseline.documentBottom;
     const questionOccurrences = countTextOccurrences(snapshot, submittedQuestion);
@@ -871,7 +1064,6 @@ async function waitForTrackedAnswerComplete(
       sawSubmittedQuestion ||
       currentDoubaoHasReferences ||
       referenceCount > baseline.referenceCount ||
-      (platformId === "yuanbao" && meaningfulChanges >= 3) ||
       ((platformId === "doubao" || platformId === "deepseek") && meaningfulChanges >= 3 && Math.abs(textGrowth) >= 60) ||
       (meaningfulChanges >= 3 && textGrowth >= 60) ||
       (bottomGrowth >= 250 && textGrowth >= 60);
@@ -903,8 +1095,6 @@ async function waitForTrackedAnswerComplete(
     const doubaoReferenceReadyFor = doubaoReferenceReadySince > 0
       ? Date.now() - doubaoReferenceReadySince
       : 0;
-    // 元宝出现新增引用入口即可确认回答阶段完成；其他平台继续等待正文稳定窗口。
-    if (platformId === "yuanbao" && referenceCount > baseline.referenceCount && !busy) return;
     // 豆包的搜索入口属于当前回答且正文已短暂稳定时即可放行。这个信号不依赖
     // 搜索块总数递增，可兼容长会话回收旧 DOM、复用搜索块数量的情况。
     if (

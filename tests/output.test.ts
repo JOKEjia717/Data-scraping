@@ -2,12 +2,16 @@
  * 汇总清洗回归测试：分别验证平台分桶、平台内问题分组和跨平台同题合并。
  */
 import assert from "node:assert/strict";
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import test from "node:test";
 import {
   answersToCsv,
   groupPlatformRecordsByQuestion,
   groupRecordsByPlatform,
-  groupRecordsByQuestion
+  groupRecordsByQuestion,
+  writePlatformOutputs
 } from "../src/output.js";
 import type { AnswerRecord, ReferenceRecord } from "../src/types.js";
 
@@ -87,4 +91,32 @@ test("最终回答 CSV 保留固定字段并正确转义多行正文", () => {
   );
   assert.ok(csv.includes('"第一段，包含逗号\n第二段包含""引号"""'));
   assert.ok(csv.includes(",3,15,2026-07-30T10:00:00.000Z"));
+});
+
+test("非豆包平台也会写出独立的最终回答 JSON 和 CSV", async () => {
+  const outDir = await fs.mkdtemp(path.join(os.tmpdir(), "crawler-output-"));
+  const answers: AnswerRecord[] = [{
+    question: "问题一",
+    crawlPlatform: "DeepSeek",
+    answer: "DeepSeek 最终回答",
+    generationNumber: 1,
+    referenceCount: 2,
+    extractedAt: "2026-07-31T00:00:00.000Z"
+  }];
+
+  try {
+    await writePlatformOutputs(outDir, "deepseek", [], answers);
+    const json = JSON.parse(
+      await fs.readFile(path.join(outDir, "deepseek", "answers.json"), "utf8")
+    ) as AnswerRecord[];
+    const csv = await fs.readFile(
+      path.join(outDir, "deepseek", "answers.csv"),
+      "utf8"
+    );
+
+    assert.deepEqual(json, answers);
+    assert.ok(csv.includes("DeepSeek 最终回答"));
+  } finally {
+    await fs.rm(outDir, { recursive: true, force: true });
+  }
 });

@@ -6,7 +6,12 @@
  * Playwright 定位、等待与最终标准化。
  */
 import type { Locator, Page } from "playwright";
-import type { RawReferenceCandidate, ReferenceRecord, SearchResultCandidate } from "./types.js";
+import type {
+  PlatformId,
+  RawReferenceCandidate,
+  ReferenceRecord,
+  SearchResultCandidate
+} from "./types.js";
 import {
   chooseTitle,
   cleanText,
@@ -24,7 +29,10 @@ const DOUBAO_BASELINE_BLOCKS_KEY = "__codexDoubaoBaselineSearchBlocks";
 const DOUBAO_ANSWER_CONTAINER_SELECTOR = '[data-container-type="block-v2"]';
 const DOUBAO_ANSWER_BLOCK_SELECTOR = '[data-plugin-identifier*="block_type:10000"]';
 const DOUBAO_BASELINE_ANSWERS_KEY = "__codexDoubaoBaselineAnswerContainers";
+const DEEPSEEK_ANSWER_SELECTOR = ".ds-markdown.ds-assistant-message-main-content";
 const DEEPSEEK_REFERENCE_CONTAINER_SELECTOR = '[class~="_223dd7b"]';
+const QIANWEN_ANSWER_SELECTOR =
+  ".message-select-wrapper-answer-rqWekn .qk-markdown";
 const QIANWEN_REFERENCE_TRIGGER_SELECTOR = '[class~="link-title-igf0OC"]';
 const QIANWEN_REFERENCE_LIST_SELECTOR = '[class~="list-XPxyL2"]';
 const QIANWEN_ANSWER_ACTION_SELECTOR =
@@ -41,6 +49,8 @@ const YUANBAO_REFERENCE_BASELINE_ATTRIBUTE = "data-codex-yuanbao-baseline";
 const YUANBAO_REFERENCE_LIST_SELECTOR = ".agent-dialogue-references__list";
 const YUANBAO_OPEN_REFERENCE_LIST_SELECTOR =
   ".t-drawer--open .agent-dialogue-references__list";
+const YUANBAO_ANSWER_SELECTOR =
+  "[data-conv-speaker='ai'] .agent-chat__speech-card__text";
 
 /** 豆包列表的轻量快照，用于判断容器是否命中以及引用是否加载稳定。 */
 interface DoubaoReferenceListSnapshot {
@@ -1377,6 +1387,27 @@ interface YuanbaoTriggerCandidates {
   afterQuestionCount: number;
 }
 
+interface YuanbaoTriggerActionSnapshot {
+  exists: boolean;
+  connected: boolean;
+  rect: string;
+  display: string;
+  visibility: string;
+  opacity: string;
+  pointerEvents: string;
+  ariaDisabled: string;
+  disabled: boolean;
+  inViewport: boolean;
+  coveredBy: string;
+}
+
+interface YuanbaoTriggerClickResult {
+  opened: boolean;
+  method: string;
+  errors: string[];
+  state: YuanbaoTriggerActionSnapshot;
+}
+
 async function locateCurrentYuanbaoTriggerCandidates(
   page: Page,
   baselineMarker: string,
@@ -1459,7 +1490,218 @@ export async function countNewYuanbaoReferenceTriggers(
 `).catch(() => 0);
 }
 
-/** 点击本轮新增的最新元宝入口，并确认打开抽屉中已挂载首条 li。 */
+/** 选择当前可见的元宝引用主列表，兼容抽屉 open class 变化。 */
+async function getVisibleYuanbaoReferenceList(page: Page): Promise<Locator | null> {
+  const openLists = page.locator(`${YUANBAO_OPEN_REFERENCE_LIST_SELECTOR}:visible`);
+  const openListCount = await openLists.count().catch(() => 0);
+  if (openListCount > 0) return openLists.last();
+
+  const visibleLists = page.locator(`${YUANBAO_REFERENCE_LIST_SELECTOR}:visible`);
+  const visibleListCount = await visibleLists.count().catch(() => 0);
+  return visibleListCount > 0 ? visibleLists.last() : null;
+}
+
+/** 等待引用抽屉出现；requireItem=true 时还要求主列表已挂载直接子 li。 */
+async function waitForVisibleYuanbaoReferenceList(
+  page: Page,
+  timeoutMs: number,
+  requireItem: boolean
+): Promise<boolean> {
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < timeoutMs) {
+    const list = await getVisibleYuanbaoReferenceList(page);
+    if (list) {
+      if (!requireItem || await list.locator(":scope > li").count().catch(() => 0) > 0) return true;
+    }
+    await page.waitForTimeout(100);
+  }
+  return false;
+}
+
+/** 读取点击失败时最关键的 CSS、视口和遮挡信息。 */
+async function inspectYuanbaoTriggerActionState(
+  page: Page,
+  triggerIndex: number
+): Promise<YuanbaoTriggerActionSnapshot> {
+  const selector = JSON.stringify(YUANBAO_REFERENCE_TRIGGER_SELECTOR);
+  return page.evaluate<YuanbaoTriggerActionSnapshot>(`
+(() => {
+  const element = Array.from(document.querySelectorAll(${selector}))[${triggerIndex}];
+  if (!(element instanceof HTMLElement)) {
+    return {
+      exists: Boolean(element),
+      connected: Boolean(element?.isConnected),
+      rect: "",
+      display: "",
+      visibility: "",
+      opacity: "",
+      pointerEvents: "",
+      ariaDisabled: "",
+      disabled: false,
+      inViewport: false,
+      coveredBy: ""
+    };
+  }
+  const rect = element.getBoundingClientRect();
+  const style = window.getComputedStyle(element);
+  const centerX = Math.max(0, Math.min(window.innerWidth - 1, rect.left + rect.width / 2));
+  const centerY = Math.max(0, Math.min(window.innerHeight - 1, rect.top + rect.height / 2));
+  const topElement = rect.width > 0 && rect.height > 0
+    ? document.elementFromPoint(centerX, centerY)
+    : null;
+  const covered = Boolean(topElement && topElement !== element && !element.contains(topElement));
+  const topDescription = covered && topElement
+    ? topElement.tagName.toLowerCase() + "." +
+      String(topElement.getAttribute("class") || "").replace(/\\s+/g, ".").slice(0, 120)
+    : "";
+  return {
+    exists: true,
+    connected: element.isConnected,
+    rect: [rect.left, rect.top, rect.width, rect.height].map((value) => Math.round(value)).join(","),
+    display: style.display,
+    visibility: style.visibility,
+    opacity: style.opacity,
+    pointerEvents: style.pointerEvents,
+    ariaDisabled: element.getAttribute("aria-disabled") || "",
+    disabled: "disabled" in element && Boolean(element.disabled),
+    inViewport:
+      rect.width > 0 &&
+      rect.height > 0 &&
+      rect.bottom > 0 &&
+      rect.right > 0 &&
+      rect.top < window.innerHeight &&
+      rect.left < window.innerWidth,
+    coveredBy: topDescription
+  };
+})()
+`).catch(() => ({
+    exists: false,
+    connected: false,
+    rect: "",
+    display: "",
+    visibility: "",
+    opacity: "",
+    pointerEvents: "",
+    ariaDisabled: "",
+    disabled: false,
+    inViewport: false,
+    coveredBy: ""
+  }));
+}
+
+function compactYuanbaoClickError(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error);
+  return cleanText(message.split("\n")[0]).slice(0, 240);
+}
+
+/**
+ * 尝试点击当前题入口。每种点击方式都必须确认可见主列表已经出现，避免把
+ * “事件已派发但抽屉没打开”误判为成功。
+ */
+async function clickYuanbaoReferenceTrigger(
+  page: Page,
+  triggerIndex: number
+): Promise<YuanbaoTriggerClickResult> {
+  const trigger = page.locator(YUANBAO_REFERENCE_TRIGGER_SELECTOR).nth(triggerIndex);
+  const errors: string[] = [];
+  let method = "";
+
+  await trigger.scrollIntoViewIfNeeded({ timeout: 3_000 }).catch((error) => {
+    errors.push(`滚动:${compactYuanbaoClickError(error)}`);
+  });
+
+  const tryClick = async (
+    name: string,
+    click: () => Promise<void>
+  ): Promise<boolean> => {
+    try {
+      await click();
+    } catch (error) {
+      errors.push(`${name}:${compactYuanbaoClickError(error)}`);
+      return false;
+    }
+
+    const opened = await waitForVisibleYuanbaoReferenceList(page, 1_200, false);
+    if (opened) {
+      method = name;
+      return true;
+    }
+    errors.push(`${name}:点击完成但引用抽屉未出现`);
+    return false;
+  };
+
+  const [visible, enabled] = await Promise.all([
+    trigger.isVisible().catch(() => false),
+    trigger.isEnabled().catch(() => false)
+  ]);
+
+  let opened = false;
+  if (visible && enabled) {
+    opened = await tryClick("入口普通点击", () => trigger.click({ timeout: 2_000 }));
+  } else {
+    errors.push(`入口状态:visible=${visible},enabled=${enabled}`);
+  }
+
+  if (!opened) {
+    const innerTargets = trigger.locator(
+      "button, [role='button'], a, [tabindex], span"
+    );
+    const innerCount = await innerTargets.count().catch(() => 0);
+    for (let index = innerCount - 1; index >= Math.max(0, innerCount - 8) && !opened; index -= 1) {
+      const target = innerTargets.nth(index);
+      const [targetVisible, targetEnabled] = await Promise.all([
+        target.isVisible().catch(() => false),
+        target.isEnabled().catch(() => false)
+      ]);
+      if (!targetVisible || !targetEnabled) continue;
+      opened = await tryClick(
+        `内部节点点击${index + 1}/${innerCount}`,
+        () => target.click({ timeout: 1_500 })
+      );
+    }
+  }
+
+  if (!opened) {
+    opened = await tryClick(
+      "入口强制点击",
+      () => trigger.click({ timeout: 1_500, force: true })
+    );
+  }
+
+  if (!opened) {
+    const selector = JSON.stringify(YUANBAO_REFERENCE_TRIGGER_SELECTOR);
+    const dispatched = await page.evaluate<boolean>(`
+(() => {
+  const element = Array.from(document.querySelectorAll(${selector}))[${triggerIndex}];
+  if (!(element instanceof HTMLElement) || !element.isConnected) return false;
+  const inner = element.querySelector("button, [role='button'], a, [tabindex], span");
+  const target = inner instanceof HTMLElement ? inner : element;
+  target.click();
+  return true;
+})()
+`).catch((error) => {
+      errors.push(`DOM点击:${compactYuanbaoClickError(error)}`);
+      return false;
+    });
+    if (dispatched) {
+      opened = await waitForVisibleYuanbaoReferenceList(page, 1_500, false);
+      if (opened) {
+        method = "DOM点击";
+      } else {
+        errors.push("DOM点击:事件已派发但引用抽屉未出现");
+      }
+    }
+  }
+
+  return {
+    opened,
+    method,
+    errors,
+    state: await inspectYuanbaoTriggerActionState(page, triggerIndex)
+  };
+}
+
+/** 点击本轮新增或当前问题之后的元宝入口，并确认抽屉中已挂载直接子 li。 */
 export async function revealLatestYuanbaoReferenceList(
   page: Page,
   baselineMarker: string,
@@ -1474,65 +1716,61 @@ export async function revealLatestYuanbaoReferenceList(
     questionFound: false,
     afterQuestionCount: 0
   };
+  let lastClickResult: YuanbaoTriggerClickResult | null = null;
 
   while (Date.now() - startedAt < timeoutMs) {
-    const triggers = await page.locator(YUANBAO_REFERENCE_TRIGGER_SELECTOR).all().catch(() => []);
     lastCandidateSnapshot = await locateCurrentYuanbaoTriggerCandidates(
       page,
       baselineMarker,
       currentQuestion
     );
     for (const triggerIndex of lastCandidateSnapshot.indexes.slice().reverse()) {
-      const trigger = triggers[triggerIndex];
-      if (!trigger) continue;
-      const [visible, enabled] = await Promise.all([
-        trigger.isVisible().catch(() => false),
-        trigger.isEnabled().catch(() => false)
-      ]);
-      if (!visible || !enabled) continue;
-
-      await trigger.scrollIntoViewIfNeeded({ timeout: 5_000 }).catch(() => undefined);
-      const clicked = await trigger.click({ timeout: 5_000 }).then(() => true).catch(() => false);
-      if (!clicked) continue;
+      lastClickResult = await clickYuanbaoReferenceTrigger(page, triggerIndex);
+      if (!lastClickResult.opened) continue;
 
       console.log(
-        `[元宝] 已点击当前问题参考入口 ${triggerIndex + 1}/${triggers.length}` +
+        `[元宝] 已点击当前问题参考入口 ${triggerIndex + 1}/${lastCandidateSnapshot.total}` +
+        `，方式=${lastClickResult.method}` +
         `（class="ToolbarSearchGuid_searchGuidTool__M81L2 Toolbar_icon__xGP8b"）`
       );
 
-      const drawerItem = page
-        .locator(YUANBAO_OPEN_REFERENCE_LIST_SELECTOR)
-        .last()
-        .locator(":scope > li")
-        .first();
-      let opened = await drawerItem.waitFor({ state: "attached", timeout: 10_000 })
-        .then(() => true)
-        .catch(() => false);
-      // 测试夹具或页面旧版本可能没有 t-drawer--open，保留可见列表兼容路径。
-      const hasDrawerShell = await page.locator(".t-drawer").count().catch(() => 0) > 0;
-      if (!opened && !hasDrawerShell) {
-        opened = await page
-          .locator(`${YUANBAO_REFERENCE_LIST_SELECTOR}:visible`)
-          .last()
-          .locator(":scope > li")
-          .first()
-          .waitFor({ state: "attached", timeout: 2_000 })
-          .then(() => true)
-          .catch(() => false);
-      }
-      if (opened) return true;
+      const itemReady = await waitForVisibleYuanbaoReferenceList(page, 10_000, true);
+      if (itemReady) return true;
+      console.log(
+        "[元宝] 参考入口已打开抽屉，但主列表在 10 秒内没有挂载直接子 li。"
+      );
+      return false;
     }
 
     await page.waitForTimeout(250);
   }
 
-  console.log(
-    "[元宝] 当前问题参考入口定位失败：" +
-    `Toolbar总数=${lastCandidateSnapshot.total}` +
-    `，未标记入口=${lastCandidateSnapshot.unmarkedCount}` +
-    `，问题锚点=${lastCandidateSnapshot.questionFound ? "已找到" : "未找到"}` +
-    `，问题之后入口=${lastCandidateSnapshot.afterQuestionCount}`
-  );
+  if (lastCandidateSnapshot.indexes.length > 0 && lastClickResult) {
+    const state = lastClickResult.state;
+    console.log(
+      "[元宝] 当前问题参考入口已定位但无法打开：" +
+      `Toolbar总数=${lastCandidateSnapshot.total}` +
+      `，候选入口=${lastCandidateSnapshot.indexes.map((index) => index + 1).join(",")}` +
+      `，rect=${state.rect || "无"}` +
+      `，display=${state.display || "未知"}` +
+      `，visibility=${state.visibility || "未知"}` +
+      `，opacity=${state.opacity || "未知"}` +
+      `，pointerEvents=${state.pointerEvents || "未知"}` +
+      `，inViewport=${state.inViewport}` +
+      `，ariaDisabled=${state.ariaDisabled || "false"}` +
+      `，disabled=${state.disabled}` +
+      (state.coveredBy ? `，中心点被 ${state.coveredBy} 遮挡` : "") +
+      `，点击诊断=${lastClickResult.errors.join(" | ") || "无"}`
+    );
+  } else {
+    console.log(
+      "[元宝] 当前问题参考入口定位失败：" +
+      `Toolbar总数=${lastCandidateSnapshot.total}` +
+      `，未标记入口=${lastCandidateSnapshot.unmarkedCount}` +
+      `，问题锚点=${lastCandidateSnapshot.questionFound ? "已找到" : "未找到"}` +
+      `，问题之后入口=${lastCandidateSnapshot.afterQuestionCount}`
+    );
+  }
 
   return false;
 }
@@ -1547,15 +1785,10 @@ export async function waitForYuanbaoReferenceListStable(
   let stableSince = Date.now();
 
   while (Date.now() - startedAt < timeoutMs) {
-    const openLists = page.locator(YUANBAO_OPEN_REFERENCE_LIST_SELECTOR);
-    const openListCount = await openLists.count().catch(() => 0);
-    const hasDrawerShell = await page.locator(".t-drawer").count().catch(() => 0) > 0;
-    const list = openListCount > 0
-      ? openLists.last()
-      : hasDrawerShell
-        ? page.locator(".__yuanbao_reference_list_not_open__")
-        : page.locator(`${YUANBAO_REFERENCE_LIST_SELECTOR}:visible`).last();
-    const items = list.locator(":scope > li");
+    const list = await getVisibleYuanbaoReferenceList(page);
+    const items = list
+      ? list.locator(":scope > li")
+      : page.locator(".__yuanbao_reference_list_not_open__");
     const count = await items.count().catch(() => 0);
     if (count === 0) {
       lastSignature = "";
@@ -1789,14 +2022,98 @@ export async function extractLatestDoubaoAnswer(page: Page): Promise<string> {
       wrapper.remove();
       return text;
     }).catch(() => "");
-    const text = cleanDoubaoAnswerText(rawText);
+    const text = cleanAnswerText(rawText);
     if (text) texts.push(text);
   }
-  return cleanDoubaoAnswerText(texts.join("\n\n"));
+  return cleanAnswerText(texts.join("\n\n"));
+}
+
+/**
+ * 提取指定平台当前会话中最后一版回答正文。
+ *
+ * DeepSeek 会移除正文内只用于标注来源编号的链接；千问会移除引用编号和
+ * 多模态视频推荐；元宝会移除 Markdown 中插入的图片卡片。回答操作按钮、
+ * 脚本和样式节点也不会进入最终正文。
+ */
+export async function extractLatestPlatformAnswer(
+  page: Page,
+  platformId: PlatformId
+): Promise<string> {
+  if (platformId === "doubao") return extractLatestDoubaoAnswer(page);
+
+  const selector = platformId === "deepseek"
+    ? DEEPSEEK_ANSWER_SELECTOR
+    : platformId === "qianwen"
+      ? QIANWEN_ANSWER_SELECTOR
+      : YUANBAO_ANSWER_SELECTOR;
+  const candidates = page.locator(selector);
+  const count = await candidates.count().catch(() => 0);
+
+  // 流式回答结束时偶尔会残留空壳节点，因此从最后一个节点开始反向查找
+  // 第一段非空正文；正常情况下第一轮循环就是本题的最终回答。
+  for (let index = count - 1; index >= 0; index -= 1) {
+    const rawText = await candidates.nth(index).evaluate((element, currentPlatformId) => {
+      const clone = element.cloneNode(true) as HTMLElement;
+      const removableSelectors = [
+        "button",
+        "[role='button']",
+        "[data-copy-ignore]",
+        "script",
+        "style",
+        "noscript",
+        "[aria-hidden='true']",
+        "[contenteditable='true']"
+      ];
+
+      if (currentPlatformId === "qianwen") {
+        removableSelectors.push(
+          "[class*='options-item-']",
+          "[class~='qk-md-has-multi-modal']"
+        );
+      }
+      if (currentPlatformId === "yuanbao") {
+        removableSelectors.push("[class~='hyc-common-markdown__replace']");
+      }
+
+      for (const removable of clone.querySelectorAll(removableSelectors.join(", "))) {
+        removable.remove();
+      }
+
+      if (currentPlatformId === "deepseek") {
+        for (const anchor of clone.querySelectorAll("a[href]")) {
+          const citationText = (anchor.textContent ?? "").replace(/\s+/g, " ").trim();
+          if (/^-\s*\d+$/.test(citationText)) anchor.remove();
+        }
+      }
+
+      // 平台样式中包含流式动画和虚拟列表规则，克隆后若继续套用这些 class，
+      // 部分已完成段落会被判成隐藏。移除 class 后仍由 h1/p/li/table 等语义标签
+      // 保留自然换行，同时避免真实页面样式影响离屏文本计算。
+      clone.removeAttribute("class");
+      for (const styledNode of clone.querySelectorAll("[class]")) {
+        styledNode.removeAttribute("class");
+      }
+
+      // detached 克隆节点的 innerText 可能为空，临时挂载到屏幕外完成布局计算。
+      const wrapper = document.createElement("div");
+      wrapper.style.cssText =
+        "position:fixed;left:-100000px;top:0;width:1000px;opacity:0;" +
+        "pointer-events:none;z-index:-1;";
+      wrapper.appendChild(clone);
+      document.body.appendChild(wrapper);
+      const text = clone.innerText;
+      wrapper.remove();
+      return text;
+    }, platformId).catch(() => "");
+    const answer = cleanAnswerText(rawText);
+    if (answer) return answer;
+  }
+
+  return "";
 }
 
 /** 保留回答段落和表格换行，同时清理行尾空白与过多空行。 */
-function cleanDoubaoAnswerText(value: string): string {
+function cleanAnswerText(value: string): string {
   return value
     .replace(/\r\n?/g, "\n")
     .split("\n")
@@ -1998,14 +2315,8 @@ async function extractYuanbaoReferenceList(
   question: string,
   crawlPlatform: string
 ): Promise<ReferenceRecord[]> {
-  const openLists = page.locator(YUANBAO_OPEN_REFERENCE_LIST_SELECTOR);
-  const openListCount = await openLists.count().catch(() => 0);
-  const hasDrawerShell = await page.locator(".t-drawer").count().catch(() => 0) > 0;
-  const list = openListCount > 0
-    ? openLists.last()
-    : hasDrawerShell
-      ? page.locator(".__yuanbao_reference_list_not_open__")
-      : page.locator(`${YUANBAO_REFERENCE_LIST_SELECTOR}:visible`).last();
+  const list = await getVisibleYuanbaoReferenceList(page) ??
+    page.locator(".__yuanbao_reference_list_not_open__");
   const listReady = await list.waitFor({ state: "visible", timeout: 10_000 })
     .then(() => true)
     .catch(() => false);

@@ -121,6 +121,7 @@ npm run crawl
 ### DeepSeek
 
 - 提问前记录页面正文、高度和 `._223dd7b` 引用容器数量，用于识别新回答是否开始。
+- 回答结束后读取最后一个 `.ds-markdown.ds-assistant-message-main-content` 正文区，并移除只用于标注来源编号的链接和操作按钮；历史回答不会写入答案文件。
 - 回答结束后，只点击页面最下方、文本严格符合“X个网页”的最新 `.f93f59e4` 按钮，不操作历史回答入口。
 - 等待最后一个可见 `._223dd7b` 列表的引用数量和 URL 集合稳定，再逐个解析其直接子节点；同时兼容直接子节点为 `div` 或 `a` 的页面版本。
 - 从单条引用卡片内提取来源、日期、标题、摘要和 URL。标题明显不完整时，默认访问文章页面并使用 `og:title`、`twitter:title` 或 `<title>` 补全，可用 `--resolve-titles=false` 关闭。
@@ -132,6 +133,7 @@ npm run crawl
 
 - 提问前记录 `.link-title-igf0OC` 参考入口数量，只允许点击本题回答新增的最后一个入口。
 - 如果首次回答结束后没有新参考入口，会通过 `reg_svg` 图标找到最新回答的重新生成控件，先点击其外层 `.flex.items-center.rounded` 打开菜单，再点击 `role="menuitem"`、文字严格为“重新生成”的长 class 菜单项。点击后 15 秒内检查生成是否启动；自动重新生成严格限制为一次。
+- 从最新回答的 `.qk-markdown` 读取正文，排除引用编号、多模态视频推荐和操作按钮；自动重新生成成功时，新正文覆盖原始正文，最终只保存第 2 版。
 - 等待回答时会单独分析本题新增正文；如果同一批长句高频重复、判定千问回答进入循环崩坏，程序会立即停止当前生成、跳过该题并继续下一题，不再耗尽单题 5 分钟超时。正常长列表和少量重复不会触发该保护。
 - 点击入口后等待最后一个可见 `.list-XPxyL2`。列表达到入口标注的引用数并稳定，或其直接子节点与 URL 集合持续稳定后，才开始解析。
 - 只遍历列表的直接子 `div`，优先从 `data-exposure-extra`、`data-click-extra` 读取标题、URL 和引用顺序，同时兼容卡片内的链接及数据属性。
@@ -142,11 +144,14 @@ npm run crawl
 ### 元宝
 
 - 每道题开始前先关闭上一题的引用抽屉，并给当前已有的 `.ToolbarSearchGuid_searchGuidTool__M81L2.Toolbar_icon__xGP8b` 入口加本轮身份标记。
+- “源”入口和回答操作栏可能在正文流式输出期间提前出现，因此不再把入口出现视为回答完成。程序以当前问题为 DOM 锚点，只观察它之后的最新 AI 正文；正文至少连续 15 秒不再增长且本题已等待 20 秒后，才缓存答案并进入引用阶段。
 - 回答完成后优先点击未标记的新入口；长会话发生 DOM 回收、入口总数不再增长时，改用当前问题文本作为 DOM 锚点，只接受问题之后的参考入口。
-- 如果入口定位失败，日志会打印 Toolbar 总数、未标记入口数、当前问题锚点状态和问题之后的入口数，便于区分“没有联网来源”和“页面结构变化”。
-- 点击入口后等待已打开抽屉中的 `.agent-dialogue-references__list` 出现。
+- 入口点击依次尝试外层普通点击、内部可点击节点、强制点击和 DOM 点击；每一步都必须确认可见引用抽屉已经出现，避免把事件派发成功误判为列表打开。
+- 如果入口已经定位但仍打不开，日志会打印尺寸、CSS 可见性、`pointer-events`、禁用状态、视口状态、中心点遮挡元素和每种点击方式的实际错误；完全没有候选时才打印入口定位失败。
+- 点击入口后优先读取已打开抽屉中的 `.agent-dialogue-references__list`，同时兼容抽屉存在但 `t-drawer--open` class 发生变化的页面版本。
 - 持续检查列表直接子 `li` 的数量、标题和 URL；这些内容稳定后才进行提取，避免抽屉仍在加载时漏抓。
 - 每个 `li` 作为一条引用解析，优先读取 `.hyc-common-markdown__ref_card[data-url]` 及卡片标题、来源、时间和摘要，随后清洗 URL、去重并保持页面顺序。
+- 从最新 AI 消息的 `.agent-chat__speech-card__text` 读取正文，并排除图片替换卡片和操作按钮，避免车型图片标题在答案中重复出现。
 - 抓取结束后自动关闭引用抽屉；入口缺失、列表未稳定或结果为空时最多检查 3 次，随后跳过当前题，不读取历史抽屉内容。
 
 输出目录：`results/yuanbao/`
@@ -161,15 +166,21 @@ results/
 ├── doubao/answers.csv
 ├── deepseek/references.json
 ├── deepseek/references.csv
+├── deepseek/answers.json
+├── deepseek/answers.csv
 ├── qianwen/references.json
 ├── qianwen/references.csv
+├── qianwen/answers.json
+├── qianwen/answers.csv
 ├── yuanbao/references.json
 ├── yuanbao/references.csv
+├── yuanbao/answers.json
+├── yuanbao/answers.csv
 ├── references.json
 └── references.csv
 ```
 
-平台子目录中的引用 JSON、CSV 均保持原有的扁平记录格式。豆包额外生成 `answers.json` 和 `answers.csv`，每道题仅保存最终一版回答；即使最终没有可用参考资料，也会保留已抓到的答案正文并将 `referenceCount` 写为 `0`。生成引用汇总数据时，程序先把记录放入豆包、DeepSeek、千问、元宝各自的数据组，再在每个平台内按问题分组，最后合并四个平台中的相同问题。根目录的 `results/references.json` 因此按“问题 → 平台 → 引用记录”组织，平台内部不再重复保存 `question` 字段；四个平台键始终存在，没有结果时为 `[]`。根目录的 `results/references.csv` 继续使用便于表格处理的扁平格式。
+平台子目录中的引用 JSON、CSV 均保持原有的扁平记录格式。豆包、DeepSeek、千问和元宝都会生成各自的 `answers.json` 与 `answers.csv`，每道题仅保存最后一次实际生成的回答；即使最终没有可用参考资料，也会保留已抓到的答案正文并将 `referenceCount` 写为 `0`。生成引用汇总数据时，程序先把记录放入豆包、DeepSeek、千问、元宝各自的数据组，再在每个平台内按问题分组，最后合并四个平台中的相同问题。根目录的 `results/references.json` 因此按“问题 → 平台 → 引用记录”组织，平台内部不再重复保存 `question` 字段；四个平台键始终存在，没有结果时为 `[]`。根目录的 `results/references.csv` 继续使用便于表格处理的扁平格式。
 
 ### 清洗规则
 
@@ -194,14 +205,14 @@ results/
 | `url` | 解跳转、去跟踪参数后的文章地址 |
 | `extractedAt` | 抓取时间，使用 ISO 8601 UTC 字符串 |
 
-豆包答案文件字段：
+四个平台答案文件字段：
 
 | 字段 | 含义 |
 | --- | --- |
 | `question` | 当前回答对应的问题 |
-| `crawlPlatform` | 固定为豆包 |
+| `crawlPlatform` | 生成该回答的平台：豆包、DeepSeek、千问或元宝 |
 | `answer` | 最后一次实际生成的回答正文 |
-| `generationNumber` | 生成版本，从 1 开始；1 为原始回答，2 为第一次重新提问得到的回答 |
+| `generationNumber` | 生成版本，从 1 开始；豆包重新提问或千问重新生成成功后递增 |
 | `referenceCount` | 该最终答案成功解析出的参考文献数量；没有有效引用时为 0 |
 | `extractedAt` | 最终正文缓存时间，使用 ISO 8601 UTC 字符串 |
 
@@ -334,12 +345,12 @@ npm test
 | `src/index.ts` | 组织多平台任务并写入平台数据与汇总数据 |
 | `src/cli.ts` | 解析命令行参数和外部问题文件 |
 | `src/crawler.ts` | 连接页面、发送问题、等待回答和执行失败保护 |
-| `src/extractReferences.ts` | 展开并解析各平台引用列表 |
+| `src/extractReferences.ts` | 提取各平台最终回答，并展开、解析引用列表 |
 | `src/platforms.ts` | 平台地址与页面选择器配置 |
 | `src/questions.ts` | 默认问题列表 |
 | `src/resolveTitles.ts` | DeepSeek 外部文章标题补全 |
 | `src/text.ts` | 标题、来源、日期和 URL 的公共清洗规则 |
 | `src/output.ts` | 平台分桶、问题分组以及 JSON、CSV 输出 |
 | `src/types.ts` | CLI、平台配置、候选记录与输出记录类型 |
-| `tests/doubao-extraction.test.ts` | 四个平台引用入口与结构化抽取回归测试 |
-| `tests/output.test.ts` | 三阶段汇总分组测试 |
+| `tests/doubao-extraction.test.ts` | 四个平台回答、引用入口与结构化抽取回归测试 |
+| `tests/output.test.ts` | 三阶段汇总分组与平台答案文件测试 |

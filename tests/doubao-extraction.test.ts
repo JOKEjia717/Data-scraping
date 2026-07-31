@@ -5,13 +5,18 @@
 import assert from "node:assert/strict";
 import { after, before, test } from "node:test";
 import { chromium, type Browser } from "playwright";
-import { detectQianwenAnswerLoop, openNewConversation } from "../src/crawler.js";
+import {
+  detectQianwenAnswerLoop,
+  openNewConversation,
+  waitForYuanbaoCurrentAnswerComplete
+} from "../src/crawler.js";
 import {
   clickLatestQianwenRegenerate,
   countDoubaoSearchResultBlocks,
   countQianwenReferenceTriggers,
   countYuanbaoReferenceTriggers,
   extractLatestDoubaoAnswer,
+  extractLatestPlatformAnswer,
   extractReferences,
   hasCurrentDoubaoReferenceEntry,
   markDoubaoSearchResultBaseline,
@@ -455,6 +460,74 @@ test("豆包只提取最后一次生成的正文块并排除搜索、视频和�
   await page.close();
 });
 
+test("DeepSeek、千问和元宝只提取最后一版回答正文并清理非正文组件", async () => {
+  assert.ok(browser);
+  const page = await browser.newPage();
+
+  await page.setContent(`
+    <main>
+      <section id="deepseek">
+        <div class="ds-markdown ds-assistant-message-main-content">DeepSeek 历史回答</div>
+        <div class="ds-markdown ds-assistant-message-main-content">
+          <h2>DeepSeek 最终回答</h2>
+          <p>正文内容<a href="https://example.com/source">-<span>2</span></a>。</p>
+          <button>复制</button>
+        </div>
+      </section>
+
+      <section id="qianwen">
+        <div class="message-select-wrapper-answer-rqWekn">
+          <div class="qk-markdown">千问历史回答</div>
+        </div>
+        <div class="message-select-wrapper-answer-rqWekn">
+          <div class="qk-markdown">
+            <h2>千问最终回答</h2>
+            <div class="qk-md-paragraph">
+              正文内容<span class="options-item-Yv7oFR">3</span>。
+            </div>
+            <div class="qk-md-paragraph qk-md-has-multi-modal">
+              视频推荐不应保存
+            </div>
+          </div>
+          <div class="reference-wrap-iEjeb3">7篇来源</div>
+        </div>
+      </section>
+
+      <section id="yuanbao">
+        <div data-conv-speaker="ai">
+          <div class="agent-chat__speech-card__text">元宝历史回答</div>
+        </div>
+        <div data-conv-speaker="ai">
+          <div class="agent-chat__speech-card__text">
+            <div class="hyc-common-markdown">
+              <h2>元宝最终回答</h2>
+              <div class="ybc-p">正文内容。</div>
+              <div class="hyc-common-markdown__replace">
+                图片卡片标题不应重复保存
+              </div>
+            </div>
+            <div role="button">重新生成</div>
+          </div>
+        </div>
+      </section>
+    </main>
+  `);
+
+  assert.equal(
+    await extractLatestPlatformAnswer(page, "deepseek"),
+    "DeepSeek 最终回答\n\n正文内容。"
+  );
+  assert.equal(
+    await extractLatestPlatformAnswer(page, "qianwen"),
+    "千问最终回答\n正文内容。"
+  );
+  assert.equal(
+    await extractLatestPlatformAnswer(page, "yuanbao"),
+    "元宝最终回答\n正文内容。"
+  );
+  await page.close();
+});
+
 test("DeepSeek 只抽取最新可见 _223dd7b 容器的直接引用子节点", async () => {
   assert.ok(browser);
   const page = await browser.newPage();
@@ -672,6 +745,147 @@ test("元宝长会话复用已标记入口时按当前问题 DOM 锚点点击", 
     true
   );
   assert.equal(await page.locator("body").getAttribute("data-clicked"), "recycled-current");
+  await page.close();
+});
+
+test("元宝入口不可见时通过 DOM 点击回退打开无 open class 的抽屉", async () => {
+  assert.ok(browser);
+  const page = await browser.newPage();
+  await page.setContent(`
+    <main>
+      <section>
+        <div>当前隐藏入口问题</div>
+        <div
+          id="hidden-yuanbao-source"
+          class="ToolbarSearchGuid_searchGuidTool__M81L2 Toolbar_icon__xGP8b"
+          style="display:none"
+        >源</div>
+      </section>
+    </main>
+    <script>
+      document.querySelector("#hidden-yuanbao-source").addEventListener("click", () => {
+        document.body.dataset.clicked = "hidden-dom-fallback";
+        const drawer = document.createElement("div");
+        drawer.className = "t-drawer";
+        drawer.innerHTML =
+          '<ul class="agent-dialogue-references__list">' +
+            '<li><div data-url="https://news.example.com/hidden">' +
+              '<h4>隐藏入口引用</h4>' +
+            '</div></li>' +
+          '</ul>';
+        document.body.append(drawer);
+      });
+    </script>
+  `);
+
+  assert.equal(
+    await revealLatestYuanbaoReferenceList(
+      page,
+      "hidden-marker",
+      "当前隐藏入口问题",
+      8_000
+    ),
+    true
+  );
+  assert.equal(
+    await page.locator("body").getAttribute("data-clicked"),
+    "hidden-dom-fallback"
+  );
+  assert.equal(await waitForYuanbaoReferenceListStable(page, 5_000), true);
+  await page.close();
+});
+
+test("元宝回答完成后延迟挂载参考入口时继续等待并打开", async () => {
+  assert.ok(browser);
+  const page = await browser.newPage();
+  await page.setContent(`
+    <main>
+      <section id="late-answer">
+        <div>延迟入口问题</div>
+        <div>回答正文先完成</div>
+      </section>
+    </main>
+    <script>
+      setTimeout(() => {
+        const trigger = document.createElement("div");
+        trigger.id = "late-yuanbao-source";
+        trigger.className =
+          "ToolbarSearchGuid_searchGuidTool__M81L2 Toolbar_icon__xGP8b";
+        trigger.textContent = "源";
+        trigger.addEventListener("click", () => {
+          document.body.dataset.clicked = "late-current";
+          const list = document.createElement("ul");
+          list.className = "agent-dialogue-references__list";
+          list.innerHTML =
+            '<li><div data-url="https://news.example.com/late">' +
+              '<h4>延迟入口引用</h4>' +
+            '</div></li>';
+          document.body.append(list);
+        });
+        document.querySelector("#late-answer").append(trigger);
+      }, 500);
+    </script>
+  `);
+
+  assert.equal(
+    await revealLatestYuanbaoReferenceList(
+      page,
+      "late-marker",
+      "延迟入口问题",
+      8_000
+    ),
+    true
+  );
+  assert.equal(await page.locator("body").getAttribute("data-clicked"), "late-current");
+  await page.close();
+});
+
+test("元宝来源入口提前出现时仍等待当前正文停止增长", async () => {
+  assert.ok(browser);
+  const page = await browser.newPage();
+  const question = "元宝流式回答测试问题";
+  await page.setContent(`
+    <main>
+      <section>
+        <div>${question}</div>
+        <div data-conv-speaker="ai">
+          <div id="yuanbao-streaming-answer" class="agent-chat__speech-card__text"></div>
+          <div class="ToolbarSearchGuid_searchGuidTool__M81L2 Toolbar_icon__xGP8b">源</div>
+        </div>
+      </section>
+    </main>
+    <script>
+      setTimeout(() => {
+        document.querySelector("#yuanbao-streaming-answer").textContent =
+          "回答开头。";
+      }, 100);
+      setTimeout(() => {
+        document.querySelector("#yuanbao-streaming-answer").textContent +=
+          "第一部分仍在生成。";
+      }, 350);
+      setTimeout(() => {
+        document.querySelector("#yuanbao-streaming-answer").textContent +=
+          "这是最终完整答案。";
+      }, 700);
+    </script>
+  `);
+
+  const startedAt = Date.now();
+  await waitForYuanbaoCurrentAnswerComplete(
+    page,
+    question,
+    4_000,
+    250,
+    0
+  );
+  const elapsed = Date.now() - startedAt;
+  const finalText = await page.locator("#yuanbao-streaming-answer").innerText();
+
+  assert.equal(
+    finalText,
+    "回答开头。第一部分仍在生成。这是最终完整答案。"
+  );
+  assert.ok(elapsed >= 900, `不应在最终正文出现前结束等待，实际等待 ${elapsed}ms`);
   await page.close();
 });
 
