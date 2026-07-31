@@ -41,6 +41,26 @@ export interface CrawlPlatformResult {
   answers: AnswerRecord[];
 }
 
+export type CrawlQuestionStatus = "completed" | "no_references" | "skipped";
+
+/** 单题完成事件用于数据库精确定位“问题 × 平台”任务，不依赖问题文本唯一。 */
+export interface CrawlQuestionResult {
+  questionIndex: number;
+  question: string;
+  status: CrawlQuestionStatus;
+  attemptCount: number;
+  answer?: AnswerRecord;
+  references: ReferenceRecord[];
+  errorMessage?: string;
+}
+
+/** 抓取生命周期钩子：文件快照与数据库写入可以独立订阅同一轮进度。 */
+export interface CrawlPlatformHooks {
+  onProgress?: (result: CrawlPlatformResult) => Promise<void>;
+  onQuestionStart?: (questionIndex: number, question: string) => Promise<void>;
+  onQuestionComplete?: (result: CrawlQuestionResult) => Promise<void>;
+}
+
 /** 提问前的页面快照，用于区分历史内容与本题新增回答。 */
 interface TrackedAnswerBaseline {
   bodyText: string;
@@ -73,7 +93,7 @@ const REFERENCE_CHECK_INTERVAL_MS = 1_500;
 export async function crawlPlatform(
   config: PlatformConfig,
   options: CrawlPlatformOptions,
-  onProgress?: (result: CrawlPlatformResult) => Promise<void>
+  hooks: CrawlPlatformHooks = {}
 ): Promise<CrawlPlatformResult> {
   const browser = await chromium.connectOverCDP(options.cdpEndpoint);
   const page = findExistingPage(browser.contexts().flatMap((context) => context.pages()), config);
@@ -88,6 +108,7 @@ export async function crawlPlatform(
 
   for (const [index, question] of options.questions.entries()) {
     console.log(`\n[${config.name}] ${index + 1}/${options.questions.length} ${question}`);
+    await hooks.onQuestionStart?.(index, question);
     // 元宝引用抽屉会遮挡页面并污染下一题基线，因此提问前后都主动关闭。
     if (config.id === "yuanbao") await closeYuanbaoReferencePanel(page);
     await waitForReadyToSend(page, config, options.timeoutMs);
@@ -112,7 +133,15 @@ export async function crawlPlatform(
     } catch (error) {
       if (config.id === "qianwen" && error instanceof QianwenAnswerLoopError) {
         console.log(`[千问] 跳过本题：${error.message}`);
-        await onProgress?.({ references: records, answers });
+        await hooks.onProgress?.({ references: records, answers });
+        await hooks.onQuestionComplete?.({
+          questionIndex: index,
+          question,
+          status: "skipped",
+          attemptCount: 1,
+          references: [],
+          errorMessage: error.message
+        });
         continue;
       }
       throw error;
@@ -153,19 +182,21 @@ export async function crawlPlatform(
       submittedQuestion,
       captureAnswer
     );
-    const appendFinalAnswer = (referenceCount: number): void => {
-      answers.push({
+    const appendFinalAnswer = (referenceCount: number): AnswerRecord => {
+      const answerRecord: AnswerRecord = {
         question,
         crawlPlatform: config.name,
         answer: finalAnswer,
         generationNumber: finalGeneration,
         referenceCount,
         extractedAt: finalAnswerExtractedAt
-      });
+      };
+      answers.push(answerRecord);
       console.log(
         `[${config.name}] 已保存最终第 ${finalGeneration} 版回答` +
         `（正文=${finalAnswer.length} 字符，参考=${referenceCount} 条）。`
       );
+      return answerRecord;
     };
     if (!referenceReady) {
       if (config.id === "yuanbao") await closeYuanbaoReferencePanel(page);
@@ -177,8 +208,17 @@ export async function crawlPlatform(
       if (baselineRevealButtonCount > 0) {
         console.log(`[${config.name}] 页面存在历史参考入口，但没有确认到属于本题的有效引用列表。`);
       }
-      appendFinalAnswer(0);
-      await onProgress?.({ references: records, answers });
+      const answerRecord = appendFinalAnswer(0);
+      await hooks.onProgress?.({ references: records, answers });
+      await hooks.onQuestionComplete?.({
+        questionIndex: index,
+        question,
+        status: "no_references",
+        attemptCount: finalGeneration,
+        answer: answerRecord,
+        references: [],
+        errorMessage: "多次检查后仍没有找到属于当前问题的有效参考资料。"
+      });
       continue;
     }
 
@@ -198,14 +238,31 @@ export async function crawlPlatform(
       console.log(
         `[${config.name}] 跳过本题：引用面板已打开，但连续 ${REFERENCE_CHECK_ATTEMPTS} 次没有解析到有效外部链接。`
       );
-      appendFinalAnswer(0);
-      await onProgress?.({ references: records, answers });
+      const answerRecord = appendFinalAnswer(0);
+      await hooks.onProgress?.({ references: records, answers });
+      await hooks.onQuestionComplete?.({
+        questionIndex: index,
+        question,
+        status: "no_references",
+        attemptCount: finalGeneration,
+        answer: answerRecord,
+        references: [],
+        errorMessage: "引用面板已打开，但没有解析到有效外部链接。"
+      });
       continue;
     }
     records.push(...questionRecords);
-    appendFinalAnswer(questionRecords.length);
+    const answerRecord = appendFinalAnswer(questionRecords.length);
     // 每完成一道题就通知入口层写盘，而不是等待整个平台全部结束。
-    await onProgress?.({ references: records, answers });
+    await hooks.onProgress?.({ references: records, answers });
+    await hooks.onQuestionComplete?.({
+      questionIndex: index,
+      question,
+      status: "completed",
+      attemptCount: finalGeneration,
+      answer: answerRecord,
+      references: questionRecords
+    });
   }
 
   if (options.questions.length > 0) {

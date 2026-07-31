@@ -9,10 +9,13 @@
     "crawl:deepseek": "tsx src/index.ts --platforms=deepseek",
     "crawl:qianwen": "tsx src/index.ts --platforms=qianwen",
     "crawl:yuanbao": "tsx src/index.ts --platforms=yuanbao",
+    "db:check": "tsx src/checkDatabase.ts",
     "test": "tsx --test tests/*.test.ts",
     "check": "tsc --noEmit"
   },
   "dependencies": {
+    "dotenv": "^17.4.2",
+    "mysql2": "^3.23.2",
     "playwright": "^1.45.0"
   },
   "devDependencies": {

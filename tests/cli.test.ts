@@ -27,3 +27,15 @@ test("并发运行时会去除重复平台，避免两个任务操作同一标�
 
   assert.deepEqual(options.platforms, ["doubao", "deepseek", "qianwen"]);
 });
+
+test("数据库入库默认开启，也可以为纯文件调试显式关闭", async () => {
+  const defaultOptions = await parseCli([]);
+  const fileOnlyOptions = await parseCli([
+    "--database=false",
+    "--batch-name=  调试批次  "
+  ]);
+
+  assert.equal(defaultOptions.databaseEnabled, true);
+  assert.equal(fileOnlyOptions.databaseEnabled, false);
+  assert.equal(fileOnlyOptions.batchName, "调试批次");
+});

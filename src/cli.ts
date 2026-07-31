@@ -24,7 +24,9 @@ export async function parseCli(argv: string[]): Promise<CliOptions> {
     questionFile: args.get("questions"),
     promptPrefix: args.get("prompt-prefix") ?? DEFAULT_PROMPT_PREFIX,
     resolveTitles: args.get("resolve-titles") !== "false",
-    timeoutMs: Number(args.get("timeout-ms") || 300_000)
+    timeoutMs: Number(args.get("timeout-ms") || 300_000),
+    databaseEnabled: args.get("database") !== "false",
+    batchName: normalizeOptionalValue(args.get("batch-name"))
   };
 }
 
@@ -55,4 +57,10 @@ function parsePlatforms(value?: string): PlatformId[] {
   }
   // 并发模式下重复平台会操作同一个标签页，必须在入口处去重。
   return [...new Set(platforms)];
+}
+
+/** 把只包含空白的可选参数视为未配置，避免创建没有名称的数据库批次。 */
+function normalizeOptionalValue(value?: string): string | undefined {
+  const normalized = value?.trim();
+  return normalized || undefined;
 }

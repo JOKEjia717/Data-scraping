@@ -17,7 +17,7 @@
   ↓
 各平台解析、清洗后更新内存快照
   ↓
-集中写入队列依次刷新平台文件和根目录汇总
+单题事务写入 MySQL，同时刷新平台文件和根目录汇总
   ↓
 各平台完成全部问题后分别自动新建对话
   ↓
@@ -92,7 +92,49 @@ Invoke-RestMethod http://127.0.0.1:9222/json/version
 
 只采集某个平台时，只需打开对应页面。
 
-### 4. 运行
+### 4. 配置 MySQL
+
+复制环境变量模板：
+
+```bash
+cp .env.example .env
+```
+
+在 `.env` 中填写低权限数据库账号。默认连接本机 `127.0.0.1:3306` 的
+`Data_Scraping` 数据库；真实密码只保存在 `.env`，该文件已被 Git 忽略。
+
+```env
+DB_HOST=127.0.0.1
+DB_PORT=3306
+DB_USER=crawler_app
+DB_PASSWORD=你的数据库密码
+DB_NAME=Data_Scraping
+DB_CONNECTION_LIMIT=6
+DB_SSL=false
+```
+
+如果密码包含 `#`，必须使用引号包住完整密码，否则 `#` 后面的内容会被
+`dotenv` 当成注释：
+
+```env
+DB_PASSWORD="完整密码#后半段"
+```
+
+填写完成后执行只读连接检查：
+
+```bash
+npm run db:check
+```
+
+公网或生产环境建议将 `DB_SSL` 设置为 `true`，并通过 `DB_SSL_CA_PATH`
+配置 MySQL CA 证书；开启 TLS 后程序始终验证服务端证书，不提供跳过验证的开关。
+
+数据库入库默认开启。每次运行会自动创建一个 `question_batches` 批次和一个
+`crawl_runs` 运行记录，并预先创建所有“问题 × 平台”任务。每完成一道题，
+程序会在同一个事务中写入任务状态、最终答案和参考资料，同时继续保留原有
+JSON/CSV 文件。临时只调试页面和文件输出时可加 `--database=false`。
+
+### 5. 运行
 
 在终端 B 中执行：
 
@@ -100,11 +142,57 @@ Invoke-RestMethod http://127.0.0.1:9222/json/version
 npm run crawl
 ```
 
-默认同时运行豆包、DeepSeek、千问和元宝。四个平台的终端日志会交错出现，这是并发运行的正常现象。需要中止时按 `Ctrl+C`；程序每完成一道题都会更新快照并通过统一队列写盘，已经完成的数据不会因中止而丢失。
+默认同时运行豆包、DeepSeek、千问和元宝。四个平台的终端日志会交错出现，这是并发运行的正常现象。需要中止时按 `Ctrl+C`；程序每完成一道题都会提交数据库事务并更新文件快照，已经完成的数据不会因中止而丢失。
 
 不要再同时打开四个终端分别执行 `crawl:doubao`、`crawl:deepseek`、`crawl:qianwen` 和 `crawl:yuanbao` 并指向同一个输出目录。默认的 `npm run crawl` 已经并发运行四个平台，而且只有这个主进程负责更新根目录汇总，因此不会出现“最后完成的平台覆盖其他平台”的问题。单平台命令保留用于调试；调试时建议通过 `--out` 使用单独的输出目录。
 
-并发抓取期间，每个平台拥有独立的数据快照；文件写入使用同一条 Promise 队列，并采用“临时文件写完后再替换正式文件”的原子写入方式。某个平台发生异常时，程序会等待其他平台完成并保存其数据，最后再统一报告失败平台。
+并发抓取期间，每个平台拥有独立的数据快照；文件写入使用同一条 Promise 队列，并采用“临时文件写完后再替换正式文件”的原子写入方式。数据库通过任务 ID 隔离四个平台，并按单题使用事务写入。某个平台发生异常时，其当前及未执行任务会标记为 `failed`，其他平台继续抓取和入库，最后再统一结束本次运行。
+
+### 数据库写入关系
+
+```text
+question_batches
+├── questions
+└── crawl_runs
+    └── question_platform_tasks（问题 × 平台）
+        ├── answers（每个任务最多一条，重复生成时覆盖为最后一版）
+        └── references（当前最终答案对应的多条引用）
+```
+
+任务状态说明：
+
+| 状态 | 含义 |
+| --- | --- |
+| `pending` | 已创建，尚未开始 |
+| `running` | 正在提问或等待回答 |
+| `completed` | 最终答案和有效参考资料已入库 |
+| `no_references` | 回答已入库，但多次检查后没有有效参考资料 |
+| `skipped` | 当前题无法形成可保存的回答，已跳过 |
+| `failed` | 平台发生会造成错位的异常，任务失败 |
+
+查询最新一次运行的分组结果：
+
+```sql
+SELECT
+  q.sort_order,
+  q.content AS question,
+  p.name AS platform,
+  t.status,
+  a.content AS answer,
+  a.generation_number,
+  a.reference_count,
+  r.rank,
+  r.title,
+  r.url
+FROM crawl_runs cr
+JOIN question_platform_tasks t ON t.run_id = cr.id
+JOIN questions q ON q.id = t.question_id
+JOIN platforms p ON p.id = t.platform_id
+LEFT JOIN answers a ON a.task_id = t.id
+LEFT JOIN `references` r ON r.task_id = t.id
+WHERE cr.id = (SELECT MAX(id) FROM crawl_runs)
+ORDER BY q.sort_order, p.id, r.rank;
+```
 
 ## 平台模块
 
@@ -268,6 +356,8 @@ npm run crawl:yuanbao
 | `--timeout-ms` | 修改单题最长等待时间，默认 300000（5 分钟） | `--timeout-ms=600000` |
 | `--prompt-prefix` | 覆盖全局提问前缀；默认使用“请联网搜索后回答，并提供可点击的参考来源。问题：” | `--prompt-prefix="请联网搜索并保留参考来源。问题："` |
 | `--resolve-titles=false` | 关闭 DeepSeek 文章标题补全 | `npm run crawl:deepseek -- --resolve-titles=false` |
+| `--batch-name` | 自定义本次数据库批次名称；默认使用运行时间 | `--batch-name="理想L7调研第一轮"` |
+| `--database=false` | 临时关闭 MySQL 入库，仅保留 JSON/CSV 输出 | `npm run crawl -- --database=false` |
 
 参数需要放在 npm 脚本后的 `--` 之后，例如：
 

@@ -15,6 +15,8 @@ export interface CliOptions {
   promptPrefix: string;
   resolveTitles: boolean;
   timeoutMs: number;
+  databaseEnabled: boolean;
+  batchName?: string;
 }
 
 /** 单个平台的地址、兼容域名和页面交互选择器。 */
