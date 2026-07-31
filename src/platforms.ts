@@ -123,6 +123,10 @@ export const PLATFORMS: Record<PlatformId, PlatformConfig> = {
       "input[type='text']"
     ],
     sendButtonSelectors: [
+      // 保留 Apple/macOS 页面原有的语义定位，同时兼容 Windows 当前的
+      // 黑色圆形发送按钮。class 使用 token 匹配，不依赖完整 class 或排列顺序。
+      "button[class~='bg-black-button'][class~='rounded-full'][class~='cursor-pointer'][class~='size-8']",
+      "[role='button'][class~='bg-black-button'][class~='rounded-full'][class~='cursor-pointer'][class~='size-8']",
       "button[aria-label*='发送']",
       "button[title*='发送']",
       "button:has-text('发送')",

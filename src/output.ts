@@ -23,6 +23,74 @@ type PlatformQuestionGroups = Record<
   Map<string, GroupedReferenceRecord[]>
 >;
 
+/** 并发抓取过程中，一个平台已经完成并可安全落盘的数据快照。 */
+export interface PlatformOutputSnapshot {
+  references: ReferenceRecord[];
+  answers: AnswerRecord[];
+}
+
+/**
+ * 创建集中输出协调器。抓取任务可以并发更新各自快照，但所有文件写入会进入
+ * 同一条 Promise 队列；每次写根目录汇总前，先写完当前全部平台子目录。
+ */
+export function createOutputCoordinator(
+  outDir: string,
+  platformIds: readonly PlatformId[],
+  questions: readonly string[]
+): {
+  update: (platformId: PlatformId, snapshot: PlatformOutputSnapshot) => Promise<void>;
+  flush: () => Promise<void>;
+} {
+  const orderedPlatformIds = [...new Set(platformIds)];
+  const snapshots = new Map<PlatformId, PlatformOutputSnapshot>();
+  let writeQueue = Promise.resolve();
+
+  const writeCurrentSnapshots = async (): Promise<void> => {
+    // 在本次队列任务开始时冻结视图，保证平台文件与根目录汇总使用同一批数据。
+    const currentSnapshots = orderedPlatformIds
+      .map((platformId) => {
+        const snapshot = snapshots.get(platformId);
+        return snapshot ? { platformId, snapshot } : null;
+      })
+      .filter((item): item is {
+        platformId: PlatformId;
+        snapshot: PlatformOutputSnapshot;
+      } => item !== null);
+
+    for (const { platformId, snapshot } of currentSnapshots) {
+      await writePlatformOutputs(
+        outDir,
+        platformId,
+        snapshot.references,
+        snapshot.answers
+      );
+    }
+
+    const allReferences = currentSnapshots.flatMap(
+      ({ snapshot }) => snapshot.references
+    );
+    await writeOutputs(outDir, allReferences, questions);
+  };
+
+  return {
+    update(platformId, snapshot) {
+      // crawlPlatform 内部会继续复用并追加原数组，因此必须保存独立快照。
+      snapshots.set(platformId, {
+        references: snapshot.references.map((record) => ({ ...record })),
+        answers: snapshot.answers.map((answer) => ({ ...answer }))
+      });
+
+      const pendingWrite = writeQueue.then(writeCurrentSnapshots);
+      // 单次写入失败要返回给对应平台，但不能永久阻塞其他平台后续写入。
+      writeQueue = pendingWrite.catch(() => undefined);
+      return pendingWrite;
+    },
+    flush() {
+      return writeQueue;
+    }
+  };
+}
+
 /** 写入按问题分组的汇总 JSON，以及仍保持扁平结构的汇总 CSV。 */
 export async function writeOutputs(
   outDir: string,
@@ -34,8 +102,8 @@ export async function writeOutputs(
   const csvPath = path.join(outDir, "references.csv");
 
   const groupedRecords = groupRecordsByQuestion(records, questions);
-  await fs.writeFile(jsonPath, `${JSON.stringify(groupedRecords, null, 2)}\n`, "utf8");
-  await fs.writeFile(csvPath, toCsv(records), "utf8");
+  await writeFileAtomic(jsonPath, `${JSON.stringify(groupedRecords, null, 2)}\n`);
+  await writeFileAtomic(csvPath, toCsv(records));
 }
 
 /** 写入单个平台的原始扁平 JSON/CSV，不套用跨平台问题分组。 */
@@ -115,15 +183,21 @@ export function groupPlatformRecordsByQuestion(
 /** 单平台文件使用的扁平写入器。 */
 async function writeFlatOutputs(outDir: string, records: ReferenceRecord[]): Promise<void> {
   await fs.mkdir(outDir, { recursive: true });
-  await fs.writeFile(path.join(outDir, "references.json"), `${JSON.stringify(records, null, 2)}\n`, "utf8");
-  await fs.writeFile(path.join(outDir, "references.csv"), toCsv(records), "utf8");
+  await writeFileAtomic(
+    path.join(outDir, "references.json"),
+    `${JSON.stringify(records, null, 2)}\n`
+  );
+  await writeFileAtomic(path.join(outDir, "references.csv"), toCsv(records));
 }
 
 /** 各平台最终回答使用独立文件，避免在每条参考文献记录中重复存储长正文。 */
 async function writeAnswerOutputs(outDir: string, answers: AnswerRecord[]): Promise<void> {
   await fs.mkdir(outDir, { recursive: true });
-  await fs.writeFile(path.join(outDir, "answers.json"), `${JSON.stringify(answers, null, 2)}\n`, "utf8");
-  await fs.writeFile(path.join(outDir, "answers.csv"), answersToCsv(answers), "utf8");
+  await writeFileAtomic(
+    path.join(outDir, "answers.json"),
+    `${JSON.stringify(answers, null, 2)}\n`
+  );
+  await writeFileAtomic(path.join(outDir, "answers.csv"), answersToCsv(answers));
 }
 
 /** 创建包含四个平台键的空扁平分桶，保证后续访问不需要判空。 */
@@ -194,4 +268,22 @@ export function answersToCsv(answers: AnswerRecord[]): string {
 function escapeCsv(value: string): string {
   if (!/[",\n\r]/.test(value)) return value;
   return `"${value.replace(/"/g, '""')}"`;
+}
+
+let atomicWriteSequence = 0;
+
+/**
+ * 先在目标目录写入临时文件，再通过 rename 一次替换正式文件。程序被中断时，
+ * 读取方只会看到旧的完整文件或新的完整文件，不会读到半段 JSON/CSV。
+ */
+async function writeFileAtomic(filePath: string, content: string): Promise<void> {
+  const temporaryPath =
+    `${filePath}.${process.pid}.${Date.now()}.${atomicWriteSequence += 1}.tmp`;
+  try {
+    await fs.writeFile(temporaryPath, content, "utf8");
+    await fs.rename(temporaryPath, filePath);
+  } catch (error) {
+    await fs.unlink(temporaryPath).catch(() => undefined);
+    throw error;
+  }
 }

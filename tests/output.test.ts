@@ -8,6 +8,7 @@ import path from "node:path";
 import test from "node:test";
 import {
   answersToCsv,
+  createOutputCoordinator,
   groupPlatformRecordsByQuestion,
   groupRecordsByPlatform,
   groupRecordsByQuestion,
@@ -116,6 +117,66 @@ test("非豆包平台也会写出独立的最终回答 JSON 和 CSV", async () =
 
     assert.deepEqual(json, answers);
     assert.ok(csv.includes("DeepSeek 最终回答"));
+  } finally {
+    await fs.rm(outDir, { recursive: true, force: true });
+  }
+});
+
+test("并发平台快照通过集中写入器合并，不会被最后完成的平台覆盖", async () => {
+  const outDir = await fs.mkdtemp(path.join(os.tmpdir(), "crawler-coordinator-"));
+  const deepseekRecord: ReferenceRecord = {
+    question: "并发问题",
+    crawlPlatform: "DeepSeek",
+    rank: 1,
+    articlePlatform: "DeepSeek 来源",
+    articleTime: "",
+    title: "DeepSeek 标题",
+    summary: "",
+    url: "https://deepseek-source.example/article",
+    extractedAt: "2026-07-31T01:00:00.000Z"
+  };
+  const qianwenRecord: ReferenceRecord = {
+    question: "并发问题",
+    crawlPlatform: "千问",
+    rank: 1,
+    articlePlatform: "千问来源",
+    articleTime: "",
+    title: "千问标题",
+    summary: "",
+    url: "https://qianwen-source.example/article",
+    extractedAt: "2026-07-31T01:00:01.000Z"
+  };
+  const coordinator = createOutputCoordinator(
+    outDir,
+    ["deepseek", "qianwen"],
+    ["并发问题"]
+  );
+
+  try {
+    await Promise.all([
+      coordinator.update("deepseek", {
+        references: [deepseekRecord],
+        answers: []
+      }),
+      coordinator.update("qianwen", {
+        references: [qianwenRecord],
+        answers: []
+      })
+    ]);
+    await coordinator.flush();
+
+    const grouped = JSON.parse(
+      await fs.readFile(path.join(outDir, "references.json"), "utf8")
+    ) as Array<{
+      question: string;
+      platforms: Record<string, ReferenceRecord[]>;
+    }>;
+
+    assert.equal(grouped.length, 1);
+    assert.equal(grouped[0].platforms.DeepSeek.length, 1);
+    assert.equal(grouped[0].platforms.千问.length, 1);
+    assert.equal(grouped[0].platforms.DeepSeek[0].title, "DeepSeek 标题");
+    assert.equal(grouped[0].platforms.千问[0].title, "千问标题");
   } finally {
     await fs.rm(outDir, { recursive: true, force: true });
   }

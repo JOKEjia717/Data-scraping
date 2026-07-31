@@ -53,5 +53,6 @@ function parsePlatforms(value?: string): PlatformId[] {
   if (unknown.length > 0) {
     throw new Error(`未知平台：${unknown.join(", ")}。可选值：${ALL_PLATFORMS.join(", ")}`);
   }
-  return platforms;
+  // 并发模式下重复平台会操作同一个标签页，必须在入口处去重。
+  return [...new Set(platforms)];
 }

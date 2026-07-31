@@ -19,3 +19,11 @@ test("命令行可以覆盖默认提问前缀", async () => {
 
   assert.equal(options.promptPrefix, "自定义提示：");
 });
+
+test("并发运行时会去除重复平台，避免两个任务操作同一标签页", async () => {
+  const options = await parseCli([
+    "--platforms=doubao,deepseek,doubao,qianwen,deepseek"
+  ]);
+
+  assert.deepEqual(options.platforms, ["doubao", "deepseek", "qianwen"]);
+});

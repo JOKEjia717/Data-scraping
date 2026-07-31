@@ -710,15 +710,23 @@ async function submitQuestion(page: Page, config: PlatformConfig, question: stri
 
 /** 从后向前寻找最新且可点击的发送控件。 */
 async function clickSendButton(page: Page, selectors: string[]): Promise<boolean> {
-  for (const selector of selectors) {
-    const locators = await page.locator(selector).all().catch(() => []);
-    for (const locator of locators.slice(-4)) {
-      const visible = await locator.isVisible().catch(() => false);
-      const enabled = await locator.isEnabled().catch(() => false);
-      if (!visible || !enabled) continue;
-      await locator.click({ timeout: 1000 }).catch(() => undefined);
-      return true;
+  // React 更新输入状态后，Windows 页面上的发送按钮可能延迟数百毫秒才启用。
+  // 在退回 Enter 之前短暂轮询，避免把 Enter 当成富文本输入框里的换行。
+  const deadline = Date.now() + 3_000;
+  while (Date.now() < deadline) {
+    for (const selector of selectors) {
+      const locators = await page.locator(selector).all().catch(() => []);
+      for (const locator of locators.slice(-4).reverse()) {
+        const visible = await locator.isVisible().catch(() => false);
+        const enabled = await locator.isEnabled().catch(() => false);
+        if (!visible || !enabled) continue;
+        const clicked = await locator.click({ timeout: 1000 })
+          .then(() => true)
+          .catch(() => false);
+        if (clicked) return true;
+      }
     }
+    await page.waitForTimeout(100);
   }
   return false;
 }

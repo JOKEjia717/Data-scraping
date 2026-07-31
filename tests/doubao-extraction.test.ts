@@ -63,6 +63,34 @@ after(async () => {
   await browser?.close();
 });
 
+test("千问 Apple 语义发送按钮与 Windows class 发送按钮都可定位", async () => {
+  assert.ok(browser);
+  const page = await browser.newPage();
+
+  await page.setContent(`
+    <button id="qianwen-apple-send" aria-label="发送"></button>
+    <button
+      id="qianwen-windows-send"
+      class="inline-flex size-8 shrink-0 items-center justify-center rounded-full border-0 p-0 text-16 leading-none outline-none transition-[background-color,color,opacity] duration-200 [&amp;_span[data-role=&quot;icon&quot;]]:size-4 [&amp;_svg]:size-4 cursor-pointer bg-black-button text-[--ty-line-circle]"
+    >
+      <svg aria-hidden="true"></svg>
+    </button>
+  `);
+
+  const matchesSelector = async (elementId: string) => {
+    const matches = await Promise.all(
+      PLATFORMS.qianwen.sendButtonSelectors.map(async (selector) =>
+        page.locator(`${selector}#${elementId}`).count().catch(() => 0)
+      )
+    );
+    return matches.some((count) => count === 1);
+  };
+
+  assert.equal(await matchesSelector("qianwen-apple-send"), true);
+  assert.equal(await matchesSelector("qianwen-windows-send"), true);
+  await page.close();
+});
+
 test("豆包只抽取最新搜索结果块的直接引用子节点", async () => {
   assert.ok(browser);
   const page = await browser.newPage();
