@@ -7,9 +7,10 @@ import { after, before, test } from "node:test";
 import { chromium, type Browser } from "playwright";
 import {
   detectQianwenAnswerLoop,
-  openNewConversation,
+  executeQuestion,
   waitForYuanbaoCurrentAnswerComplete
 } from "../src/crawler.js";
+import { openNewConversation } from "../src/conversationManager.js";
 import {
   clickLatestQianwenRegenerate,
   countDoubaoSearchResultBlocks,
@@ -950,5 +951,57 @@ test("一轮问题结束后点击新建对话并等待空白输入界面", async
   assert.equal(await page.locator("body").getAttribute("data-new-conversation"), "true");
   assert.equal(await page.getByText(previousQuestion).count(), 0);
   assert.equal(await page.locator("textarea").isEnabled(), true);
+  await page.close();
+});
+
+test("已经处于空白聊天页时可直接作为首个品牌批次的独立对话", async () => {
+  assert.ok(browser);
+  const page = await browser.newPage();
+
+  await page.setContent(`
+    <aside><button aria-label="新建对话">新建对话</button></aside>
+    <main><div>开始新的对话</div></main>
+    <textarea aria-label="聊天输入框"></textarea>
+  `);
+
+  const ready = await openNewConversation(page, PLATFORMS.doubao, "", 1_000);
+
+  assert.equal(ready, true);
+  await page.close();
+});
+
+test("executeQuestion 页面未就绪时不会越权创建新对话", async () => {
+  assert.ok(browser);
+  const page = await browser.newPage();
+
+  await page.setContent(`
+    <button id="new-chat" aria-label="新建对话">新建对话</button>
+    <script>
+      document.querySelector("#new-chat").addEventListener("click", () => {
+        document.body.dataset.newConversationClicked = "true";
+      });
+    </script>
+  `);
+
+  await assert.rejects(
+    () => executeQuestion(
+      { questionIndex: 0, question: "单题边界测试" },
+      {
+        page,
+        config: PLATFORMS.doubao,
+        mode: "research",
+        promptPrefix: "",
+        retryOnNoReferences: true,
+        regenerateOnNoReferences: true,
+        resolveTitles: false,
+        timeoutMs: 1
+      }
+    ),
+    /长时间没有恢复到可提问状态/
+  );
+  assert.equal(
+    await page.locator("body").getAttribute("data-new-conversation-clicked"),
+    null
+  );
   await page.close();
 });

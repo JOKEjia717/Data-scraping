@@ -6,15 +6,60 @@
 /** 命令行与目录使用的稳定平台标识。 */
 export type PlatformId = "doubao" | "deepseek" | "qianwen" | "yuanbao";
 
+/** research 保留原爬虫行为；business 原样提问且只允许技术错误重试。 */
+export type CollectionMode = "research" | "business";
+
+/** 引用数组为空只有 CONFIRMED_EMPTY 才具有明确业务语义。 */
+export type ReferenceExtractionStatus =
+  | "EXTRACTED"
+  | "CONFIRMED_EMPTY"
+  | "UNKNOWN";
+
+/** business 单题发送前的联网搜索执行条件。 */
+export type WebSearchPolicy = "REQUIRED" | "PREFERRED" | "DISABLED";
+
+/** 平台不提供深度思考能力时的显式处理策略。 */
+export type DeepThinkingUnsupportedPolicy = "allow_degrade" | "fail";
+
+/** 页面上的深度思考控件；supported=false 必须配合显式降级策略使用。 */
+export interface DeepThinkingControlConfig {
+  supported: boolean;
+  selectors: string[];
+  /** 页面明确展示“已关闭”模式时使用；仅用于读状态，不会被点击。 */
+  disabledStateSelectors?: string[];
+}
+
+/** business 模式的输入批次；三项身份共同决定对话隔离边界。 */
+export interface BusinessBatchInput {
+  tenantId: string;
+  businessTaskId: string;
+  brand: string;
+  questions: string[];
+}
+
+/** 经过校验、同身份批次合并后的稳定执行单元。 */
+export interface CrawlBatch extends BusinessBatchInput {
+  key: string;
+}
+
 /** 解析完成后的命令行选项。 */
 export interface CliOptions {
+  mode: CollectionMode;
   cdpEndpoint: string;
   outDir: string;
   platforms: PlatformId[];
   questionFile?: string;
   promptPrefix: string;
+  retryOnNoReferences: boolean;
+  regenerateOnNoReferences: boolean;
   resolveTitles: boolean;
   timeoutMs: number;
+  /** 未配置时保持 research 的历史页面行为，不读取或点击深度思考控件。 */
+  deepThinking?: boolean;
+  deepThinkingUnsupportedPolicy: DeepThinkingUnsupportedPolicy;
+  /** 未配置时 research 继续使用历史的宽松尝试行为。 */
+  webSearchPolicy?: WebSearchPolicy;
+  verbose: boolean;
   databaseEnabled: boolean;
   batchName?: string;
 }
@@ -29,6 +74,9 @@ export interface PlatformConfig {
   sendButtonSelectors: string[];
   newConversationButtonSelectors: string[];
   webSearchButtonSelectors: string[];
+  /** false 表示平台配置明确声明不提供联网搜索能力。 */
+  webSearchSupported: boolean;
+  deepThinkingControl: DeepThinkingControlConfig;
   referenceRevealSelectors: string[];
 }
 
@@ -59,6 +107,8 @@ export interface SearchResultCandidate {
 /** 平台独立 JSON/CSV 与汇总 CSV 使用的标准扁平记录。 */
 export interface ReferenceRecord {
   question: string;
+  /** 实际发送到平台的完整文本；兼容直接调用旧抽取器产生的历史记录。 */
+  submittedQuestion?: string;
   crawlPlatform: string;
   rank: number;
   articlePlatform: string;
@@ -72,6 +122,8 @@ export interface ReferenceRecord {
 /** 单题最终回答记录；generationNumber 从 1 开始，1 表示原始回答。 */
 export interface AnswerRecord {
   question: string;
+  /** 实际发送到平台的完整文本。 */
+  submittedQuestion?: string;
   crawlPlatform: string;
   answer: string;
   generationNumber: number;

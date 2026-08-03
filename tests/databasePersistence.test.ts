@@ -62,6 +62,8 @@ const doubao: PlatformConfig = {
   sendButtonSelectors: [],
   newConversationButtonSelectors: [],
   webSearchButtonSelectors: [],
+  webSearchSupported: false,
+  deepThinkingControl: { supported: false, selectors: [] },
   referenceRevealSelectors: []
 };
 
@@ -81,6 +83,7 @@ test("每题最终答案和引用在同一事务内写入，并以 task_id 覆�
     questionIndex: 0,
     question: "问题一",
     status: "completed",
+    referenceStatus: "EXTRACTED",
     attemptCount: 3,
     answer: {
       question: "问题一",

@@ -3,6 +3,9 @@ dist/
 results/
 playwright-report/
 test-results/
+rpa-task-logs/
+rpa-runtime/
+.chrome-profiles/
 .env
 .env.*
 !.env.example

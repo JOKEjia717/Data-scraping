@@ -233,6 +233,7 @@ function requirePlatformName(value: string): CrawlPlatformName {
 function toCsv(records: ReferenceRecord[]): string {
   const headers: Array<keyof ReferenceRecord> = [
     "question",
+    "submittedQuestion",
     "crawlPlatform",
     "rank",
     "articlePlatform",
@@ -251,6 +252,7 @@ function toCsv(records: ReferenceRecord[]): string {
 export function answersToCsv(answers: AnswerRecord[]): string {
   const headers: Array<keyof AnswerRecord> = [
     "question",
+    "submittedQuestion",
     "crawlPlatform",
     "answer",
     "generationNumber",

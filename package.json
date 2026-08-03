@@ -9,14 +9,22 @@
     "crawl:deepseek": "tsx src/index.ts --platforms=deepseek",
     "crawl:qianwen": "tsx src/index.ts --platforms=qianwen",
     "crawl:yuanbao": "tsx src/index.ts --platforms=yuanbao",
+    "mock:rpa": "tsx src/mockRpaCli.ts",
+    "rpa:tasks:check": "tsx src/checkRpaTasks.ts",
+    "rpa:diagnosis": "tsx src/rpaWorkerCli.ts --worker=diagnosis",
+    "rpa:monitor": "tsx src/rpaWorkerCli.ts --worker=monitor",
+    "rpa:diagnosis:health": "tsx src/rpaWorkerCli.ts --worker=diagnosis --health-check=true",
+    "rpa:monitor:health": "tsx src/rpaWorkerCli.ts --worker=monitor --health-check=true",
+    "rpa:gray:validate": "tsx src/rpaGrayValidation.ts",
     "db:check": "tsx src/checkDatabase.ts",
     "test": "tsx --test tests/*.test.ts",
-    "check": "tsc --noEmit"
+    "check": "tsc --noEmit",
+    "build": "tsc"
   },
   "dependencies": {
     "dotenv": "^17.4.2",
     "mysql2": "^3.23.2",
-    "playwright": "^1.45.0"
+    "playwright": "^1.62.1"
   },
   "devDependencies": {
     "@types/node": "^20.14.0",

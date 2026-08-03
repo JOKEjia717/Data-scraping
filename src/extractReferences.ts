@@ -20,6 +20,10 @@ import {
   platformFromUrl,
   unwrapUrl
 } from "./text.js";
+import { privacyDebugLog } from "./consolePrivacy.js";
+
+// 直接抽取测试与 research 保留调试输出；business 上下文自动抑制详细标题和 URL。
+const console = { log: privacyDebugLog };
 
 // 平台专属稳定选择器。class 变化时需同步更新 README 和测试夹具。
 const DOUBAO_SEARCH_BLOCK_SELECTOR = '[data-plugin-identifier*="search_query_result_block"]';

@@ -26,14 +26,54 @@ import {
   waitForYuanbaoReferenceListStable
 } from "./extractReferences.js";
 import { resolveRecordTitles } from "./resolveTitles.js";
-import type { AnswerRecord, PlatformConfig, ReferenceRecord } from "./types.js";
+import { ensureDeepThinkingState } from "./deepThinking.js";
+import {
+  activateWebSearch,
+  assertVerifiedWebSearchForZeroReferences,
+  enforceWebSearchPolicy,
+  type WebSearchActivationResult
+} from "./webSearch.js";
+import {
+  attachConsoleSecrets,
+  privacyDebugLog,
+  runWithConsolePrivacy
+} from "./consolePrivacy.js";
+import {
+  createPageConversationManager,
+  type ConversationBatchContext
+} from "./conversationManager.js";
+export { openNewConversation } from "./conversationManager.js";
+import {
+  buildSubmittedQuestion,
+  getNoReferencesStatus,
+  planBatchQuestions
+} from "./execution.js";
+import type {
+  AnswerRecord,
+  CollectionMode,
+  CrawlBatch,
+  DeepThinkingUnsupportedPolicy,
+  PlatformConfig,
+  ReferenceExtractionStatus,
+  ReferenceRecord,
+  WebSearchPolicy
+} from "./types.js";
 
 export interface CrawlPlatformOptions {
+  mode: CollectionMode;
   cdpEndpoint: string;
   questions: string[];
+  batches: CrawlBatch[];
   promptPrefix: string;
+  retryOnNoReferences: boolean;
+  regenerateOnNoReferences: boolean;
   resolveTitles: boolean;
   timeoutMs: number;
+  /** 未配置时不读取或修改页面深度思考状态，保持 research 历史行为。 */
+  deepThinking?: boolean;
+  deepThinkingUnsupportedPolicy?: DeepThinkingUnsupportedPolicy;
+  webSearchPolicy?: WebSearchPolicy;
+  verbose?: boolean;
 }
 
 export interface CrawlPlatformResult {
@@ -51,7 +91,73 @@ export interface CrawlQuestionResult {
   attemptCount: number;
   answer?: AnswerRecord;
   references: ReferenceRecord[];
+  referenceStatus: ReferenceExtractionStatus;
   errorMessage?: string;
+  submittedQuestion?: string;
+}
+
+export type ExecuteQuestionStatus = "success" | "no_references" | "skipped";
+
+/** 独立单题调用使用 success；批量层会将其映射为原有 completed 状态。 */
+export interface ExecuteQuestionResult
+  extends Omit<CrawlQuestionResult, "status" | "submittedQuestion"> {
+  status: ExecuteQuestionStatus;
+  submittedQuestion: string;
+  requestedDeepThinking: boolean | null;
+  actualDeepThinking: boolean | null;
+  webSearchRequested: boolean;
+  webSearchEnabled: boolean;
+  webSearchVerified: boolean;
+  webSearchFailureReason: string | null;
+}
+
+/** executeQuestion 的不可变单题输入；索引只用于把结果映射回上层任务。 */
+export interface ExecuteQuestionTask {
+  questionIndex: number;
+  question: string;
+}
+
+/**
+ * 单题执行所需的页面与策略。调用方负责提供已经存在且属于正确批次的对话；
+ * 此运行时不包含对话创建、结果持久化或下一题调度能力。
+ */
+export interface ExecuteQuestionRuntime {
+  page: Page;
+  config: PlatformConfig;
+  mode: CollectionMode;
+  promptPrefix: string;
+  retryOnNoReferences: boolean;
+  regenerateOnNoReferences: boolean;
+  resolveTitles: boolean;
+  timeoutMs: number;
+  /** undefined 表示保持页面现状；正式 business Worker 必须传入任务原值。 */
+  deepThinking?: boolean;
+  deepThinkingUnsupportedPolicy?: DeepThinkingUnsupportedPolicy;
+  onDeepThinkingStateResolved?: (
+    requested: boolean,
+    actual: boolean | null
+  ) => void;
+  webSearchPolicy?: WebSearchPolicy;
+  onWebSearchStateResolved?: (result: WebSearchActivationResult) => void;
+  verbose?: boolean;
+  /** 正式 Worker 用于区分可安全释放与发送后不确定；普通 CLI 可不提供。 */
+  onSubmissionStateChange?: (
+    state: "submitted" | "uncertain",
+    submittedQuestion: string
+  ) => void;
+}
+
+export interface CurrentQuestionAnswerInspection {
+  status: "answered" | "uncertain";
+  answerContent?: string;
+  reason: string;
+}
+
+export interface RecoveredSubmittedQuestionResult {
+  answerContent: string;
+  references: ReferenceRecord[];
+  referenceStatus: ReferenceExtractionStatus;
+  reason: string;
 }
 
 /** 抓取生命周期钩子：文件快照与数据库写入可以独立订阅同一轮进度。 */
@@ -78,6 +184,7 @@ class QianwenAnswerLoopError extends Error {
 }
 
 const REFERENCE_CHECK_ATTEMPTS = 3;
+const TECHNICAL_RETRY_ATTEMPTS = 3;
 const DOUBAO_RESUBMISSION_ATTEMPTS = 3;
 const REFERENCE_REVEAL_TIMEOUT_MS = 10_000;
 const REFERENCE_STABLE_TIMEOUT_MS = 5_000;
@@ -85,17 +192,23 @@ const DOUBAO_REFERENCE_REVEAL_TIMEOUT_MS = 30_000;
 const DOUBAO_REFERENCE_STABLE_TIMEOUT_MS = 15_000;
 const DOUBAO_REFERENCE_READY_STABLE_MS = 4_000;
 const REFERENCE_CHECK_INTERVAL_MS = 1_500;
+// 保留原调试调用点，但统一由 AsyncLocalStorage 决定 research 输出或 business 抑制。
+const console = { log: privacyDebugLog };
 
 /**
- * 抓取单个平台的全部问题。单题引用缺失时豆包最多重新提问三次，其他平台
- * 最多检查三次后跳过；登录失效或回答生命周期无法确认等错误仍会停止当前任务。
+ * 抓取单个平台的全部批次。research 保留原整轮会话和引用恢复策略；business
+ * 严格按“租户 + 业务任务 + 品牌”隔离对话，批内问题连续执行。
  */
 export async function crawlPlatform(
   config: PlatformConfig,
   options: CrawlPlatformOptions,
   hooks: CrawlPlatformHooks = {}
 ): Promise<CrawlPlatformResult> {
-  const browser = await chromium.connectOverCDP(options.cdpEndpoint);
+  return runWithConsolePrivacy({
+    mode: options.mode,
+    verbose: options.mode === "research" && (options.verbose ?? true)
+  }, async () => {
+  const browser = await chromium.connectOverCDP(options.cdpEndpoint, { noDefaults: true });
   const page = findExistingPage(browser.contexts().flatMap((context) => context.pages()), config);
   if (!page) {
     throw new Error(
@@ -103,173 +216,99 @@ export async function crawlPlatform(
     );
   }
   await ensureReadyForInput(page, config);
+  const conversationManager = createPageConversationManager(page, config);
   const records: ReferenceRecord[] = [];
   const answers: AnswerRecord[] = [];
+  const executionQuestions = planBatchQuestions(options.batches);
 
-  for (const [index, question] of options.questions.entries()) {
-    console.log(`\n[${config.name}] ${index + 1}/${options.questions.length} ${question}`);
+  for (const [index, executionQuestion] of executionQuestions.entries()) {
+    const {
+      batch,
+      batchIndex,
+      batchQuestionIndex,
+      question,
+      startsNewConversation
+    } = executionQuestion;
+    const conversationContext: ConversationBatchContext = {
+      batchId: batch.key,
+      tenantId: batch.tenantId,
+      brandId: batch.brand,
+      businessTaskId: batch.businessTaskId,
+      businessGroupId: batch.businessTaskId,
+      platformId: config.id
+    };
+    if (options.mode === "business" && startsNewConversation) {
+      const previousQuestion = executionQuestions[index - 1]?.question ?? "";
+      console.log(
+        `\n[${config.name}] 开始品牌批次 ${batchIndex + 1}/${options.batches.length}：` +
+        `tenant=${batch.tenantId}, task=${batch.businessTaskId}, brand=${batch.brand}`
+      );
+      await retryTechnicalFailure(
+        options.mode,
+        `${config.name} 创建品牌批次独立新对话`,
+        () => conversationManager.startBatch(conversationContext, previousQuestion)
+      );
+    }
+    if (options.mode === "business") {
+      await retryTechnicalFailure(
+        options.mode,
+        `${config.name} 获取品牌批次会话`,
+        () => conversationManager.acquireForQuestion(
+          conversationContext,
+          executionQuestions[index - 1]?.question ?? ""
+        )
+      );
+    }
+    console.log(`\n[${config.name}] ${index + 1}/${executionQuestions.length} ${question}`);
     await hooks.onQuestionStart?.(index, question);
-    // 元宝引用抽屉会遮挡页面并污染下一题基线，因此提问前后都主动关闭。
-    if (config.id === "yuanbao") await closeYuanbaoReferencePanel(page);
-    await waitForReadyToSend(page, config, options.timeoutMs);
-    await activateWebSearch(page, config);
-
-    // 所有基线必须在发送问题前采集，之后只接受相对基线新增的回答和引用入口。
-    const baselineBottom = await snapshotDocumentBottom(page);
-    const baselineDoubaoSearchBlockCount = config.id === "doubao"
-      ? await countDoubaoSearchResultBlocks(page)
-      : 0;
-    const baselineRevealButtonCount = await countReferenceRevealButtons(page, config.referenceRevealSelectors);
-    const submittedQuestion = `${options.promptPrefix}${question}`;
-    const trackedBaseline = config.id === "doubao" || config.id === "deepseek" || config.id === "qianwen" || config.id === "yuanbao"
-      ? await snapshotTrackedAnswerBaseline(page, config.id)
-      : undefined;
-    // 豆包长会话会同时回收问题气泡和历史搜索块，因此在真正发送前保存现存
-    // 搜索块的元素身份；后续可识别数量减少或索引前移后的本题新入口。
-    if (config.id === "doubao") await markDoubaoSearchResultBaseline(page);
-    await submitQuestion(page, config, submittedQuestion);
+    let executionResult: ExecuteQuestionResult;
     try {
-      await waitForAnswerComplete(page, config, options.timeoutMs, trackedBaseline, submittedQuestion);
+      executionResult = await executeQuestion(
+        { questionIndex: index, question },
+        {
+          page,
+          config,
+          mode: options.mode,
+          promptPrefix: options.promptPrefix,
+          retryOnNoReferences: options.retryOnNoReferences,
+          regenerateOnNoReferences: options.regenerateOnNoReferences,
+          resolveTitles: options.resolveTitles,
+          timeoutMs: options.timeoutMs,
+          deepThinking: options.deepThinking,
+          deepThinkingUnsupportedPolicy: options.deepThinkingUnsupportedPolicy,
+          webSearchPolicy: options.webSearchPolicy
+        }
+      );
     } catch (error) {
-      if (config.id === "qianwen" && error instanceof QianwenAnswerLoopError) {
-        console.log(`[千问] 跳过本题：${error.message}`);
-        await hooks.onProgress?.({ references: records, answers });
-        await hooks.onQuestionComplete?.({
-          questionIndex: index,
-          question,
-          status: "skipped",
-          attemptCount: 1,
-          references: [],
-          errorMessage: error.message
-        });
-        continue;
+      if (options.mode === "business" && conversationManager.currentState) {
+        conversationManager.markDamaged(error);
       }
       throw error;
     }
-    await scrollToBottom(page);
-
-    let finalAnswer = "";
-    let finalGeneration = 1;
-    let finalAnswerExtractedAt = new Date().toISOString();
-    const captureAnswer = async (generationNumber: number): Promise<void> => {
-      const answer = await captureLatestPlatformAnswerWithRetries(
-        page,
-        config.id,
-        config.name
-      );
-      if (!answer) {
-        console.log(
-          `[${config.name}] 第 ${generationNumber} 版回答正文未能解析，暂时保留上一版缓存。`
-        );
-        return;
-      }
-      finalAnswer = answer;
-      finalGeneration = generationNumber;
-      finalAnswerExtractedAt = new Date().toISOString();
-      console.log(
-        `[${config.name}] 已缓存第 ${generationNumber} 版回答正文（${answer.length} 字符）。`
-      );
+    if (options.mode === "business") conversationManager.recordQuestion(question);
+    const questionResult: CrawlQuestionResult = {
+      ...executionResult,
+      status: executionResult.status === "success"
+        ? "completed"
+        : executionResult.status
     };
-    await captureAnswer(1);
 
-    // 引用入口缺失或列表未稳定只影响当前题；平台恢复策略失败后保留空结果并继续。
-    const referenceReady = await prepareCurrentReferenceList(
-      page,
-      config,
-      options.timeoutMs,
-      trackedBaseline,
-      baselineDoubaoSearchBlockCount,
-      submittedQuestion,
-      captureAnswer
-    );
-    const appendFinalAnswer = (referenceCount: number): AnswerRecord => {
-      const answerRecord: AnswerRecord = {
-        question,
-        crawlPlatform: config.name,
-        answer: finalAnswer,
-        generationNumber: finalGeneration,
-        referenceCount,
-        extractedAt: finalAnswerExtractedAt
-      };
-      answers.push(answerRecord);
-      console.log(
-        `[${config.name}] 已保存最终第 ${finalGeneration} 版回答` +
-        `（正文=${finalAnswer.length} 字符，参考=${referenceCount} 条）。`
-      );
-      return answerRecord;
-    };
-    if (!referenceReady) {
-      if (config.id === "yuanbao") await closeYuanbaoReferencePanel(page);
-      console.log(
-        config.id === "doubao"
-          ? `[豆包] 跳过本题：原始回答及 ${DOUBAO_RESUBMISSION_ATTEMPTS} 次重新提问后仍没有可用参考资料。`
-          : `[${config.name}] 跳过本题：检查 ${REFERENCE_CHECK_ATTEMPTS} 次后仍没有可用参考资料。`
-      );
-      if (baselineRevealButtonCount > 0) {
-        console.log(`[${config.name}] 页面存在历史参考入口，但没有确认到属于本题的有效引用列表。`);
-      }
-      const answerRecord = appendFinalAnswer(0);
-      await hooks.onProgress?.({ references: records, answers });
-      await hooks.onQuestionComplete?.({
-        questionIndex: index,
-        question,
-        status: "no_references",
-        attemptCount: finalGeneration,
-        answer: answerRecord,
-        references: [],
-        errorMessage: "多次检查后仍没有找到属于当前问题的有效参考资料。"
-      });
-      continue;
-    }
-
-    const extractionBaseline = config.id === "doubao" ? baselineDoubaoSearchBlockCount : baselineBottom;
-    const extractedRecords = await extractReferencesWithRetries(
-      page,
-      question,
-      config.name,
-      extractionBaseline
-    );
-    if (config.id === "yuanbao") await closeYuanbaoReferencePanel(page);
-    const questionRecords = options.resolveTitles && config.id === "deepseek"
-      ? await resolveRecordTitles(extractedRecords)
-      : extractedRecords;
-    console.log(`[${config.name}] 抽取到 ${questionRecords.length} 条参考链接`);
-    if (questionRecords.length === 0) {
-      console.log(
-        `[${config.name}] 跳过本题：引用面板已打开，但连续 ${REFERENCE_CHECK_ATTEMPTS} 次没有解析到有效外部链接。`
-      );
-      const answerRecord = appendFinalAnswer(0);
-      await hooks.onProgress?.({ references: records, answers });
-      await hooks.onQuestionComplete?.({
-        questionIndex: index,
-        question,
-        status: "no_references",
-        attemptCount: finalGeneration,
-        answer: answerRecord,
-        references: [],
-        errorMessage: "引用面板已打开，但没有解析到有效外部链接。"
-      });
-      continue;
-    }
-    records.push(...questionRecords);
-    const answerRecord = appendFinalAnswer(questionRecords.length);
-    // 每完成一道题就通知入口层写盘，而不是等待整个平台全部结束。
+    records.push(...questionResult.references);
+    if (questionResult.answer) answers.push(questionResult.answer);
+    // 单题函数只返回数据；批量层负责累计快照并通知文件/数据库订阅者。
     await hooks.onProgress?.({ references: records, answers });
-    await hooks.onQuestionComplete?.({
-      questionIndex: index,
-      question,
-      status: "completed",
-      attemptCount: finalGeneration,
-      answer: answerRecord,
-      references: questionRecords
-    });
+    await hooks.onQuestionComplete?.(questionResult);
+    if (
+      options.mode === "business" &&
+      batchQuestionIndex === batch.questions.length - 1
+    ) {
+      conversationManager.finishBatch(batch.key);
+    }
   }
 
-  if (options.questions.length > 0) {
-    const opened = await openNewConversation(
-      page,
-      config,
-      options.questions[options.questions.length - 1]
+  if (executionQuestions.length > 0) {
+    const opened = await conversationManager.resetToBlank(
+      executionQuestions[executionQuestions.length - 1].question
     );
     console.log(
       opened
@@ -279,6 +318,410 @@ export async function crawlPlatform(
   }
 
   return { references: records, answers };
+  });
+}
+
+/**
+ * 在调用方提供的当前页面和当前对话中完成一道题。该函数不创建对话、不调度
+ * 下一题，也不调用输出或数据库钩子；所有平台专属基线与恢复策略保持在本模块内。
+ */
+export async function executeQuestion(
+  task: ExecuteQuestionTask,
+  runtime: ExecuteQuestionRuntime
+): Promise<ExecuteQuestionResult> {
+  return runWithConsolePrivacy({
+    mode: runtime.mode,
+    verbose: runtime.mode === "research" && (runtime.verbose ?? true)
+  }, async () => {
+  try {
+  const { questionIndex, question } = task;
+  const {
+    page,
+    config,
+    mode,
+    promptPrefix,
+    retryOnNoReferences,
+    regenerateOnNoReferences,
+    resolveTitles,
+    timeoutMs,
+    deepThinking,
+    deepThinkingUnsupportedPolicy = "fail",
+    webSearchPolicy = "PREFERRED"
+  } = runtime;
+
+  const requestedDeepThinking = deepThinking ?? null;
+  let actualDeepThinking: boolean | null = null;
+
+  // 元宝引用抽屉会遮挡页面并污染本题基线，因此单题开始和提取结束时主动关闭。
+  if (config.id === "yuanbao") await closeYuanbaoReferencePanel(page);
+  await retryTechnicalFailure(
+    mode,
+    `${config.name} 等待输入框恢复`,
+    () => waitForReadyToSend(page, config, timeoutMs)
+  );
+  if (deepThinking !== undefined) {
+    let resolution;
+    try {
+      resolution = await ensureDeepThinkingState(
+        page,
+        config,
+        deepThinking,
+        deepThinkingUnsupportedPolicy
+      );
+    } catch (error) {
+      runtime.onDeepThinkingStateResolved?.(deepThinking, null);
+      throw error;
+    }
+    actualDeepThinking = resolution.actual;
+    runtime.onDeepThinkingStateResolved?.(deepThinking, actualDeepThinking);
+    console.log(
+      `[${config.name}] 深度思考：requested=${deepThinking}, ` +
+      `actual=${actualDeepThinking === null ? "unsupported" : actualDeepThinking}` +
+      (resolution.changed ? "（已切换）" : resolution.degraded ? "（已按配置降级）" : "（无需切换）")
+    );
+  }
+  const webSearch = await activateWebSearch(page, config, webSearchPolicy);
+  runtime.onWebSearchStateResolved?.(webSearch);
+  console.log(
+    `[${config.name}] 联网搜索：policy=${webSearchPolicy}, requested=${webSearch.requested}, ` +
+    `supported=${webSearch.supported}, enabled=${webSearch.enabled}, verified=${webSearch.verified}` +
+    (webSearch.failureReason ? `（${webSearch.failureReason}）` : "")
+  );
+  enforceWebSearchPolicy(webSearchPolicy, webSearch);
+  const webSearchResultFields = {
+    webSearchRequested: webSearch.requested,
+    webSearchEnabled: webSearch.enabled,
+    webSearchVerified: webSearch.verified,
+    webSearchFailureReason: webSearch.failureReason
+  };
+
+  // 所有基线必须在发送问题前采集，之后只接受相对基线新增的回答和引用入口。
+  const baselineBottom = await snapshotDocumentBottom(page);
+  const baselineDoubaoSearchBlockCount = config.id === "doubao"
+    ? await countDoubaoSearchResultBlocks(page)
+    : 0;
+  const baselineRevealButtonCount = await countReferenceRevealButtons(
+    page,
+    config.referenceRevealSelectors
+  );
+  const submittedQuestion = buildSubmittedQuestion(mode, promptPrefix, question);
+  const trackedBaseline = await snapshotTrackedAnswerBaseline(page, config.id);
+  // 豆包长会话会同时回收问题气泡和历史搜索块，因此在真正发送前保存现存
+  // 搜索块的元素身份；后续可识别数量减少或索引前移后的本题新入口。
+  if (config.id === "doubao") await markDoubaoSearchResultBaseline(page);
+  console.log(`[${config.name}] 实际发送问题：${JSON.stringify(submittedQuestion)}`);
+  try {
+    await submitQuestion(page, config, submittedQuestion);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (!/没有在.+页面找到聊天输入框|input.*not found/i.test(message)) {
+      runtime.onSubmissionStateChange?.("uncertain", submittedQuestion);
+    }
+    throw error;
+  }
+  runtime.onSubmissionStateChange?.("submitted", submittedQuestion);
+
+  try {
+    await retryTechnicalFailure(
+      mode,
+      `${config.name} 等待回答完成`,
+      () => waitForAnswerComplete(
+        page,
+        config,
+        timeoutMs,
+        trackedBaseline,
+        submittedQuestion
+      )
+    );
+  } catch (error) {
+    if (
+      mode === "research" &&
+      config.id === "qianwen" &&
+      error instanceof QianwenAnswerLoopError
+    ) {
+      console.log(`[千问] 跳过本题：${error.message}`);
+      return {
+        questionIndex,
+        question,
+        status: "skipped",
+        attemptCount: 1,
+        references: [],
+        referenceStatus: "UNKNOWN",
+        errorMessage: error.message,
+        submittedQuestion,
+        requestedDeepThinking,
+        actualDeepThinking,
+        ...webSearchResultFields
+      };
+    }
+    throw error;
+  }
+  await scrollToBottom(page);
+
+  let finalAnswer = "";
+  let finalGeneration = 1;
+  let finalAnswerExtractedAt = new Date().toISOString();
+  const captureAnswer = async (generationNumber: number): Promise<void> => {
+    const answer = await captureLatestPlatformAnswerWithRetries(
+      page,
+      config.id,
+      config.name
+    );
+    if (!answer) {
+      console.log(
+        `[${config.name}] 第 ${generationNumber} 版回答正文未能解析，暂时保留上一版缓存。`
+      );
+      return;
+    }
+    finalAnswer = answer;
+    finalGeneration = generationNumber;
+    finalAnswerExtractedAt = new Date().toISOString();
+    console.log(
+      `[${config.name}] 已缓存第 ${generationNumber} 版回答正文（${answer.length} 字符）。`
+    );
+  };
+  await captureAnswer(1);
+  if (mode === "business" && !finalAnswer) {
+    throw new Error(
+      `[${config.name}] 当前问题已有回答生命周期信号，但回答正文为空，按技术失败停止该批次。`
+    );
+  }
+
+  // business 不会因为引用缺失而重新提问或重新生成；research 保留原恢复流程。
+  const referenceReady = await prepareCurrentReferenceList(
+    page,
+    config,
+    timeoutMs,
+    trackedBaseline,
+    baselineDoubaoSearchBlockCount,
+    baselineRevealButtonCount,
+    submittedQuestion,
+    captureAnswer,
+    retryOnNoReferences,
+    regenerateOnNoReferences
+  );
+  const createAnswerRecord = (referenceCount: number): AnswerRecord => {
+    const answerRecord: AnswerRecord = {
+      question,
+      submittedQuestion,
+      crawlPlatform: config.name,
+      answer: finalAnswer,
+      generationNumber: finalGeneration,
+      referenceCount,
+      extractedAt: finalAnswerExtractedAt
+    };
+    console.log(
+      `[${config.name}] 已保存最终第 ${finalGeneration} 版回答` +
+      `（正文=${finalAnswer.length} 字符，参考=${referenceCount} 条）。`
+    );
+    return answerRecord;
+  };
+
+  if (!referenceReady) {
+    if (config.id === "yuanbao") await closeYuanbaoReferencePanel(page);
+    if (mode === "business") {
+      assertVerifiedWebSearchForZeroReferences(webSearch);
+    }
+    console.log(mode === "business"
+      ? `[${config.name}] 当前回答没有引用，按正常成功结果保存，不重试或重新生成。`
+      : config.id === "doubao"
+        ? `[豆包] 跳过本题：原始回答及 ${DOUBAO_RESUBMISSION_ATTEMPTS} 次重新提问后仍没有可用参考资料。`
+        : `[${config.name}] 跳过本题：检查 ${REFERENCE_CHECK_ATTEMPTS} 次后仍没有可用参考资料。`
+    );
+    if (baselineRevealButtonCount > 0) {
+      console.log(`[${config.name}] 页面存在历史参考入口，但没有确认到属于本题的有效引用列表。`);
+    }
+    return {
+      questionIndex,
+      question,
+      status: getNoReferencesStatus(mode),
+      attemptCount: finalGeneration,
+      answer: createAnswerRecord(0),
+      references: [],
+      referenceStatus: "CONFIRMED_EMPTY",
+      submittedQuestion,
+      requestedDeepThinking,
+      actualDeepThinking,
+      ...webSearchResultFields,
+      ...(mode === "research"
+        ? { errorMessage: "多次检查后仍没有找到属于当前问题的有效参考资料。" }
+        : {})
+    };
+  }
+
+  const extractionBaseline = config.id === "doubao"
+    ? baselineDoubaoSearchBlockCount
+    : baselineBottom;
+  const extractedRecords = await extractReferencesWithRetries(
+    page,
+    question,
+    config.name,
+    extractionBaseline
+  );
+  if (config.id === "yuanbao") await closeYuanbaoReferencePanel(page);
+  const resolvedQuestionRecords = resolveTitles && config.id === "deepseek"
+    ? await resolveRecordTitles(extractedRecords)
+    : extractedRecords;
+  const questionRecords = resolvedQuestionRecords.map((record) => ({
+    ...record,
+    submittedQuestion
+  }));
+  console.log(`[${config.name}] 抽取到 ${questionRecords.length} 条参考链接`);
+  if (questionRecords.length === 0) {
+    if (mode === "business") {
+      throw new Error(
+        `[${config.name}] 引用面板已确认存在，但连续 ${REFERENCE_CHECK_ATTEMPTS} 次无法解析有效引用，按 DOM 技术失败停止该批次。`
+      );
+    }
+    console.log(
+      `[${config.name}] 跳过本题：引用面板已打开，但连续 ${REFERENCE_CHECK_ATTEMPTS} 次没有解析到有效外部链接。`
+    );
+    return {
+      questionIndex,
+      question,
+      status: "no_references",
+      attemptCount: finalGeneration,
+      answer: createAnswerRecord(0),
+      references: [],
+      referenceStatus: "UNKNOWN",
+      errorMessage: "引用面板已打开，但没有解析到有效外部链接。",
+      submittedQuestion,
+      requestedDeepThinking,
+      actualDeepThinking,
+      ...webSearchResultFields
+    };
+  }
+
+  return {
+    questionIndex,
+    question,
+    status: "success",
+    attemptCount: finalGeneration,
+    answer: createAnswerRecord(questionRecords.length),
+    references: questionRecords,
+    referenceStatus: "EXTRACTED",
+    submittedQuestion,
+    requestedDeepThinking,
+    actualDeepThinking,
+    ...webSearchResultFields
+  };
+  } catch (error) {
+    // 正式 Worker 的后续错误摘要即使包含原问题，也能自动完整移除。
+    throw attachConsoleSecrets(error, [task.question]);
+  }
+  });
+}
+
+/**
+ * 发送后异常的只读恢复检查。它只观察当前页面，不点击发送、不新建会话，也不
+ * 重新生成；只有问题锚点、最新回答正文和非生成状态同时成立才确认成功。
+ */
+export async function inspectCurrentQuestionAnswer(
+  page: Page,
+  config: PlatformConfig,
+  submittedQuestion: string,
+  mode: CollectionMode = "research"
+): Promise<CurrentQuestionAnswerInspection> {
+  return runWithConsolePrivacy({ mode, verbose: mode === "research" }, async () => {
+  if (page.isClosed()) {
+    return { status: "uncertain", reason: "平台页面已关闭，无法确认发送后的回答" };
+  }
+  const [bodyText, busy, answerContent] = await Promise.all([
+    page.locator("body").innerText({ timeout: 3_000 }).catch(() => ""),
+    isAnswerGenerating(page).catch(() => true),
+    captureLatestPlatformAnswerWithRetries(page, config.id, config.name).catch(() => "")
+  ]);
+  const body = normalizeInspectionText(bodyText);
+  const question = normalizeInspectionText(submittedQuestion);
+  const answer = normalizeInspectionText(answerContent);
+  const questionIndex = question ? body.lastIndexOf(question) : -1;
+  if (questionIndex < 0) {
+    return { status: "uncertain", reason: "当前页面未确认到本题问题锚点" };
+  }
+  if (busy) {
+    return { status: "uncertain", reason: "当前页面仍显示回答生成中" };
+  }
+  if (!answer) {
+    return { status: "uncertain", reason: "当前页面未解析到本题回答正文" };
+  }
+  const answerProbe = answer.slice(0, Math.min(80, answer.length));
+  if (!body.slice(questionIndex + question.length).includes(answerProbe)) {
+    return { status: "uncertain", reason: "最新回答正文无法与本题问题锚点对应" };
+  }
+  return {
+    status: "answered",
+    answerContent,
+    reason: "当前页面已确认本题问题锚点和完整回答正文"
+  };
+  });
+}
+
+/**
+ * CDP/标签页恢复后的只读结果恢复。该函数绝不发送、重新生成或新建对话；它先
+ * 用问题锚点确认当前回答，再按现有平台 DOM 规则判断并抽取引用。
+ */
+export async function recoverSubmittedQuestionResult(
+  page: Page,
+  config: PlatformConfig,
+  submittedQuestion: string,
+  webSearch: WebSearchActivationResult
+): Promise<RecoveredSubmittedQuestionResult> {
+  return runWithConsolePrivacy({ mode: "business", verbose: false }, async () => {
+    const inspection = await inspectCurrentQuestionAnswer(
+      page,
+      config,
+      submittedQuestion,
+      "business"
+    );
+    if (inspection.status !== "answered" || !inspection.answerContent?.trim()) {
+      throw Object.assign(new Error(inspection.reason), { errorCode: "REFERENCE_UNKNOWN" });
+    }
+
+    if (config.id === "yuanbao") await closeYuanbaoReferencePanel(page);
+    const doubaoBlockCount = config.id === "doubao"
+      ? await countDoubaoSearchResultBlocks(page)
+      : 0;
+    const referenceReady = await prepareCurrentReferenceList(
+      page,
+      config,
+      15_000,
+      undefined,
+      Math.max(0, doubaoBlockCount - 1),
+      0,
+      submittedQuestion,
+      undefined,
+      false,
+      false
+    );
+    if (!referenceReady) {
+      assertVerifiedWebSearchForZeroReferences(webSearch);
+      return {
+        answerContent: inspection.answerContent,
+        references: [],
+        referenceStatus: "CONFIRMED_EMPTY",
+        reason: "重连后确认原问题回答完整且当前回答不存在引用入口"
+      };
+    }
+
+    const references = await extractReferencesWithRetries(
+      page,
+      submittedQuestion,
+      config.name,
+      config.id === "doubao" ? Math.max(0, doubaoBlockCount - 1) : 0
+    );
+    if (config.id === "yuanbao") await closeYuanbaoReferencePanel(page);
+    if (references.length === 0) {
+      throw Object.assign(new Error("重连后引用入口存在但引用无法解析"), {
+        errorCode: "REFERENCE_UNKNOWN"
+      });
+    }
+    return {
+      answerContent: inspection.answerContent,
+      references: references.map((reference) => ({ ...reference, submittedQuestion })),
+      referenceStatus: "EXTRACTED",
+      reason: "重连后确认并恢复原问题回答和引用"
+    };
+  });
 }
 
 /**
@@ -291,10 +734,49 @@ async function prepareCurrentReferenceList(
   answerTimeoutMs: number,
   trackedBaseline: TrackedAnswerBaseline | undefined,
   baselineDoubaoSearchBlockCount: number,
+  baselineRevealButtonCount: number,
   submittedQuestion: string,
-  onGenerationComplete?: (generationNumber: number) => Promise<void>
+  onGenerationComplete?: (generationNumber: number) => Promise<void>,
+  retryOnNoReferences = true,
+  regenerateOnNoReferences = true
 ): Promise<boolean> {
-  if (config.id === "doubao") {
+  if (!retryOnNoReferences && !regenerateOnNoReferences) {
+    return retryTechnicalFailure(
+      "business",
+      `${config.name} 检查当前回答引用结构`,
+      async () => {
+        const ready = await checkCurrentReferenceListOnce(
+          page,
+          config,
+          trackedBaseline?.referenceCount ?? 0,
+          trackedBaseline?.referenceMarker ?? "",
+          baselineDoubaoSearchBlockCount,
+          submittedQuestion
+        );
+        if (ready) return true;
+
+        const [currentRevealButtonCount, currentDoubaoHasReferences] = await Promise.all([
+          countReferenceRevealButtons(page, config.referenceRevealSelectors),
+          config.id === "doubao"
+            ? hasCurrentDoubaoReferenceEntry(
+                page,
+                submittedQuestion,
+                baselineDoubaoSearchBlockCount
+              )
+            : Promise.resolve(false)
+        ]);
+        if (
+          currentRevealButtonCount > baselineRevealButtonCount ||
+          currentDoubaoHasReferences
+        ) {
+          throw new Error("已发现当前回答的引用入口，但引用列表未能打开或稳定，可能是 DOM 改版");
+        }
+        return false;
+      }
+    );
+  }
+
+  if (config.id === "doubao" && retryOnNoReferences) {
     return prepareDoubaoReferenceList(
       page,
       config,
@@ -309,7 +791,8 @@ async function prepareCurrentReferenceList(
   const referenceTriggerMarker = trackedBaseline?.referenceMarker ?? "";
   let qianwenRegenerated = false;
 
-  for (let attempt = 1; attempt <= REFERENCE_CHECK_ATTEMPTS; attempt += 1) {
+  const referenceCheckAttempts = retryOnNoReferences ? REFERENCE_CHECK_ATTEMPTS : 1;
+  for (let attempt = 1; attempt <= referenceCheckAttempts; attempt += 1) {
     const ready = await checkCurrentReferenceListOnce(
       page,
       config,
@@ -323,7 +806,7 @@ async function prepareCurrentReferenceList(
     });
     if (ready) return true;
 
-    if (config.id === "qianwen" && !qianwenRegenerated) {
+    if (config.id === "qianwen" && regenerateOnNoReferences && !qianwenRegenerated) {
       qianwenRegenerated = true;
       console.log("[千问] 首次检查没有参考入口，自动重新生成一次后继续检查。");
       const regenerationBaseline = await snapshotTrackedAnswerBaseline(page, "qianwen");
@@ -358,8 +841,8 @@ async function prepareCurrentReferenceList(
       }
     }
 
-    console.log(`[${config.name}] 第 ${attempt}/${REFERENCE_CHECK_ATTEMPTS} 次未找到可用参考资料。`);
-    if (attempt < REFERENCE_CHECK_ATTEMPTS) {
+    console.log(`[${config.name}] 第 ${attempt}/${referenceCheckAttempts} 次未找到可用参考资料。`);
+    if (attempt < referenceCheckAttempts) {
       await page.waitForTimeout(REFERENCE_CHECK_INTERVAL_MS);
       await scrollToBottom(page);
     }
@@ -397,7 +880,7 @@ async function prepareDoubaoReferenceList(
   let completedGenerationNumber = 1;
   for (let attempt = 1; attempt <= DOUBAO_RESUBMISSION_ATTEMPTS; attempt += 1) {
     await waitForReadyToSend(page, config, answerTimeoutMs);
-    await activateWebSearch(page, config);
+    await activateWebSearch(page, config, "PREFERRED");
     const resubmissionBaseline = await snapshotTrackedAnswerBaseline(page, "doubao");
     // 每次重新提问都覆盖 WeakSet 基线，确保只认本次新挂载的回答和搜索块。
     await markDoubaoSearchResultBaseline(page);
@@ -513,7 +996,8 @@ async function extractReferencesWithRetries(
   platformName: string,
   extractionBaseline: number
 ): Promise<ReferenceRecord[]> {
-  for (let attempt = 1; attempt <= REFERENCE_CHECK_ATTEMPTS; attempt += 1) {
+  const attempts = REFERENCE_CHECK_ATTEMPTS;
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
     const records = await extractReferences(page, question, platformName, extractionBaseline)
       .catch((error) => {
         console.log(`[${platformName}] 第 ${attempt} 次解析参考资料异常：${formatError(error)}`);
@@ -521,12 +1005,39 @@ async function extractReferencesWithRetries(
       });
     if (records.length > 0) return records;
 
-    console.log(`[${platformName}] 第 ${attempt}/${REFERENCE_CHECK_ATTEMPTS} 次解析结果为空。`);
-    if (attempt < REFERENCE_CHECK_ATTEMPTS) {
+    console.log(`[${platformName}] 第 ${attempt}/${attempts} 次解析结果为空。`);
+    if (attempt < attempts) {
       await page.waitForTimeout(REFERENCE_CHECK_INTERVAL_MS);
     }
   }
   return [];
+}
+
+/**
+ * business 只重试抛出异常的技术步骤，不会重发问题或重新生成回答。返回 false、
+ * 空引用等业务结果会直接返回给调用方，不会触发这里的重试。
+ */
+async function retryTechnicalFailure<T>(
+  mode: CollectionMode,
+  label: string,
+  operation: () => Promise<T>
+): Promise<T> {
+  const attempts = mode === "business" ? TECHNICAL_RETRY_ATTEMPTS : 1;
+  let lastError: unknown;
+
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      return await operation();
+    } catch (error) {
+      lastError = error;
+      if (attempt >= attempts) break;
+      console.log(
+        `[技术重试] ${label} 第 ${attempt}/${attempts} 次失败：${formatError(error)}`
+      );
+    }
+  }
+
+  throw lastError;
 }
 
 /** 回答刚结束时短暂重试正文节点，避免最后一批 Markdown/block 节点尚未挂载。 */
@@ -551,86 +1062,8 @@ function formatError(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-/**
- * 一个平台完成整轮问题后创建空白会话。
- *
- * 仅在点击后确认“会话地址变化、旧问题数量减少或旧问题消失”之一成立，
- * 并且页面重新出现可用输入框时才返回成功，避免把侧栏普通容器误判为新对话。
- */
-export async function openNewConversation(
-  page: Page,
-  config: PlatformConfig,
-  previousQuestion = "",
-  timeoutMs = 15_000
-): Promise<boolean> {
-  const beforeUrl = page.url();
-  const beforeBody = await page.locator("body").innerText({ timeout: 3_000 }).catch(() => "");
-  const beforeQuestionCount = countTextOccurrences(beforeBody, previousQuestion);
-  const startedAt = Date.now();
-
-  for (const selector of config.newConversationButtonSelectors) {
-    if (Date.now() - startedAt >= timeoutMs) break;
-    const locators = await page.locator(selector).all().catch(() => []);
-
-    for (const locator of locators.slice().reverse()) {
-      if (Date.now() - startedAt >= timeoutMs) break;
-      const [visible, enabled, box] = await Promise.all([
-        locator.isVisible().catch(() => false),
-        locator.isEnabled().catch(() => false),
-        locator.boundingBox().catch(() => null)
-      ]);
-      // 新对话入口通常是按钮或较小的侧栏控件，过滤覆盖整页的大容器。
-      if (!visible || !enabled || !box || box.width > 500 || box.height > 180) continue;
-
-      const clicked = await locator.click({ timeout: 2_000 })
-        .then(() => true)
-        .catch(() => false);
-      if (!clicked) continue;
-
-      const remainingMs = timeoutMs - (Date.now() - startedAt);
-      if (remainingMs <= 0) return false;
-      const ready = await waitForNewConversationReady(
-        page,
-        config,
-        beforeUrl,
-        beforeQuestionCount,
-        previousQuestion,
-        Math.min(remainingMs, 6_000)
-      );
-      if (ready) return true;
-    }
-  }
-
-  return false;
-}
-
-/** 等待新会话完成切换，并确认空白会话的输入框已经可用。 */
-async function waitForNewConversationReady(
-  page: Page,
-  config: PlatformConfig,
-  beforeUrl: string,
-  beforeQuestionCount: number,
-  previousQuestion: string,
-  timeoutMs: number
-): Promise<boolean> {
-  const startedAt = Date.now();
-
-  while (Date.now() - startedAt < timeoutMs) {
-    const [bodyText, inputBox] = await Promise.all([
-      page.locator("body").innerText({ timeout: 2_000 }).catch(() => ""),
-      findInput(page, config.inputSelectors, 500)
-    ]);
-    const currentQuestionCount = countTextOccurrences(bodyText, previousQuestion);
-    const conversationChanged =
-      page.url() !== beforeUrl ||
-      (beforeQuestionCount > 0 && currentQuestionCount < beforeQuestionCount) ||
-      (Boolean(previousQuestion) && !bodyText.includes(previousQuestion));
-
-    if (inputBox && conversationChanged && !await isAnswerGenerating(page)) return true;
-    await page.waitForTimeout(300);
-  }
-
-  return false;
+function normalizeInspectionText(value: string): string {
+  return value.replace(/\s+/g, " ").trim();
 }
 
 /** 将视口移到最新回答区域，避免引用入口因懒加载而尚未挂载。 */
@@ -685,63 +1118,6 @@ async function ensureReadyForInput(page: Page, config: PlatformConfig): Promise<
   if (inputBox) return;
 
   throw new Error(`没有在已打开的 ${config.name} 标签页找到聊天输入框，请确认页面已登录并停留在可提问界面。`);
-}
-
-/**
- * 尝试打开平台联网搜索能力；点击失败时继续检查其他候选，不再把吞掉的点击
- * 异常当作成功。对带 aria 状态的开关还会验证点击后确实进入启用状态。
- */
-async function activateWebSearch(page: Page, config: PlatformConfig): Promise<void> {
-  const clickErrors: string[] = [];
-  let sawCandidate = false;
-
-  for (const selector of config.webSearchButtonSelectors) {
-    const locators = await page.locator(selector).all().catch(() => []);
-    for (const locator of locators.slice(0, 4)) {
-      const visible = await locator.isVisible().catch(() => false);
-      const enabled = await locator.isEnabled().catch(() => false);
-      if (!visible || !enabled) continue;
-
-      const text = (await locator.innerText({ timeout: 1_000 }).catch(() => ""))
-        .replace(/\s+/g, " ")
-        .trim();
-      // 过滤包含整块页面文字的宽泛 :has-text 命中，避免误点非搜索控件。
-      if (text.length > 24) continue;
-      sawCandidate = true;
-
-      const pressed = await locator.getAttribute("aria-pressed").catch(() => null);
-      const checked = await locator.getAttribute("aria-checked").catch(() => null);
-      if (pressed === "true" || checked === "true") return;
-
-      const clicked = await locator.click({ timeout: 1_500 })
-        .then(() => true)
-        .catch((error) => {
-          const message = error instanceof Error ? error.message : String(error);
-          clickErrors.push(`${selector}:${message.split("\n")[0]}`);
-          return false;
-        });
-      if (!clicked) continue;
-
-      await page.waitForTimeout(400);
-      if (pressed !== null || checked !== null) {
-        const [nextPressed, nextChecked] = await Promise.all([
-          locator.getAttribute("aria-pressed").catch(() => null),
-          locator.getAttribute("aria-checked").catch(() => null)
-        ]);
-        if (nextPressed !== "true" && nextChecked !== "true") {
-          clickErrors.push(`${selector}:点击后 aria 状态仍未启用`);
-          continue;
-        }
-      }
-      return;
-    }
-  }
-
-  if (config.id === "yuanbao" && sawCandidate && clickErrors.length > 0) {
-    console.log(
-      `[元宝] 联网搜索控件未能确认启用：${clickErrors.slice(-3).join(" | ")}`
-    );
-  }
 }
 
 /** 兼容 textarea/input 与 contenteditable，并优先点击发送按钮、回退 Enter。 */

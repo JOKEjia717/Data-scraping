@@ -78,6 +78,7 @@ test("汇总记录按问题和平台分组，并移除平台记录中重复的�
 test("最终回答 CSV 保留固定字段并正确转义多行正文", () => {
   const answers: AnswerRecord[] = [{
     question: "问题一",
+    submittedQuestion: "请联网搜索。问题：问题一",
     crawlPlatform: "豆包",
     answer: "第一段，包含逗号\n第二段包含\"引号\"",
     generationNumber: 3,
@@ -88,9 +89,10 @@ test("最终回答 CSV 保留固定字段并正确转义多行正文", () => {
   const csv = answersToCsv(answers);
   assert.equal(
     csv.split("\n")[0],
-    "question,crawlPlatform,answer,generationNumber,referenceCount,extractedAt"
+    "question,submittedQuestion,crawlPlatform,answer,generationNumber,referenceCount,extractedAt"
   );
   assert.ok(csv.includes('"第一段，包含逗号\n第二段包含""引号"""'));
+  assert.ok(csv.includes("请联网搜索。问题：问题一"));
   assert.ok(csv.includes(",3,15,2026-07-30T10:00:00.000Z"));
 });
 
@@ -98,6 +100,7 @@ test("非豆包平台也会写出独立的最终回答 JSON 和 CSV", async () =
   const outDir = await fs.mkdtemp(path.join(os.tmpdir(), "crawler-output-"));
   const answers: AnswerRecord[] = [{
     question: "问题一",
+    submittedQuestion: "请联网搜索。问题：问题一",
     crawlPlatform: "DeepSeek",
     answer: "DeepSeek 最终回答",
     generationNumber: 1,
@@ -106,7 +109,19 @@ test("非豆包平台也会写出独立的最终回答 JSON 和 CSV", async () =
   }];
 
   try {
-    await writePlatformOutputs(outDir, "deepseek", [], answers);
+    const references: ReferenceRecord[] = [{
+      question: "问题一",
+      submittedQuestion: "请联网搜索。问题：问题一",
+      crawlPlatform: "DeepSeek",
+      rank: 1,
+      articlePlatform: "示例来源",
+      articleTime: "",
+      title: "示例标题",
+      summary: "",
+      url: "https://example.com/article",
+      extractedAt: "2026-07-31T00:00:01.000Z"
+    }];
+    await writePlatformOutputs(outDir, "deepseek", references, answers);
     const json = JSON.parse(
       await fs.readFile(path.join(outDir, "deepseek", "answers.json"), "utf8")
     ) as AnswerRecord[];
@@ -114,9 +129,18 @@ test("非豆包平台也会写出独立的最终回答 JSON 和 CSV", async () =
       path.join(outDir, "deepseek", "answers.csv"),
       "utf8"
     );
+    const referenceCsv = await fs.readFile(
+      path.join(outDir, "deepseek", "references.csv"),
+      "utf8"
+    );
 
     assert.deepEqual(json, answers);
     assert.ok(csv.includes("DeepSeek 最终回答"));
+    assert.equal(
+      referenceCsv.split("\n")[0],
+      "question,submittedQuestion,crawlPlatform,rank,articlePlatform,articleTime,title,summary,url,extractedAt"
+    );
+    assert.ok(referenceCsv.includes("请联网搜索。问题：问题一"));
   } finally {
     await fs.rm(outDir, { recursive: true, force: true });
   }

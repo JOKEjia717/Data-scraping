@@ -49,6 +49,23 @@ export const PLATFORMS: Record<PlatformId, PlatformConfig> = {
       "[aria-label*='联网搜索']",
       "[title*='联网搜索']"
     ],
+    webSearchSupported: true,
+    deepThinkingControl: {
+      supported: true,
+      selectors: [
+        "button[aria-label*='深度思考']",
+        "button[title*='深度思考']",
+        "button:has-text('深度思考')",
+        "[role='switch'][aria-label*='深度思考']",
+        "[role='button']:has-text('深度思考')"
+      ],
+      // 豆包新版把当前未启用深度思考的模式明确显示为“快速”。
+      // 这里只读取状态，不点击该入口，也不把找不到入口推断为关闭。
+      disabledStateSelectors: [
+        "button:has-text('快速')",
+        "[role='button']:has-text('快速')"
+      ]
+    },
     referenceRevealSelectors: [
       "text=/参考\\s*\\d+\\s*篇资料/",
       "[role='button']:has-text('篇资料')",
@@ -84,12 +101,34 @@ export const PLATFORMS: Record<PlatformId, PlatformConfig> = {
       ...COMMON_NEW_CONVERSATION_SELECTORS
     ],
     webSearchButtonSelectors: [
+      "div[aria-pressed]:has-text('智能搜索')",
+      "[aria-pressed]:has-text('智能搜索')",
       "button:has-text('联网搜索')",
       "button:has-text('Search')",
       "[role='button']:has-text('联网搜索')",
       "[aria-label*='联网搜索']",
       "[aria-label*='Search']"
     ],
+    webSearchSupported: true,
+    deepThinkingControl: {
+      supported: true,
+      selectors: [
+        "div[aria-pressed]:has-text('深度思考')",
+        "[aria-pressed]:has-text('深度思考')",
+        "button[aria-label*='深度思考']",
+        "button[title*='深度思考']",
+        "button:has-text('深度思考')",
+        "button:has-text('DeepThink')",
+        "[role='switch'][aria-label*='DeepThink']",
+        "[role='button']:has-text('DeepThink')"
+      ],
+      // DeepSeek 新版在未启用深度思考时明确展示“快速模式”。
+      // 该入口只用于确认关闭态，不作为切换控件点击。
+      disabledStateSelectors: [
+        "button:has-text('快速模式')",
+        "[role='button']:has-text('快速模式')"
+      ]
+    },
     referenceRevealSelectors: [
       "[class~='f93f59e4']",
       "text=/^\\d+\\s*个网页$/",
@@ -143,6 +182,8 @@ export const PLATFORMS: Record<PlatformId, PlatformConfig> = {
       ...COMMON_NEW_CONVERSATION_SELECTORS
     ],
     webSearchButtonSelectors: [
+      "span[data-input-login-gate='deep-research:primary'] button[aria-label='研究'][aria-pressed]",
+      "button[aria-label='研究'][aria-pressed]",
       "button:has-text('联网搜索')",
       "button:has-text('搜索')",
       "button:has-text('全网搜索')",
@@ -157,6 +198,20 @@ export const PLATFORMS: Record<PlatformId, PlatformConfig> = {
       "[title*='联网搜索']",
       "[title*='搜索']"
     ],
+    webSearchSupported: true,
+    deepThinkingControl: {
+      supported: true,
+      selectors: [
+        "span[data-input-login-gate='deep-think:primary'] button[aria-label='思考'][aria-pressed]",
+        "button[aria-label='思考'][aria-pressed]",
+        "button[aria-label*='深度思考']",
+        "button[title*='深度思考']",
+        "button:has-text('深度思考')",
+        "button:has-text('深度推理')",
+        "[role='switch'][aria-label*='深度思考']",
+        "[role='button']:has-text('深度思考')"
+      ]
+    },
     referenceRevealSelectors: [
       "[class~='link-title-igf0OC']",
       "text=/参考来源\\s*\\(\\d+\\)/",
@@ -221,6 +276,18 @@ export const PLATFORMS: Record<PlatformId, PlatformConfig> = {
       "[title*='联网搜索']",
       "[title*='搜索']"
     ],
+    webSearchSupported: true,
+    deepThinkingControl: {
+      supported: true,
+      selectors: [
+        "button[aria-label*='深度思考']",
+        "button[title*='深度思考']",
+        "button:has-text('深度思考')",
+        "button:has-text('深度推理')",
+        "[role='switch'][aria-label*='深度思考']",
+        "[role='button']:has-text('深度思考')"
+      ]
+    },
     referenceRevealSelectors: [
       ".ToolbarSearchGuid_searchGuidTool__M81L2.Toolbar_icon__xGP8b",
       "text=\"源\"",

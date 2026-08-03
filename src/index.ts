@@ -3,7 +3,8 @@
  * 通过集中写入队列刷新平台文件与跨平台汇总，避免并发覆盖和数据丢失。
  */
 import { DEFAULT_QUESTIONS } from "./questions.js";
-import { parseCli, readQuestionFile } from "./cli.js";
+import { parseCli, readBusinessBatchFile, readQuestionFile } from "./cli.js";
+import { createResearchBatch, flattenBatchQuestions } from "./execution.js";
 import { PLATFORMS } from "./platforms.js";
 import { crawlPlatform } from "./crawler.js";
 import { createOutputCoordinator } from "./output.js";
@@ -12,10 +13,21 @@ import {
   createDatabaseRunCoordinator,
   type DatabaseRunFailure
 } from "./databasePersistence.js";
+import { safeErrorSummary } from "./consolePrivacy.js";
 
 async function main(): Promise<void> {
   const options = await parseCli(process.argv.slice(2));
-  const questions = options.questionFile ? await readQuestionFile(options.questionFile) : DEFAULT_QUESTIONS;
+  if (options.mode === "business" && !options.questionFile) {
+    throw new Error("business 模式必须通过 --questions 指定品牌批次 JSON 文件。");
+  }
+  const batches = options.mode === "business"
+    ? await readBusinessBatchFile(options.questionFile!)
+    : [createResearchBatch(
+        options.questionFile
+          ? await readQuestionFile(options.questionFile)
+          : DEFAULT_QUESTIONS
+      )];
+  const questions = flattenBatchQuestions(batches);
   const outputCoordinator = createOutputCoordinator(
     options.outDir,
     options.platforms,
@@ -47,7 +59,7 @@ async function main(): Promise<void> {
     try {
       const platformResult = await crawlPlatform(
         PLATFORMS[platformId],
-        { ...options, questions },
+        { ...options, questions, batches },
         {
           async onProgress(partialResult) {
             // 平台抓取互不等待；只有短暂的写盘阶段进入统一队列。
@@ -71,7 +83,7 @@ async function main(): Promise<void> {
         await databaseCoordinator.failPlatform(platformId, error).catch((databaseError) => {
           console.error(
             `[${PLATFORMS[platformId].name}] 标记数据库失败状态时发生异常：`,
-            databaseError
+            safeErrorSummary(databaseError)
           );
         });
       }
@@ -95,12 +107,9 @@ async function main(): Promise<void> {
 
   if (failures.length > 0) {
     const failureSummary = failures
-      .map(({ platformId, result }) => {
-        const reason = result.reason instanceof Error
-          ? result.reason.message
-          : String(result.reason);
-        return `${PLATFORMS[platformId].name}: ${reason}`;
-      })
+      .map(({ platformId, result }) =>
+        `${PLATFORMS[platformId].name}: ${safeErrorSummary(result.reason)}`
+      )
       .join("\n");
     throw new Error(
       `${failures.length} 个平台运行失败，其余平台数据已正常保存：\n${failureSummary}`
@@ -123,9 +132,9 @@ main()
     process.exit(0);
   })
   .catch(async (error) => {
-    console.error(error);
+    console.error(safeErrorSummary(error));
     await closeDatabasePool().catch((closeError) => {
-      console.error("关闭数据库连接池失败：", closeError);
+      console.error("关闭数据库连接池失败：", safeErrorSummary(closeError));
     });
     process.exit(1);
   });

@@ -1,0 +1,59 @@
+{
+  "tasks": [
+    {
+      "executionId": "exec-a-diagnosis-1",
+      "businessType": "DIAGNOSIS",
+      "businessTaskId": "diagnosis-20260803-a",
+      "tenantKey": "tenant-demo",
+      "brandId": "brand-a",
+      "keyword": "品牌 A 的核心产品有哪些？",
+      "aiModelId": "doubao",
+      "aiModelName": "豆包",
+      "deepThinking": false
+    },
+    {
+      "executionId": "exec-a-diagnosis-2",
+      "businessType": "DIAGNOSIS",
+      "businessTaskId": "diagnosis-20260803-a",
+      "tenantKey": "tenant-demo",
+      "brandId": "brand-a",
+      "keyword": "品牌 A 的主要消费人群是谁？",
+      "aiModelId": "doubao",
+      "aiModelName": "豆包",
+      "deepThinking": true
+    },
+    {
+      "executionId": "exec-b-probe-1",
+      "businessType": "ARTICLE_PROBE",
+      "businessTaskId": "probe-20260803-b",
+      "tenantKey": "tenant-demo",
+      "brandId": "brand-b",
+      "keyword": "品牌 B 最近有哪些新品报道？",
+      "aiModelId": "deepseek",
+      "aiModelName": "DeepSeek",
+      "deepThinking": false
+    },
+    {
+      "executionId": "exec-a-probe-2",
+      "businessType": "ARTICLE_PROBE",
+      "businessTaskId": "probe-20260803-a-second",
+      "tenantKey": "tenant-demo",
+      "brandId": "brand-a",
+      "keyword": "品牌 A 最近一次业务任务有哪些媒体报道？",
+      "aiModelId": "qianwen",
+      "aiModelName": "千问",
+      "deepThinking": true
+    },
+    {
+      "executionId": "exec-c-diagnosis-1",
+      "businessType": "DIAGNOSIS",
+      "businessTaskId": "diagnosis-20260803-c",
+      "tenantKey": "tenant-demo",
+      "brandId": "brand-c",
+      "keyword": "品牌 C 的市场定位是什么？",
+      "aiModelId": "yuanbao",
+      "aiModelName": "元宝",
+      "deepThinking": false
+    }
+  ]
+}
