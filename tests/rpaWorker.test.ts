@@ -14,10 +14,25 @@ import {
   nextPlatformBatches,
   planGreyRpaBatches,
   readySessionPlatforms,
+  referenceRecoveryRuntimeForTask,
+  releaseableExecutionIds,
   taskInGrayScope,
   webSearchRuntimeForTask,
   type RpaWorkerSession
 } from "../src/rpaWorker.js";
+
+test("批次失败只释放明确尚未发送的任务", () => {
+  const states = new Map([
+    ["not-sent", "NOT_SUBMITTED" as const],
+    ["sent", "SUBMITTED" as const],
+    ["visible", "ANSWER_VISIBLE" as const],
+    ["uncertain", "POST_SUBMIT_UNCERTAIN" as const]
+  ]);
+  assert.deepEqual(
+    releaseableExecutionIds(["not-sent", "sent", "visible", "uncertain"], states),
+    ["not-sent"]
+  );
+});
 import type { BrowserSelfCheckResult } from "../src/browserDiagnostics.js";
 import { parseRpaWorkerConfig } from "../src/rpaWorkerConfig.js";
 import {
@@ -483,4 +498,31 @@ test("跨进程平台租约使用两个 Worker 共享的稳定名称并有限等
   });
   assert.equal(acquired, true);
   assert.equal(leases.attempts.length, 3);
+});
+
+test("正式诊断仅为元宝开启缺少参考列表时的重新生成闭环", () => {
+  assert.deepEqual(
+    referenceRecoveryRuntimeForTask({ businessType: "DIAGNOSIS" }, "yuanbao"),
+    {
+      retryOnNoReferences: true,
+      regenerateOnNoReferences: true,
+      requireReferences: true
+    }
+  );
+  assert.deepEqual(
+    referenceRecoveryRuntimeForTask({ businessType: "DIAGNOSIS" }, "doubao"),
+    {
+      retryOnNoReferences: false,
+      regenerateOnNoReferences: false,
+      requireReferences: false
+    }
+  );
+  assert.deepEqual(
+    referenceRecoveryRuntimeForTask({ businessType: "ARTICLE_PROBE" }, "yuanbao"),
+    {
+      retryOnNoReferences: false,
+      regenerateOnNoReferences: false,
+      requireReferences: false
+    }
+  );
 });

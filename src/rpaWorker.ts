@@ -53,7 +53,10 @@ import type {
   ReferenceExtractionStatus,
   ReferenceRecord
 } from "./types.js";
-import type { RpaCollectionResult } from "./rpaResultRepository.js";
+import type {
+  RpaCollectionResult,
+  RpaResultSaveOutcome
+} from "./rpaResultRepository.js";
 import {
   webSearchPolicyForBusinessType,
   confirmWebSearchFromAnswerEvidence,
@@ -748,11 +751,45 @@ export function webSearchRuntimeForTask(
   };
 }
 
+/** 正式诊断的元宝回答必须经过“参考列表检查 + 缺失时重新生成”闭环。 */
+export function referenceRecoveryRuntimeForTask(
+  task: Pick<CollectionTask, "businessType">,
+  platformId: PlatformId
+): Pick<ExecuteQuestionRuntime, "retryOnNoReferences" | "regenerateOnNoReferences" | "requireReferences"> {
+  const enabled = task.businessType === "DIAGNOSIS" && platformId === "yuanbao";
+  return {
+    retryOnNoReferences: enabled,
+    regenerateOnNoReferences: enabled,
+    requireReferences: enabled
+  };
+}
+
+export type RpaTaskLifecycleState =
+  | "NOT_SUBMITTED"
+  | "SUBMITTED"
+  | "ANSWER_VISIBLE"
+  | "ANSWER_CAPTURED"
+  | "REFERENCES_CONFIRMED"
+  | "OUTBOX_SAVED"
+  | "DATABASE_SAVED"
+  | "POST_SUBMIT_UNCERTAIN";
+
+/** 释放 DB claim 的唯一白名单；发送后的任何状态都必须保留结果恢复语义。 */
+export function releaseableExecutionIds(
+  executionIds: readonly string[],
+  states: ReadonlyMap<string, RpaTaskLifecycleState>
+): string[] {
+  return executionIds.filter((executionId) => states.get(executionId) === "NOT_SUBMITTED");
+}
+
 async function executeClaimedBatches(input: ExecuteClaimedInput): Promise<void> {
   const { config } = input;
   const allTasks = input.batches.flatMap(({ tasks }) => tasks);
   const taskById = new Map(allTasks.map((task) => [task.executionId, task]));
   const owned = new Set(taskById.keys());
+  const lifecycleStates = new Map<string, RpaTaskLifecycleState>(
+    allTasks.map((task) => [task.executionId, "NOT_SUBMITTED"])
+  );
   const conversationManagers = new Map<PlatformId, ConversationManager>();
   const batchPlatformLeases = new Map<string, string>();
   const lastQuestion = new Map<PlatformId, string>();
@@ -815,9 +852,10 @@ async function executeClaimedBatches(input: ExecuteClaimedInput): Promise<void> 
             PLATFORMS[batch.platformId],
             task.keyword,
             "business"
-          ).catch(() => ({ status: "uncertain" as const }))
-          : { status: "uncertain" as const };
+          ).catch(() => ({ status: "uncertain" as const, reason: "页面检查异常" }))
+          : { status: "uncertain" as const, reason: "页面不属于当前批次" };
         if (inspection.status === "answered") {
+          lifecycleStates.set(task.executionId, "ANSWER_VISIBLE");
           manager.resumeVerifiedBatch(context);
           resumedCurrentAnswerBatches.add(batch.id);
           rpaConsoleInfo({
@@ -829,6 +867,12 @@ async function executeClaimedBatches(input: ExecuteClaimedInput): Promise<void> 
             batchProgress: "existing-answer"
           });
           return;
+        }
+        if (ownerMatches && inspection.status === "uncertain") {
+          throw Object.assign(
+            new Error(`已有本批次页面，但无法证明当前问题尚未发送：${inspection.reason ?? "未知"}`),
+            { errorCode: "REFERENCE_UNKNOWN" }
+          );
         }
         await manager.startBatch(context, lastQuestion.get(batch.platformId) ?? "");
         await storeConversationOwner(page, context);
@@ -867,10 +911,11 @@ async function executeClaimedBatches(input: ExecuteClaimedInput): Promise<void> 
           .filter((executionId) => owned.has(executionId));
         if (uncompleted.length > 0) {
           for (const executionId of uncompleted) heartbeat.remove(executionId);
-          summaryRelease(input.summary, await input.stateRepository.releaseClaims(uncompleted));
+          const releaseable = releaseableExecutionIds(uncompleted, lifecycleStates);
+          summaryRelease(input.summary, await input.stateRepository.releaseClaims(releaseable));
           for (const executionId of uncompleted) {
             const task = taskById.get(executionId);
-            if (task) {
+            if (task && releaseable.includes(executionId)) {
               input.metrics.transitionTaskState(task.platformId, "processing", "pending");
             }
             owned.delete(executionId);
@@ -913,6 +958,9 @@ async function executeClaimedBatches(input: ExecuteClaimedInput): Promise<void> 
       let submissionState: "not_submitted" | "submitted" | "uncertain" = "not_submitted";
       let actualDeepThinking: boolean | null = null;
       const taskWebSearchRuntime = webSearchRuntimeForTask(task, config);
+      const referenceRecoveryRuntime = referenceRecoveryRuntimeForTask(task, context.platformId);
+      const allowUnverifiedZeroReferences =
+        task.businessType === "DIAGNOSIS" && context.platformId === "qianwen";
       let webSearchState: WebSearchActivationResult = {
         requested: taskWebSearchRuntime.webSearchPolicy !== "DISABLED",
         supported: PLATFORMS[context.platformId].webSearchSupported,
@@ -930,6 +978,8 @@ async function executeClaimedBatches(input: ExecuteClaimedInput): Promise<void> 
         referenceStatus: ReferenceExtractionStatus
       ) => {
         assertPersistableReferenceResult(referenceStatus, references, task.businessType);
+        lifecycleStates.set(task.executionId, "ANSWER_CAPTURED");
+        lifecycleStates.set(task.executionId, "REFERENCES_CONFIRMED");
         manager.recordQuestion(task.keyword);
         lastQuestion.set(context.platformId, task.keyword);
         const completedAt = new Date();
@@ -974,7 +1024,13 @@ async function executeClaimedBatches(input: ExecuteClaimedInput): Promise<void> 
               }
             },
             beforeDatabaseWrite: () =>
-              ensureBatchLeaseOwnership(input, context.batch, task.executionId)
+              ensureBatchLeaseOwnership(input, context.batch, task.executionId),
+            afterOutboxSave() {
+              lifecycleStates.set(task.executionId, "OUTBOX_SAVED");
+            },
+            afterDatabaseWrite() {
+              lifecycleStates.set(task.executionId, "DATABASE_SAVED");
+            }
           }
         );
         const persistenceStatus = persistence.status;
@@ -1046,11 +1102,16 @@ async function executeClaimedBatches(input: ExecuteClaimedInput): Promise<void> 
         if (preflightError) throw preflightError;
         if (resumedCurrentAnswerBatches.has(context.batch.id) && context.taskIndex === 0) {
           submissionState = "submitted";
+          lifecycleStates.set(task.executionId, "ANSWER_VISIBLE");
           const recovered = await recoverSubmittedQuestionResult(
             page,
             PLATFORMS[context.platformId],
             task.keyword,
-            webSearchState
+            webSearchState,
+            {
+              allowUnverifiedZeroReferences,
+              requireReferences: referenceRecoveryRuntime.requireReferences
+            }
           );
           const recoveredWebSearch = recovered.references.length > 0
             ? confirmWebSearchFromAnswerEvidence(webSearchState)
@@ -1073,12 +1134,12 @@ async function executeClaimedBatches(input: ExecuteClaimedInput): Promise<void> 
           config: PLATFORMS[context.platformId],
           mode: "business",
           promptPrefix: "",
-          retryOnNoReferences: false,
-          regenerateOnNoReferences: false,
+          ...referenceRecoveryRuntime,
           resolveTitles: config.resolveTitles,
           timeoutMs: config.questionTimeoutMs,
           ...deepThinkingRuntimeForTask(task, config),
           ...taskWebSearchRuntime,
+          allowUnverifiedZeroReferences,
           onDeepThinkingStateResolved(_requested, actual) {
             actualDeepThinking = actual;
           },
@@ -1087,6 +1148,10 @@ async function executeClaimedBatches(input: ExecuteClaimedInput): Promise<void> 
           },
           onSubmissionStateChange(state) {
             submissionState = state;
+            lifecycleStates.set(
+              task.executionId,
+              state === "submitted" ? "SUBMITTED" : "POST_SUBMIT_UNCERTAIN"
+            );
           }
         });
         const answerContent = collected.answer?.answer;
@@ -1118,7 +1183,11 @@ async function executeClaimedBatches(input: ExecuteClaimedInput): Promise<void> 
               recoveredPage,
               PLATFORMS[context.platformId],
               task.keyword,
-              webSearchState
+              webSearchState,
+              {
+                allowUnverifiedZeroReferences,
+                requireReferences: referenceRecoveryRuntime.requireReferences
+              }
             );
             const recoveredWebSearch = recovered.references.length > 0
               ? confirmWebSearchFromAnswerEvidence(webSearchState)
@@ -1155,6 +1224,7 @@ async function executeClaimedBatches(input: ExecuteClaimedInput): Promise<void> 
             errorCode = "REFERENCE_UNKNOWN";
           }
           postSubmitUncertain = true;
+          lifecycleStates.set(task.executionId, "POST_SUBMIT_UNCERTAIN");
           inspectionReason = errorCode === "WEB_SEARCH_UNSUPPORTED" ||
             errorCode === "WEB_SEARCH_UNVERIFIED"
             ? "已取得回答，但联网状态未确认，不能作为普通零引用成功"
@@ -1341,10 +1411,13 @@ async function executeClaimedBatches(input: ExecuteClaimedInput): Promise<void> 
     const remaining = [...owned];
     if (remaining.length > 0) {
       for (const executionId of remaining) heartbeat.remove(executionId);
-      summaryRelease(input.summary, await input.stateRepository.releaseClaims(remaining));
+      const releaseable = releaseableExecutionIds(remaining, lifecycleStates);
+      summaryRelease(input.summary, await input.stateRepository.releaseClaims(releaseable));
       for (const executionId of remaining) {
         const task = taskById.get(executionId);
-        if (task) input.metrics.transitionTaskState(task.platformId, "processing", "pending");
+        if (task && releaseable.includes(executionId)) {
+          input.metrics.transitionTaskState(task.platformId, "processing", "pending");
+        }
         await input.leases.release(executionLeaseName(executionId));
       }
       owned.clear();
@@ -1628,6 +1701,8 @@ export interface OutboxRecoveryOptions {
     retryCount: number
   ) => void;
   beforeDatabaseWrite?: () => Promise<void>;
+  afterOutboxSave?: () => void | Promise<void>;
+  afterDatabaseWrite?: (outcome: RpaResultSaveOutcome) => void | Promise<void>;
 }
 
 /**
@@ -1645,7 +1720,9 @@ export async function persistResultWithOutboxRecovery(
   while (true) {
     try {
       const outcome = await persistResultThroughOutbox(result, outbox, repository, {
-        beforeDatabaseWrite: options.beforeDatabaseWrite
+        beforeDatabaseWrite: options.beforeDatabaseWrite,
+        afterOutboxSave: options.afterOutboxSave,
+        afterDatabaseWrite: options.afterDatabaseWrite
       });
       options.onFilesystemStateChange?.(false, undefined, retryCount);
       return outcome;

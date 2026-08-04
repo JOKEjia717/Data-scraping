@@ -116,6 +116,32 @@ test("Worker 重启后只重放数据库写入，成功后清理 Outbox", async 
   assert.deepEqual(await afterRestart.list(), []);
 });
 
+test("数据库成功后 Outbox 清理失败仍返回 saved 并保留幂等重放文件", async (t) => {
+  const { directory } = await temporaryOutbox(t);
+  class CleanupFailingOutbox extends ResultOutbox {
+    override async remove(): Promise<void> {
+      throw Object.assign(new Error("Windows 文件暂时被占用"), { code: "EPERM" });
+    }
+  }
+  const outbox = new CleanupFailingOutbox({ directory });
+  let databaseWrites = 0;
+  const outcome = await persistResultThroughOutbox(
+    successfulResult("cleanup-failed"),
+    outbox,
+    {
+      async saveSuccess() {
+        databaseWrites++;
+        return { status: "saved", answerId: "502", referenceCount: 1 };
+      }
+    }
+  );
+
+  assert.equal(outcome.status, "saved");
+  assert.ok(outcome.cleanupError);
+  assert.equal(databaseWrites, 1);
+  assert.equal((await outbox.list()).length, 1);
+});
+
 test("同一 execution 重放两次依赖 saveSuccess 幂等且不会重复回答", async (t) => {
   const { outbox } = await temporaryOutbox(t);
   const completed = new Set<string>();

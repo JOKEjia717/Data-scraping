@@ -58,11 +58,15 @@ export interface ResultPersistenceOutcome {
   status: "saved" | "pending";
   databaseOutcome?: RpaResultSaveOutcome;
   error?: unknown;
+  /** 数据库已经提交，仅 Outbox 清理失败；保留文件供幂等重放，不得重做页面问答。 */
+  cleanupError?: unknown;
 }
 
 export interface ResultPersistenceOptions {
   /** Outbox 已落盘后、数据库事务前用于重新确认 execution/platform 所有权。 */
   beforeDatabaseWrite?: () => Promise<void>;
+  afterOutboxSave?: () => void | Promise<void>;
+  afterDatabaseWrite?: (outcome: RpaResultSaveOutcome) => void | Promise<void>;
 }
 
 export interface OutboxReplayFailure {
@@ -271,13 +275,22 @@ export async function persistResultThroughOutbox(
   options: ResultPersistenceOptions = {}
 ): Promise<ResultPersistenceOutcome> {
   await outbox.save(result);
+  await options.afterOutboxSave?.();
+  let databaseOutcome: RpaResultSaveOutcome;
   try {
     await options.beforeDatabaseWrite?.();
-    const databaseOutcome = await repository.saveSuccess(result);
-    await outbox.remove(result.executionId);
-    return { status: "saved", databaseOutcome };
+    databaseOutcome = await repository.saveSuccess(result);
   } catch (error) {
     return { status: "pending", error };
+  }
+  await options.afterDatabaseWrite?.(databaseOutcome);
+  try {
+    await outbox.remove(result.executionId);
+    return { status: "saved", databaseOutcome };
+  } catch (cleanupError) {
+    // 数据库事务已经成功，删除失败不能倒退成 pending，否则 Worker 会把已保存结果
+    // 当成数据库故障。文件保留后由启动重放依赖 saveSuccess 幂等清理。
+    return { status: "saved", databaseOutcome, cleanupError };
   }
 }
 

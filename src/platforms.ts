@@ -38,6 +38,9 @@ export const PLATFORMS: Record<PlatformId, PlatformConfig> = {
       "[role='button'][aria-label*='发送']"
     ],
     newConversationButtonSelectors: [
+      // 2026-08 豆包折叠侧栏只显示无文字铅笔图标；两个顶部按钮 class 完全相同，
+      // 使用新对话图标的稳定 SVG path 前缀区分旁边的侧栏开关。
+      "button:has(svg[viewBox='0 0 24 24'] path[d^='M11 1.99882'])",
       "div[class~='group/sidebar_nav_item']:has-text('新对话')",
       "div[class*='sidebar_nav_item']:has-text('新对话')",
       "[data-testid*='new-chat']",
@@ -203,14 +206,19 @@ export const PLATFORMS: Record<PlatformId, PlatformConfig> = {
     webSearchSupported: true,
     deepThinkingControl: {
       supported: true,
+      // Windows / macOS 统一定位：优先 aria-label + aria-pressed 的语义组合（探针已确认
+      // 千问真实按钮为 <button aria-label="思考" aria-pressed="false">），再兜底中英文文案。
+      // 不使用会随会话变化的哈希 class。
       selectors: [
-        "span[data-input-login-gate='deep-think:primary'] button[aria-label='思考'][aria-pressed]",
         "button[aria-label='思考'][aria-pressed]",
+        "button[aria-label*='思考'][aria-pressed]",
         "button[aria-label*='深度思考']",
         "button[title*='深度思考']",
         "button:has-text('深度思考')",
         "button:has-text('深度推理')",
+        "button:has-text('思考')",
         "[role='switch'][aria-label*='深度思考']",
+        "[role='switch'][aria-label*='思考']",
         "[role='button']:has-text('深度思考')"
       ]
     },

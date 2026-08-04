@@ -36,9 +36,11 @@ const DOUBAO_BASELINE_ANSWERS_KEY = "__codexDoubaoBaselineAnswerContainers";
 const DEEPSEEK_ANSWER_SELECTOR = ".ds-markdown.ds-assistant-message-main-content";
 const DEEPSEEK_REFERENCE_CONTAINER_SELECTOR = '[class~="_223dd7b"]';
 const QIANWEN_ANSWER_SELECTOR = [
-  // 旧版稳定包装层。
-  ".message-select-wrapper-answer-rqWekn .qk-markdown",
-  // 2026-08 新版回答卡片；外层哈希 class 可能变化，使用稳定语义 class 组合。
+  // data-chat-answers-wrap 与问题消息使用同一稳定 ID，流式阶段也会提前挂载。
+  // 必须优先于回答完成后才出现的 class，避免第八题仍在流式挂载时误取第七题。
+  "[data-chat-answers-wrap] .qk-markdown",
+  // 2026-08 新版回答卡片；使用稳定语义 class 组合。注意：早期版本的
+  // `.message-select-wrapper-answer-*` 哈希 class 会随会话变化，已被探针确认失效，故移除。
   ".chat-answers-card-wrap .answer-common-card .qk-markdown",
   ".chat-answers-card-wrap .qk-markdown.qk-markdown-complete"
 ].join(", ");
@@ -59,7 +61,10 @@ const YUANBAO_REFERENCE_LIST_SELECTOR = ".agent-dialogue-references__list";
 const YUANBAO_OPEN_REFERENCE_LIST_SELECTOR =
   ".t-drawer--open .agent-dialogue-references__list";
 const YUANBAO_ANSWER_SELECTOR =
-  "[data-conv-speaker='ai'] .agent-chat__speech-card__text";
+  "[data-conv-speaker='ai'] .hyc-common-markdown, " +
+  "[data-conv-speaker='ai'] .agent-chat__speech-card__text, " +
+  "[data-conv-speaker='ai'] .agent-chat__speech-text .hyc-component-text, " +
+  "[data-conv-speaker='ai'] .hyc-content-md-done";
 
 /** 豆包列表的轻量快照，用于判断容器是否命中以及引用是否加载稳定。 */
 interface DoubaoReferenceListSnapshot {
@@ -538,9 +543,42 @@ async function resolveDoubaoBlockScope(
     ? await page.evaluate(
         ({ selector, question }) => {
           const expected = (question || "").replace(/\s+/g, " ").trim();
+          const expectedIdentity = expected
+            .normalize("NFKC")
+            .toLocaleLowerCase()
+            .replace(/[\s\p{P}\p{S}]+/gu, "");
           if (!expected || !document.body) return -1;
 
           const blocks = Array.from(document.querySelectorAll(selector));
+          // 新版豆包的 data-message-id 是比整页文本更可靠的消息边界。先找到
+          // 当前真实用户消息，再把范围限制到紧随其后的 AI 消息内，避免首题导航
+          // 后搜索块数量复用、侧栏重复文本或历史块回收导致索引错位。
+          const messages = Array.from(document.querySelectorAll("[data-message-id]"));
+          const users = messages.filter((element) =>
+            element.classList.contains("justify-end") ||
+            element.getAttribute("data-message-role") === "user"
+          );
+          const currentUser = [...users].reverse().find((element) =>
+            (element.textContent || "")
+              .normalize("NFKC")
+              .toLocaleLowerCase()
+              .replace(/[\s\p{P}\p{S}]+/gu, "") === expectedIdentity
+          );
+          if (currentUser) {
+            const userPosition = messages.indexOf(currentUser);
+            const currentAnswer = messages.slice(userPosition + 1).find((element) =>
+              !users.includes(element)
+            );
+            if (currentAnswer) {
+              const containedBlockIndex = blocks.findIndex((block) => currentAnswer.contains(block));
+              if (containedBlockIndex >= 0) return containedBlockIndex;
+            }
+            const followingBlockIndex = blocks.findIndex((block) =>
+              Boolean(currentUser.compareDocumentPosition(block) & Node.DOCUMENT_POSITION_FOLLOWING)
+            );
+            if (followingBlockIndex >= 0) return followingBlockIndex;
+          }
+
           const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
           let node: Node | null = walker.nextNode();
           let exactMatchIndex = -1;
@@ -548,11 +586,15 @@ async function resolveDoubaoBlockScope(
 
           while (node) {
             const text = (node.textContent || "").replace(/\s+/g, " ").trim();
-            const isExact = text === expected;
+            const textIdentity = text
+              .normalize("NFKC")
+              .toLocaleLowerCase()
+              .replace(/[\s\p{P}\p{S}]+/gu, "");
+            const isExact = textIdentity === expectedIdentity;
             const isCompatible =
               !isExact &&
-              text.includes(expected) &&
-              text.length <= expected.length + 20;
+              textIdentity.includes(expectedIdentity) &&
+              textIdentity.length <= expectedIdentity.length + 20;
             if (isExact || isCompatible) {
               const anchor = node.parentElement;
               if (anchor) {
@@ -625,12 +667,20 @@ async function resolveDoubaoBlockScope(
   let firstBlockIndex = Math.max(minBlockIndex, 0);
   let anchoredByBodyText = false;
   if (firstBlockIndex >= allBlocks.length && currentQuestion) {
-    const bodyText = await page.locator("body").innerText({ timeout: 3_000 }).catch(() => "");
-    const questionIndex = bodyText.lastIndexOf(currentQuestion);
-    const currentAnswerText = questionIndex >= 0
-      ? bodyText.slice(questionIndex + currentQuestion.length)
-      : "";
-    if (/搜索\s*\d+\s*个关键词，\s*参考\s*\d+\s*篇资料/.test(currentAnswerText)) {
+    const bodyHasQuestionAndReference = await page.evaluate((question) => {
+      const bodyText = document.body?.innerText || "";
+      const expectedIdentity = question
+        .normalize("NFKC")
+        .toLocaleLowerCase()
+        .replace(/[\s\p{P}\p{S}]+/gu, "");
+      const bodyIdentity = bodyText
+        .normalize("NFKC")
+        .toLocaleLowerCase()
+        .replace(/[\s\p{P}\p{S}]+/gu, "");
+      return Boolean(expectedIdentity) && bodyIdentity.includes(expectedIdentity) &&
+        /搜索\s*\d+\s*个关键词，\s*参考\s*\d+\s*篇资料/.test(bodyText);
+    }, currentQuestion).catch(() => false);
+    if (bodyHasQuestionAndReference) {
       // 极端情况下问题文本节点被框架合并，仍只检查 DOM 末尾的结果块和占位块。
       firstBlockIndex = Math.max(allBlocks.length - 2, 0);
       // 首题发送会从空白页导航到新会话，页面内 WeakSet 基线会随文档重载丢失。
@@ -897,6 +947,26 @@ export async function revealLatestDoubaoReferenceList(
           candidates.push({ locator, blockIndex, priority, area: box.width * box.height });
         }
       }
+
+      // 部分豆包版本把“搜索 N 个关键词，参考 N 篇资料”直接渲染在
+      // search_query_result_block 自身，而不是可由 block.locator() 找到的子节点。
+      // 当前问题已经完成结构化锚定，因此只把这个当前块自身作为最后兜底。
+      const blockText = cleanText(await block.innerText().catch(() => ""));
+      if (/搜索\s*\d+\s*个关键词，\s*参考\s*\d+\s*篇资料/.test(blockText)) {
+        const [visible, enabled, box] = await Promise.all([
+          block.isVisible().catch(() => false),
+          block.isEnabled().catch(() => false),
+          block.boundingBox().catch(() => null)
+        ]);
+        if (visible && enabled && box && box.height <= 140) {
+          candidates.push({
+            locator: block,
+            blockIndex,
+            priority: scopedSelectors.length + 1,
+            area: box.width * box.height
+          });
+        }
+      }
     }
 
     candidates.sort((a, b) =>
@@ -911,7 +981,18 @@ export async function revealLatestDoubaoReferenceList(
     }
 
     await latest.locator.scrollIntoViewIfNeeded({ timeout: 5_000 }).catch(() => undefined);
-    const clicked = await latest.locator.click({ timeout: 5_000 }).then(() => true).catch(() => false);
+    let clicked = await latest.locator.click({ timeout: 5_000 }).then(() => true).catch(() => false);
+    if (!clicked) {
+      // 真实入口是无 role 的 cursor-pointer DIV；动画或透明子层偶尔会让
+      // Playwright 的鼠标动作判定失败。限定在已锚定的当前题候选后，再用 DOM
+      // click 回退，不扫描也不点击历史回答。
+      clicked = await latest.locator.evaluate((element) => {
+        const target = element.closest("[class~='cursor-pointer']") || element;
+        if (!(target instanceof HTMLElement)) return false;
+        target.click();
+        return true;
+      }).catch(() => false);
+    }
     if (!clicked) {
       await page.waitForTimeout(250);
       continue;

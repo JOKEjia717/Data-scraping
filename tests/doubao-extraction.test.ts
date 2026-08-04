@@ -7,11 +7,14 @@ import { after, before, test } from "node:test";
 import { chromium, type Browser } from "playwright";
 import {
   captureLatestPlatformAnswerWithRetries,
+  clickLatestYuanbaoRegenerate,
   closeQianwenReferencePanel,
   detectQianwenAnswerLoop,
   executeQuestion,
   inspectCurrentQuestionAnswer,
+  isAnswerGenerating,
   isAnswerGeneratingControlText,
+  permitsUnverifiedZeroReferences,
   qianwenAnswerFollowsRealQuestionBubble,
   shouldCompleteDoubaoAnswer,
   submitQuestion,
@@ -40,6 +43,13 @@ import {
 import { PLATFORMS } from "../src/platforms.js";
 
 let browser: Browser | undefined;
+
+test("千问诊断可显式跳过联网与来源确认，但其他平台和模式不能放宽", () => {
+  assert.equal(permitsUnverifiedZeroReferences("qianwen", "business", true), true);
+  assert.equal(permitsUnverifiedZeroReferences("qianwen", "research", true), false);
+  assert.equal(permitsUnverifiedZeroReferences("doubao", "business", true), false);
+  assert.equal(permitsUnverifiedZeroReferences("qianwen", "business", false), false);
+});
 
 test("豆包本题引用入口稳定后不再被整页动态内容阻塞", () => {
   assert.equal(shouldCompleteDoubaoAnswer({
@@ -102,6 +112,23 @@ after(async () => {
   await browser?.close();
 });
 
+test("豆包输入框右侧无文字方形图标必须视为仍在生成", async () => {
+  assert.ok(browser);
+  const page = await browser.newPage({ viewport: { width: 1280, height: 720 } });
+  await page.setContent(`
+    <textarea style="position:fixed;left:160px;top:600px;width:900px;height:24px"></textarea>
+    <button id="stop" style="position:fixed;left:980px;top:620px;width:40px;height:40px">
+      <svg viewBox="0 0 24 24"><rect x="7" y="7" width="10" height="10"></rect></svg>
+    </button>
+  `);
+
+  assert.equal(await isAnswerGenerating(page, "doubao"), true);
+  assert.equal(await isAnswerGenerating(page, "qianwen"), false);
+  await page.locator("#stop").evaluate((element) => element.remove());
+  assert.equal(await isAnswerGenerating(page, "doubao"), false);
+  await page.close();
+});
+
 test("千问 Apple 语义发送按钮与 Windows class 发送按钮都可定位", async () => {
   assert.ok(browser);
   const page = await browser.newPage();
@@ -153,6 +180,55 @@ test("并行新建对话时输入框持续动画也能直接填充并发送", as
     await page.locator("body").getAttribute("data-submitted"),
     "四平台并行输入稳定性测试"
   );
+  await page.close();
+});
+
+test("豆包发送后必须等新增真实问题消息出现才确认提交", async () => {
+  assert.ok(browser);
+  const page = await browser.newPage();
+  await page.setContent(`
+    <main id="conversation"></main>
+    <textarea></textarea>
+    <button aria-label="发送" type="button">发送</button>
+    <script>
+      document.querySelector("button").addEventListener("click", () => {
+        const question = document.querySelector("textarea").value;
+        document.querySelector("textarea").value = "";
+        setTimeout(() => {
+          const message = document.createElement("div");
+          message.className = "justify-end";
+          message.setAttribute("data-message-id", "new-question");
+          message.textContent = question;
+          document.querySelector("#conversation").append(message);
+        }, 100);
+      });
+    </script>
+  `);
+
+  await submitQuestion(page, PLATFORMS.doubao, "豆包提交确认测试？", 2_000);
+  assert.equal(await page.locator("[data-message-id='new-question']").count(), 1);
+  await page.close();
+});
+
+test("豆包点击发送但没有真实问题消息时停止且不重复发送", async () => {
+  assert.ok(browser);
+  const page = await browser.newPage();
+  await page.setContent(`
+    <textarea></textarea>
+    <button aria-label="发送" type="button">发送</button>
+    <script>
+      document.querySelector("button").addEventListener("click", () => {
+        document.body.dataset.clickCount = String(Number(document.body.dataset.clickCount || 0) + 1);
+        document.querySelector("textarea").value = "";
+      });
+    </script>
+  `);
+
+  await assert.rejects(
+    () => submitQuestion(page, PLATFORMS.doubao, "不得重复发送的问题", 500),
+    /没有出现本题真实问题消息.*不会自动重复发送/
+  );
+  assert.equal(await page.locator("body").getAttribute("data-click-count"), "1");
   await page.close();
 });
 
@@ -314,6 +390,35 @@ test("千问重新生成先打开外层容器再点击菜单中的重新生成�
   await page.close();
 });
 
+test("元宝只点击与当前真实问题配对的回答重新生成按钮", async () => {
+  assert.ok(browser);
+  const page = await browser.newPage();
+  const currentQuestion = "当前题目需要参考来源吗？";
+  await page.setContent(`
+    <div data-conv-speaker="human" data-conv-idx="1">历史题目</div>
+    <div data-conv-speaker="ai" data-conv-idx="2">
+      <button id="old-regenerate" aria-label="重新生成">重新生成</button>
+    </div>
+    <div data-conv-speaker="human" data-conv-idx="3">${currentQuestion}</div>
+    <div data-conv-speaker="ai" data-conv-idx="4" data-conv-status="finished">
+      <button id="current-regenerate" aria-label="重新生成">重新生成</button>
+    </div>
+    <script>
+      document.querySelector("#old-regenerate").addEventListener("click", () => {
+        document.body.dataset.clicked = "old";
+      });
+      document.querySelector("#current-regenerate").addEventListener("click", () => {
+        document.body.dataset.clicked = "current";
+      });
+    </script>
+  `);
+
+  assert.equal(await clickLatestYuanbaoRegenerate(page, currentQuestion), true);
+  assert.equal(await page.locator("body").getAttribute("data-clicked"), "current");
+  assert.equal(await clickLatestYuanbaoRegenerate(page, "不存在的问题"), false);
+  await page.close();
+});
+
 test("豆包引用容器缺失时不回退扫描整页链接", async () => {
   assert.ok(browser);
   const page = await browser.newPage();
@@ -431,6 +536,58 @@ test("豆包旧块回收导致当前块索引前移时按问题锚点展开并�
       ["当前引用二", "https://current.example.com/two"]
     ]
   );
+  await page.close();
+});
+
+test("豆包按 data-message-id 定位当前回答并点击搜索块自身入口", async () => {
+  assert.ok(browser);
+  const page = await browser.newPage();
+  const searchBlock = "block_type:10025 | search_query_result_block.search_type:1";
+  await page.setContent(`
+    <main>
+      <div data-message-id="old-q" class="justify-end">历史问题</div>
+      <div data-message-id="old-a">
+        <div data-plugin-identifier="${searchBlock}">
+          <div id="old-entry" class="cursor-pointer">搜索 1 个关键词，参考 1 篇资料</div>
+        </div>
+      </div>
+      <div data-message-id="current-q" class="justify-end">手机品牌（售后）有哪些？</div>
+      <div data-message-id="current-a">
+        <div id="current-block" class="cursor-pointer" data-plugin-identifier="${searchBlock}">
+          搜索 3 个关键词，参考 2 篇资料
+        </div>
+      </div>
+    </main>
+    <script>
+      document.querySelector("#old-entry").addEventListener("click", () => {
+        document.body.dataset.oldClicked = "true";
+      });
+      document.querySelector("#current-block").addEventListener("click", () => {
+        document.body.dataset.currentClicked = "true";
+        const list = document.createElement("div");
+        list.className = "relative mt-[-8px] flex w-full min-w-0 flex-col";
+        list.innerHTML = [
+          '<div><a href="https://current.example.com/one">1. 当前资料一</a></div>',
+          '<div><a href="https://current.example.com/two">2. 当前资料二</a></div>'
+        ].join("");
+        document.querySelector("#current-block").append(list);
+      });
+    </script>
+  `);
+
+  // 模拟首题导航后新旧页面搜索块数量相同；同时任务文本与页面仅标点空格不同。
+  assert.equal(
+    await revealLatestDoubaoReferenceList(
+      page,
+      PLATFORMS.doubao.referenceRevealSelectors,
+      2,
+      "手机 品牌 售后 有哪些",
+      3_000
+    ),
+    true
+  );
+  assert.equal(await page.locator("body").getAttribute("data-current-clicked"), "true");
+  assert.equal(await page.locator("body").getAttribute("data-old-clicked"), null);
   await page.close();
 });
 
@@ -591,11 +748,11 @@ test("DeepSeek、千问和元宝只提取最后一版回答正文并清理非正
       </section>
 
       <section id="qianwen">
-        <div class="message-select-wrapper-answer-rqWekn">
-          <div class="qk-markdown">千问历史回答</div>
+        <div class="chat-answers-card-wrap">
+          <div class="answer-common-card"><div class="qk-markdown">千问历史回答</div></div>
         </div>
-        <div class="message-select-wrapper-answer-rqWekn">
-          <div class="qk-markdown">
+        <div class="chat-answers-card-wrap">
+          <div class="answer-common-card"><div class="qk-markdown">
             <h2>千问最终回答</h2>
             <div class="qk-md-paragraph">
               正文内容<span class="options-item-Yv7oFR">3</span>。
@@ -603,7 +760,7 @@ test("DeepSeek、千问和元宝只提取最后一版回答正文并清理非正
             <div class="qk-md-paragraph qk-md-has-multi-modal">
               视频推荐不应保存
             </div>
-          </div>
+          </div></div>
           <div class="reference-wrap-iEjeb3">7篇来源</div>
         </div>
       </section>
@@ -682,6 +839,84 @@ test("千问新版 complete 回答节点延迟挂载时只等待恢复而不重�
   await page.close();
 });
 
+test("千问流式回答仅有 data-chat-answers-wrap 时仍优先读取当前题", async () => {
+  assert.ok(browser);
+  const page = await browser.newPage();
+  await page.setContent(`
+    <main>
+      <div data-chat-question-wrap="q7"><div class="question-text-card">第七题</div></div>
+      <div data-chat-answers-wrap="q7" class="chat-answers-card-wrap">
+        <div class="answer-common-card"><div class="qk-markdown qk-markdown-complete">第七题旧回答</div></div>
+      </div>
+      <div data-chat-question-wrap="q8"><div class="question-text-card">第八题</div></div>
+      <div data-chat-answers-wrap="q8">
+        <section><div class="qk-markdown">第八题正在挂载但正文已经存在</div></section>
+      </div>
+    </main>
+  `);
+
+  assert.equal(
+    await extractLatestPlatformAnswer(page, "qianwen"),
+    "第八题正在挂载但正文已经存在"
+  );
+  await page.close();
+});
+
+test("元宝按 data-conv-idx 恢复新版 speech-text 回答而不误取上一题", async () => {
+  assert.ok(browser);
+  const page = await browser.newPage();
+  await page.setContent(`
+    <main>
+      <div data-conv-speaker="human" data-conv-idx="1">第一题</div>
+      <div data-conv-speaker="ai" data-conv-idx="2" data-conv-status="finished">
+        <div class="agent-chat__speech-card__text"><div class="hyc-common-markdown">第一题回答</div></div>
+      </div>
+      <div data-conv-speaker="human" data-conv-idx="3">元宝第二题：品牌，评价？</div>
+      <div data-conv-speaker="ai" data-conv-idx="4" data-conv-status="finished" data-conv-outputting="false">
+        <div class="agent-chat__speech-text"><div class="hyc-component-text">
+          <div class="hyc-content-md hyc-content-md-done"><div class="hyc-common-markdown">第二题新版回答</div></div>
+        </div></div>
+      </div>
+    </main>
+  `);
+
+  const inspection = await inspectCurrentQuestionAnswer(
+    page,
+    PLATFORMS.yuanbao,
+    "元宝第二题：品牌，评价？",
+    "business"
+  );
+  assert.equal(inspection.status, "answered", inspection.reason);
+  assert.equal(inspection.answerContent, "第二题新版回答");
+  await page.close();
+});
+
+test("豆包用规范化问题和 data-message-id 恢复第八题回答", async () => {
+  assert.ok(browser);
+  const page = await browser.newPage();
+  await page.setContent(`
+    <main>
+      <div data-message-id="q7" class="flex w-full justify-end">第七题</div>
+      <div data-message-id="a7" class="relative grid w-full"><div data-plugin-identifier="block_type:10000">第七题回答</div></div>
+      <div data-message-id="q8" class="flex w-full justify-end">豆包第八题：品牌（售后）怎么样？</div>
+      <div data-message-id="a8" class="relative grid w-full">
+        <div data-container-type="block-v2"><div data-plugin-identifier="block_type:10000">第八题完整回答</div></div>
+      </div>
+    </main>
+  `);
+
+  const inspection = await inspectCurrentQuestionAnswer(
+    page,
+    PLATFORMS.doubao,
+    "豆包第八题 品牌 售后 怎么样",
+    "business"
+  );
+  assert.equal(inspection.status, "answered", inspection.reason);
+  assert.equal(inspection.answerContent, "第八题完整回答");
+  assert.equal(await page.locator("[data-message-id='q8']").count(), 1);
+  await page.close();
+});
+
 test("千问右侧问题导航重复文本不能覆盖真实问题气泡锚点", async () => {
   assert.ok(browser);
   const page = await browser.newPage();
@@ -751,6 +986,35 @@ test("千问消息 ID 不会把后一题回答错配给前一题", async () => {
   );
   assert.equal(
     await qianwenAnswerFollowsRealQuestionBubble(page, "第二题", "第二题回答"),
+    true
+  );
+  await page.close();
+});
+
+test("千问相同消息 ID 允许问题气泡与任务仅存在标点空格差异", async () => {
+  assert.ok(browser);
+  const page = await browser.newPage();
+  await page.setContent(`
+    <main>
+      <div data-chat-question-wrap="message-format">
+        <div class="message-card-wrap question">
+          <div class="question-text-card">手机或智能手机领域，哪些品牌更值得关注？</div>
+        </div>
+      </div>
+      <div data-chat-answers-wrap="message-format" class="chat-answers-card-wrap">
+        <div class="answer-common-card">
+          <div class="qk-markdown qk-markdown-complete">这是完整回答正文。</div>
+        </div>
+      </div>
+    </main>
+  `);
+
+  assert.equal(
+    await qianwenAnswerFollowsRealQuestionBubble(
+      page,
+      "手机 或 智能手机 领域 哪些品牌更值得关注",
+      "这是完整回答正文"
+    ),
     true
   );
   await page.close();
@@ -1266,6 +1530,37 @@ test("豆包品牌完成后点击新版 sidebar_nav_item 新对话入口", async
   );
   assert.equal(await page.getByText(previousQuestion).count(), 0);
   assert.equal(await page.locator("textarea").isEnabled(), true);
+  await page.close();
+});
+
+test("豆包折叠侧栏点击无文字铅笔图标新建对话", async () => {
+  assert.ok(browser);
+  const page = await browser.newPage();
+  const previousQuestion = "豆包折叠侧栏旧问题";
+  await page.setContent(`
+    <header>
+      <button id="sidebar-toggle"><svg viewBox="0 0 24 24"><path d="M10.416 2.00098C7"></path></svg></button>
+      <button id="icon-new-chat"><svg viewBox="0 0 24 24"><path d="M11 1.99882C11.5522"></path></svg></button>
+    </header>
+    <main id="conversation"><div>${previousQuestion}</div></main>
+    <textarea></textarea>
+    <script>
+      document.querySelector("#sidebar-toggle").addEventListener("click", () => {
+        document.body.dataset.sidebarClicked = "true";
+      });
+      document.querySelector("#icon-new-chat").addEventListener("click", () => {
+        document.body.dataset.newChatClicked = "true";
+        document.querySelector("#conversation").innerHTML = "";
+      });
+    </script>
+  `);
+
+  assert.equal(
+    await openNewConversation(page, PLATFORMS.doubao, previousQuestion, 3_000),
+    true
+  );
+  assert.equal(await page.locator("body").getAttribute("data-new-chat-clicked"), "true");
+  assert.equal(await page.locator("body").getAttribute("data-sidebar-clicked"), null);
   await page.close();
 });
 

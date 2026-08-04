@@ -1,0 +1,2 @@
+# Keep TypeScript source and test files consistent across platforms.
+*.ts text eol=lf

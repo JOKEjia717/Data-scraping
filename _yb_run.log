@@ -1,0 +1,5 @@
+npm notice run ai-reference-crawler@1.0.0 rpa:diagnosis
+npm notice run tsx src/rpaWorkerCli.ts --worker=diagnosis --platforms=yuanbao --max-tasks=1 --run-once=true --dry-run=false
+[RPA] {"workerId":"diagnosis-worker","batchProgress":"WORKER_START: dryRun=false,runOnce=true,maxTasks=1,maxAttempts=3"}
+[RPA] {"workerId":"diagnosis-worker","platformId":"yuanbao","batchProgress":"PLATFORM_ENABLED"}
+[RPA] {"workerId":"diagnosis-worker","batchProgress":"STALE_RECOVERY: candidates=0,recovered=0,locked=0"}
