@@ -311,3 +311,54 @@ test("元宝通过工具菜单开启联网后使用输入栏标志验证", async
     await page.close();
   }
 });
+
+test("元宝 Windows 新版工具按钮可展开菜单并确认联网搜索", async () => {
+  assert.ok(browser);
+  const page = await browser.newPage();
+  try {
+    await page.setContent(`
+      <aside>
+        <input id="sidebar-search" aria-label="搜索" placeholder="搜索" />
+      </aside>
+      <div id="tools" class="ybc-atomSelect-tools-wrapper web-margin">
+        <div class="ybc-atomSelect-tools ybc-atomSelect-tools-lottie-wrapper">
+          <div class="ybc-atomSelect-tools-lottie">工具</div>
+        </div>
+      </div>
+      <div id="menu" role="menu" style="display:none">
+        <div id="web-search" class="ybc-atomSelect-option">联网搜索</div>
+      </div>
+      <div id="selected"></div>
+      <script>
+        document.querySelector("#sidebar-search").addEventListener("click", () => {
+          document.body.dataset.sidebarSearchClicks = "1";
+        });
+        document.querySelector("#tools").addEventListener("click", () => {
+          document.querySelector("#menu").style.display = "block";
+        });
+        document.querySelector("#web-search").addEventListener("click", () => {
+          const item = document.querySelector("#web-search");
+          item.setAttribute("aria-selected", "true");
+          item.className = "ToolMenuItem_selected__windows";
+          document.querySelector("#selected").innerHTML =
+            '<button class="InputTool_selected__windows" aria-pressed="true">联网搜索</button>';
+          document.body.dataset.clickCount = "1";
+        });
+      </script>
+    `);
+    const result = await activateWebSearch(
+      page,
+      PLATFORMS.yuanbao,
+      "REQUIRED"
+    );
+    assert.equal(result.enabled, true);
+    assert.equal(result.verified, true);
+    assert.equal(await clickCount(page), 1);
+    assert.equal(
+      await page.locator("body").getAttribute("data-sidebar-search-clicks"),
+      null
+    );
+  } finally {
+    await page.close();
+  }
+});

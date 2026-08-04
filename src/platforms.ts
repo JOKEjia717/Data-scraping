@@ -269,23 +269,40 @@ export const PLATFORMS: Record<PlatformId, PlatformConfig> = {
     ],
     webSearchButtonSelectors: [
       "li.t-dropdown__item:has-text('联网搜索')",
+      "[role='menuitem']:has-text('联网搜索')",
+      "li:has-text('联网搜索')",
+      "[class*='menu-item']:has-text('联网搜索')",
+      "[class*='menuItem']:has-text('联网搜索')",
+      "button:text-is('联网搜索')",
       "button:has-text('联网搜索')",
-      "button:has-text('搜索')",
-      "button:has-text('深度搜索')",
-      "button:has-text('全网搜索')",
-      "button:has-text('联网')",
       "[role='button']:has-text('联网搜索')",
-      "[role='button']:has-text('搜索')",
+      "div:text-is('联网搜索')",
+      "span:text-is('联网搜索')",
+      "text=\"联网搜索\"",
       "[aria-label*='联网搜索']",
-      "[aria-label*='搜索']",
-      "[title*='联网搜索']",
-      "[title*='搜索']"
+      "[title*='联网搜索']"
     ],
     webSearchMenuTriggerSelectors: [
-      ".ybc-atomSelect-tools-wrapper"
+      ".ybc-atomSelect-tools-wrapper.web-margin",
+      ".ybc-atomSelect-tools-wrapper",
+      "button:has-text('工具')",
+      "[role='button']:has-text('工具')",
+      "[aria-label*='工具']",
+      "[title*='工具']",
+      "[class*='tools']:has-text('工具')",
+      "[class*='Tools']:has-text('工具')"
     ],
     webSearchEnabledIndicatorSelectors: [
-      "span.application-blot-ai-atom:has-text('联网搜索')"
+      "span.application-blot-ai-atom:has-text('联网搜索')",
+      "[aria-pressed='true']:has-text('联网搜索')",
+      "[aria-checked='true']:has-text('联网搜索')",
+      "[aria-selected='true']:has-text('联网搜索')",
+      "[data-state='checked']:has-text('联网搜索')",
+      "[data-state='active']:has-text('联网搜索')",
+      "[class*='selected']:has-text('联网搜索')",
+      "[class*='Selected']:has-text('联网搜索')",
+      "[class*='active']:has-text('联网搜索')",
+      "[class*='Active']:has-text('联网搜索')"
     ],
     webSearchSupported: true,
     deepThinkingControl: {

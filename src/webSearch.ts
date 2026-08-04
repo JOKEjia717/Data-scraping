@@ -134,7 +134,8 @@ async function revealWebSearchMenu(
         .then(() => true)
         .catch(() => false);
       if (clicked) {
-        await page.waitForTimeout(200);
+        // 元宝 Windows 新版菜单带展开动画，200ms 内菜单项可能仍未挂载。
+        await page.waitForTimeout(config.id === "yuanbao" ? 600 : 200);
         return;
       }
     }
@@ -225,7 +226,12 @@ async function readToggleState(locator: Locator): Promise<boolean | null> {
     if (node instanceof HTMLInputElement && node.type === "checkbox") {
       return node.checked;
     }
-    for (const attribute of ["aria-pressed", "aria-checked", "data-checked"]) {
+    for (const attribute of [
+      "aria-pressed",
+      "aria-checked",
+      "aria-selected",
+      "data-checked"
+    ]) {
       const value = node.getAttribute(attribute)?.trim().toLowerCase();
       if (value === "true") return true;
       if (value === "false") return false;
@@ -236,6 +242,17 @@ async function readToggleState(locator: Locator): Promise<boolean | null> {
     }
     if (["unchecked", "off", "inactive", "disabled", "unselected"].includes(state ?? "")) {
       return false;
+    }
+    // 元宝新版菜单项使用 CSS Module 的 selected/active class 表示当前工具状态，
+    // 没有 aria-pressed。先判断否定态，避免 inactive 被 active 子串误判。
+    const className = typeof node.className === "string"
+      ? node.className.toLowerCase()
+      : "";
+    if (/(?:^|[_\-\s])(unselected|inactive|unchecked|disabled)(?:[_\-\s]|$)/.test(className)) {
+      return false;
+    }
+    if (/(?:^|[_\-\s])(selected|active|checked|enabled)(?:[_\-\s]|$)/.test(className)) {
+      return true;
     }
     return null;
   }).catch(() => null);

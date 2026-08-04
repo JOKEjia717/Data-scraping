@@ -12,6 +12,7 @@ import {
   executeQuestion,
   inspectCurrentQuestionAnswer,
   isAnswerGeneratingControlText,
+  qianwenAnswerFollowsRealQuestionBubble,
   shouldCompleteDoubaoAnswer,
   submitQuestion,
   waitForYuanbaoCurrentAnswerComplete
@@ -687,18 +688,29 @@ test("千问右侧问题导航重复文本不能覆盖真实问题气泡锚点",
   const question = "千问第三题测试";
   await page.setContent(`
     <main>
-      <div class="message-card-wrap question">
-        <div class="question-text-card">${question}</div>
+      <div class="message-select-content-inner-QCE5NQ">
+        <div class="chat-question-wrap">
+          <div class="chat-question-card-wrap" data-chat-question-wrap="message-2">
+            <div class="message-card-wrap question" data-mt="text/plain">
+              <div class="question-text-card">${question}</div>
+            </div>
+          </div>
+        </div>
       </div>
-      <div class="chat-answers-card-wrap">
-        <div class="answer-common-card">
-          <div class="qk-markdown qk-markdown-complete">这是第三题的完整回答正文。</div>
+      <div class="message-select-content-inner-QCE5NQ">
+        <div class="chat-answers-card-wrap" data-chat-answers-wrap="message-2">
+          <div class="answer-common-card">
+            <div class="qk-markdown qk-markdown-complete">这是第三题的完整回答正文。</div>
+          </div>
         </div>
       </div>
     </main>
     <aside class="rn-right-navigator">
-      <span class="rn-right-navigator-item-name">${question}</span>
+      <div class="question-text-card">${question}</div>
     </aside>
+    <section class="share-panel">
+      <div class="chat-question-card-wrap">${question}</div>
+    </section>
   `);
 
   const inspection = await inspectCurrentQuestionAnswer(
@@ -709,6 +721,74 @@ test("千问右侧问题导航重复文本不能覆盖真实问题气泡锚点",
   );
   assert.equal(inspection.status, "answered", inspection.reason);
   assert.equal(inspection.answerContent, "这是第三题的完整回答正文。");
+  await page.close();
+});
+
+test("千问消息 ID 不会把后一题回答错配给前一题", async () => {
+  assert.ok(browser);
+  const page = await browser.newPage();
+  await page.setContent(`
+    <main>
+      <div data-chat-question-wrap="message-1">
+        <div class="message-card-wrap question"><div class="question-text-card">第一题</div></div>
+      </div>
+      <div data-chat-answers-wrap="message-1" class="chat-answers-card-wrap">
+        <div class="answer-common-card"><div class="qk-markdown">第一题回答</div></div>
+      </div>
+      <div data-chat-question-wrap="message-2">
+        <div class="message-card-wrap question"><div class="question-text-card">第二题</div></div>
+      </div>
+      <div data-chat-answers-wrap="message-2" class="chat-answers-card-wrap">
+        <div class="answer-common-card"><div class="qk-markdown">第二题回答</div></div>
+      </div>
+    </main>
+    <aside><div class="rn-right-navigator-item-name">第一题</div></aside>
+  `);
+
+  assert.equal(
+    await qianwenAnswerFollowsRealQuestionBubble(page, "第一题", "第二题回答"),
+    null
+  );
+  assert.equal(
+    await qianwenAnswerFollowsRealQuestionBubble(page, "第二题", "第二题回答"),
+    true
+  );
+  await page.close();
+});
+
+test("千问 Windows 流式正文先挂载时等生成结束后再确认回答", async () => {
+  assert.ok(browser);
+  const page = await browser.newPage();
+  const question = "Windows 千问慢速回答测试";
+  await page.setContent(`
+    <main>
+      <div class="message-card-wrap question">${question}</div>
+      <div class="chat-answers-card-wrap">
+        <div class="answer-common-card">
+          <div id="answer" class="qk-markdown">这是已经出现、但仍在流式生成的千问回答。</div>
+        </div>
+      </div>
+      <button id="stop" aria-label="停止生成">停止生成</button>
+    </main>
+    <script>
+      setTimeout(() => {
+        document.querySelector("#answer").classList.add("qk-markdown-complete");
+        document.querySelector("#answer").textContent += " 回答现在已完整结束。";
+        document.querySelector("#stop").remove();
+      }, 1200);
+    </script>
+  `);
+
+  const inspection = await inspectCurrentQuestionAnswer(
+    page,
+    PLATFORMS.qianwen,
+    question,
+    "business"
+  );
+  assert.equal(inspection.status, "answered", inspection.reason);
+  assert.match(inspection.answerContent ?? "", /回答现在已完整结束/);
+  assert.equal(await page.locator("#stop").count(), 0);
+  assert.equal(await page.locator(".message-card-wrap.question").count(), 1);
   await page.close();
 });
 

@@ -687,7 +687,7 @@ export async function inspectCurrentQuestionAnswer(
     return { status: "uncertain", reason: "平台页面已关闭，无法确认发送后的回答" };
   }
   // 先核对问题锚点。页面不是本批次时立即返回，避免为了一个无关历史回答额外
-  // 等待最长 10 秒的正文挂载窗口。
+  // 等待正文挂载窗口（千问最长 30 秒，其他平台 10 秒）。
   const bodyText = await page.locator("body").innerText({ timeout: 3_000 }).catch(() => "");
   const body = normalizeInspectionText(bodyText);
   const question = normalizeInspectionText(submittedQuestion);
@@ -697,12 +697,14 @@ export async function inspectCurrentQuestionAnswer(
   }
   // 回答节点可能在上面的正文快照之后才完成挂载。先等最新回答稳定，再重新读取
   // 生成状态和正文；不能用回答挂载前的旧快照做题目/回答对应校验。
-  const answerContent = await captureLatestPlatformAnswerWithRetries(
+  const settled = await captureSettledPlatformAnswerForInspection(
     page,
     config.id,
-    config.name
-  ).catch(() => "");
-  const busy = await isAnswerGenerating(page).catch(() => true);
+    config.name,
+    submittedQuestion
+  );
+  const answerContent = settled.answerContent;
+  const busy = settled.busy;
   const answer = normalizeInspectionText(answerContent);
   if (busy) {
     return { status: "uncertain", reason: "当前页面仍显示回答生成中" };
@@ -723,9 +725,6 @@ export async function inspectCurrentQuestionAnswer(
       submittedQuestion,
       answerProbe
     );
-    if (qianwenOrder === false) {
-      return { status: "uncertain", reason: "最新回答正文无法与千问真实问题气泡对应" };
-    }
     if (qianwenOrder === true) {
       return {
         status: "answered",
@@ -1154,6 +1153,67 @@ export async function captureLatestPlatformAnswerWithRetries(
   return "";
 }
 
+/**
+ * 发送后恢复不能在千问流式正文刚出现时就停止检查。Windows
+ * 页面上正文节点会先挂载，“停止生成/终止任务”控件稍后才消失。
+ * 这里只读页面，保留最新非空正文，直到确认生成结束；绝不点击发送或重新生成。
+ */
+async function captureSettledPlatformAnswerForInspection(
+  page: Page,
+  platformId: PlatformConfig["id"],
+  platformName: string,
+  submittedQuestion: string
+): Promise<{ answerContent: string; busy: boolean }> {
+  const timeoutMs = platformId === "qianwen" ? 30_000 : 10_000;
+  const deadline = Date.now() + timeoutMs;
+  let answerContent = "";
+  let busy = true;
+  let attempt = 0;
+
+  while (Date.now() < deadline) {
+    attempt += 1;
+    const [candidate, currentBusy] = await Promise.all([
+      extractLatestPlatformAnswer(page, platformId).catch((error) => {
+        console.log(`[${platformName}] 发送后第 ${attempt} 次读取回答正文异常：${formatError(error)}`);
+        return "";
+      }),
+      isAnswerGenerating(page).catch(() => true)
+    ]);
+    if (candidate.trim()) answerContent = candidate;
+    busy = currentBusy;
+    let matchesCurrentQuestion = platformId !== "qianwen";
+    if (platformId === "qianwen" && answerContent.trim()) {
+      const normalizedQuestion = normalizeInspectionText(submittedQuestion);
+      const answerProbe = normalizeInspectionText(answerContent).slice(0, 80);
+      const structuredOrder = await qianwenAnswerFollowsRealQuestionBubble(
+        page,
+        submittedQuestion,
+        answerProbe
+      );
+      if (structuredOrder === true) {
+        matchesCurrentQuestion = true;
+      } else {
+        // 旧版千问没有稳定气泡 class 时使用保守文本顺序兼容：必须是
+        // 最后一次当前问题之后出现当前回答片段，才不会把上一题误认为本题。
+        const currentBody = normalizeInspectionText(
+          await page.locator("body").innerText({ timeout: 3_000 }).catch(() => "")
+        );
+        const questionIndex = normalizedQuestion
+          ? currentBody.lastIndexOf(normalizedQuestion)
+          : -1;
+        matchesCurrentQuestion = questionIndex >= 0 &&
+          currentBody.slice(questionIndex + normalizedQuestion.length).includes(answerProbe);
+      }
+    }
+    // 千问长对话中“最新非空正文”可能仍是上一题。只有正文已经和
+    // 当前真实问题气泡对应，且生成控件已消失，才能提前结束恢复等待。
+    if (answerContent.trim() && !busy && matchesCurrentQuestion) break;
+    await page.waitForTimeout(250);
+  }
+
+  return { answerContent, busy };
+}
+
 /** 将未知异常转换为适合终端日志的一行文本。 */
 function formatError(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
@@ -1164,11 +1224,12 @@ function normalizeInspectionText(value: string): string {
 }
 
 /**
- * 千问右侧问题导航会复制当前问题并放在全部回答之后，不能用 body.lastIndexOf
- * 判断题目与回答顺序。这里只认聊天流内的真实问题气泡，并要求最新回答节点位于
- * 该气泡之后；返回 null 表示旧版 DOM 没有稳定气泡，可交给兼容路径判断。
+ * 千问右侧导航和分享面板可能复制同一问题，并放在真实回答之后。
+ * 因此不能直接取 questionBubbles 的最后一个；应当从已提取到的回答反向确认，
+ * 只要存在一个文本匹配且位于该回答之前的问题气泡即可。无法证明时返回 null，
+ * 交给保守兼容路径，不把重复副本当成明确不匹配。
  */
-async function qianwenAnswerFollowsRealQuestionBubble(
+export async function qianwenAnswerFollowsRealQuestionBubble(
   page: Page,
   submittedQuestion: string,
   answerProbe: string
@@ -1181,25 +1242,53 @@ async function qianwenAnswerFollowsRealQuestionBubble(
       const normalizedProbe = (probe || "").replace(/\s+/g, " ").trim();
       const questionBubbles = Array.from(document.querySelectorAll(
         ".message-card-wrap.question, .question-text-card, .chat-question-card-wrap"
-      )).filter((element) =>
-        (element.textContent || "").replace(/\s+/g, " ").trim() === expectedQuestion
-      );
-      const questionBubble = questionBubbles[questionBubbles.length - 1];
-      if (!questionBubble) return null;
-
+      ));
       const answers = Array.from(document.querySelectorAll(
         ".message-select-wrapper-answer-rqWekn .qk-markdown, " +
         ".chat-answers-card-wrap .answer-common-card .qk-markdown, " +
         ".chat-answers-card-wrap .qk-markdown.qk-markdown-complete"
-      )).filter((element) =>
-        Boolean(questionBubble.compareDocumentPosition(element) & Node.DOCUMENT_POSITION_FOLLOWING)
-      );
-      const latestAnswer = answers[answers.length - 1];
-      if (!latestAnswer || !normalizedProbe) return false;
-      const latestText = (
-        latestAnswer instanceof HTMLElement ? latestAnswer.innerText : latestAnswer.textContent || ""
-      ).replace(/\s+/g, " ").trim();
-      return latestText.includes(normalizedProbe);
+      ));
+      if (questionBubbles.length === 0 || answers.length === 0 || !normalizedProbe) return null;
+
+      for (let answerIndex = answers.length - 1; answerIndex >= 0; answerIndex -= 1) {
+        const answer = answers[answerIndex];
+        const answerText = (
+          answer instanceof HTMLElement ? answer.innerText : answer.textContent || ""
+        ).replace(/\s+/g, " ").trim();
+        if (!answerText.includes(normalizedProbe)) continue;
+
+        // 2026-08 千问 Windows 页面会用同一个消息 ID 配对问题与回答：
+        // data-chat-question-wrap="..." <-> data-chat-answers-wrap="..."。
+        // 右侧导航和分享副本不带这个 ID，因此它们无法覆盖真实气泡。
+        const answerWrap = answer.closest("[data-chat-answers-wrap]");
+        const answerMessageId = answerWrap?.getAttribute("data-chat-answers-wrap")?.trim();
+        if (answerMessageId) {
+          const questionWrap = Array.from(document.querySelectorAll("[data-chat-question-wrap]"))
+            .find((element) =>
+              element.getAttribute("data-chat-question-wrap")?.trim() === answerMessageId
+            );
+          const pairedQuestion = questionWrap?.querySelector(
+            ".message-card-wrap.question .question-text-card, .question-text-card"
+          );
+          const pairedQuestionText = (pairedQuestion?.textContent || "")
+            .replace(/\s+/g, " ")
+            .trim();
+          if (pairedQuestionText) return pairedQuestionText === expectedQuestion ? true : null;
+        }
+
+        // 旧版 DOM 没有配对 ID 时，选择回答之前 DOM 顺序最靠后的问题气泡。
+        // 不能只判断“某个同文问题在回答之前”，否则会把后一题回答错配给前一题。
+        const precedingQuestions = questionBubbles.filter((questionBubble) =>
+          Boolean(questionBubble.compareDocumentPosition(answer) & Node.DOCUMENT_POSITION_FOLLOWING)
+        );
+        const nearestQuestion = precedingQuestions[precedingQuestions.length - 1];
+        if (!nearestQuestion) continue;
+        const nearestQuestionText = (nearestQuestion.textContent || "")
+          .replace(/\s+/g, " ")
+          .trim();
+        if (nearestQuestionText === expectedQuestion) return true;
+      }
+      return null;
     },
     { question: submittedQuestion, probe: answerProbe }
   );
