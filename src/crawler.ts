@@ -196,6 +196,32 @@ const REFERENCE_CHECK_INTERVAL_MS = 1_500;
 // 保留原调试调用点，但统一由 AsyncLocalStorage 决定 research 输出或 business 抑制。
 const console = { log: privacyDebugLog };
 
+export interface DoubaoAnswerCompletionSignals {
+  sawAnswerStart: boolean;
+  currentReferenceEntry: boolean;
+  busy: boolean;
+  referenceReadyForMs: number;
+  elapsedMs: number;
+  referenceReadyStableMs?: number;
+  minimumWaitMs?: number;
+}
+
+/**
+ * 豆包的当前题引用入口是问题级信号；入口持续存在且生成已停止后即可进入引用
+ * 提取。不要再依赖整个 body 的稳定时间，因为侧栏、搜索卡片等无关区域会持续
+ * 更新，可能让已经完成的回答一直等到超时。
+ */
+export function shouldCompleteDoubaoAnswer(
+  signals: DoubaoAnswerCompletionSignals
+): boolean {
+  return signals.sawAnswerStart &&
+    signals.currentReferenceEntry &&
+    !signals.busy &&
+    signals.referenceReadyForMs >=
+      (signals.referenceReadyStableMs ?? DOUBAO_REFERENCE_READY_STABLE_MS) &&
+    signals.elapsedMs >= (signals.minimumWaitMs ?? 15_000);
+}
+
 /**
  * 抓取单个平台的全部批次。research 保留原整轮会话和引用恢复策略；business
  * 严格按“租户 + 业务任务 + 品牌”隔离对话，批内问题连续执行。
@@ -1685,16 +1711,18 @@ async function waitForTrackedAnswerComplete(
     const doubaoReferenceReadyFor = doubaoReferenceReadySince > 0
       ? Date.now() - doubaoReferenceReadySince
       : 0;
-    // 豆包的搜索入口属于当前回答且正文已短暂稳定时即可放行。这个信号不依赖
-    // 搜索块总数递增，可兼容长会话回收旧 DOM、复用搜索块数量的情况。
+    // 豆包的搜索入口属于当前回答；入口持续存在且生成已停止后即可放行。整页
+    // body 可能因侧栏和搜索卡片持续变化，不能继续作为这一专属路径的必要条件。
     if (
       platformId === "doubao" &&
-      sawAnswerStart &&
-      currentDoubaoHasReferences &&
-      !busy &&
-      stableFor >= DOUBAO_REFERENCE_READY_STABLE_MS &&
-      doubaoReferenceReadyFor >= DOUBAO_REFERENCE_READY_STABLE_MS &&
-      elapsed >= minWaitMs
+      shouldCompleteDoubaoAnswer({
+        sawAnswerStart,
+        currentReferenceEntry: currentDoubaoHasReferences,
+        busy,
+        referenceReadyForMs: doubaoReferenceReadyFor,
+        elapsedMs: elapsed,
+        minimumWaitMs: minWaitMs
+      })
     ) return;
     if (sawAnswerStart && !busy && stableFor >= stableWindowMs && elapsed >= minWaitMs) return;
 

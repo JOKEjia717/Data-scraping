@@ -54,7 +54,9 @@ RPA_MONITOR_DRY_RUN=true
 
 ### 2. 启动两个独立 Chrome
 
-分别在两个终端执行：
+两个 Chrome 必须使用不同的调试端口和 Profile 目录。分别在两个终端中执行以下命令。
+
+macOS：
 
 ```bash
 "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
@@ -67,6 +69,25 @@ RPA_MONITOR_DRY_RUN=true
   --remote-debugging-port=9223 \
   --user-data-dir=/Users/joke/Desktop/爬虫/.chrome-profiles/monitor
 ```
+
+Windows PowerShell（先进入项目根目录）：
+
+```powershell
+& "$env:ProgramFiles\Google\Chrome\Application\chrome.exe" `
+  --remote-debugging-port=9222 `
+  "--user-data-dir=$PWD\.chrome-profiles\diagnosis"
+```
+
+```powershell
+& "$env:ProgramFiles\Google\Chrome\Application\chrome.exe" `
+  --remote-debugging-port=9223 `
+  "--user-data-dir=$PWD\.chrome-profiles\monitor"
+```
+
+如果 Windows 上的 Chrome 不在默认安装位置，请将命令中的
+`$env:ProgramFiles\Google\Chrome\Application\chrome.exe` 替换为实际的 `chrome.exe`
+路径；按当前 Windows 用户安装时，常见路径为
+`$env:LOCALAPPDATA\Google\Chrome\Application\chrome.exe`。
 
 在两个 Chrome 中分别打开豆包、DeepSeek、千问、元宝并完成登录。9222 专用于品牌诊断，
 9223 专用于文章监测，两个窗口不能共用 Profile。

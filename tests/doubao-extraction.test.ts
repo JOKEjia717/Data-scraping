@@ -12,6 +12,7 @@ import {
   executeQuestion,
   inspectCurrentQuestionAnswer,
   isAnswerGeneratingControlText,
+  shouldCompleteDoubaoAnswer,
   submitQuestion,
   waitForYuanbaoCurrentAnswerComplete
 } from "../src/crawler.js";
@@ -38,6 +39,30 @@ import {
 import { PLATFORMS } from "../src/platforms.js";
 
 let browser: Browser | undefined;
+
+test("豆包本题引用入口稳定后不再被整页动态内容阻塞", () => {
+  assert.equal(shouldCompleteDoubaoAnswer({
+    sawAnswerStart: true,
+    currentReferenceEntry: true,
+    busy: false,
+    referenceReadyForMs: 4_000,
+    elapsedMs: 15_000
+  }), true);
+  assert.equal(shouldCompleteDoubaoAnswer({
+    sawAnswerStart: true,
+    currentReferenceEntry: true,
+    busy: true,
+    referenceReadyForMs: 60_000,
+    elapsedMs: 60_000
+  }), false);
+  assert.equal(shouldCompleteDoubaoAnswer({
+    sawAnswerStart: true,
+    currentReferenceEntry: false,
+    busy: false,
+    referenceReadyForMs: 60_000,
+    elapsedMs: 60_000
+  }), false);
+});
 
 test("千问回答重复循环检测能识别崩坏正文且不误判正常长回答", () => {
   const repeatedLines = [
