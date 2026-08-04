@@ -56,6 +56,7 @@ import type {
 import type { RpaCollectionResult } from "./rpaResultRepository.js";
 import {
   webSearchPolicyForBusinessType,
+  confirmWebSearchFromAnswerEvidence,
   type WebSearchActivationResult
 } from "./webSearch.js";
 import {
@@ -755,6 +756,7 @@ async function executeClaimedBatches(input: ExecuteClaimedInput): Promise<void> 
   const conversationManagers = new Map<PlatformId, ConversationManager>();
   const batchPlatformLeases = new Map<string, string>();
   const lastQuestion = new Map<PlatformId, string>();
+  const resumedCurrentAnswerBatches = new Set<string>();
   const heartbeat = new ExecutionHeartbeat(input.stateRepository, [...owned], {
     intervalMs: config.heartbeatIntervalMs,
     onError: (error) => rpaConsoleError({
@@ -794,14 +796,42 @@ async function executeClaimedBatches(input: ExecuteClaimedInput): Promise<void> 
         if (!acquired) throw new PlatformLeaseUnavailableError(batch.platformId);
         batchPlatformLeases.set(batch.id, lockName);
         const task = requireTask(taskById, batch.tasks[0]?.id);
-        await conversationManagers.get(batch.platformId)!.startBatch({
+        const context = {
           batchId: batch.id,
           tenantId: task.tenantKey,
           brandId: task.brandId,
           businessTaskId: task.businessTaskId,
           businessGroupId: task.businessGroupId,
           platformId: batch.platformId
-        }, lastQuestion.get(batch.platformId) ?? "");
+        };
+        const page = requirePage(input.pages, batch.platformId);
+        const manager = conversationManagers.get(batch.platformId)!;
+        // 只有页面上的持久化业务归属标记与本批次完全一致，且当前第一题已有完整回答，
+        // 才接管中断会话。仅凭问题文本相同不足以跨进程恢复，避免跨品牌误复用。
+        const ownerMatches = await currentPageMatchesConversationOwner(page, context);
+        const inspection = ownerMatches
+          ? await inspectCurrentQuestionAnswer(
+            page,
+            PLATFORMS[batch.platformId],
+            task.keyword,
+            "business"
+          ).catch(() => ({ status: "uncertain" as const }))
+          : { status: "uncertain" as const };
+        if (inspection.status === "answered") {
+          manager.resumeVerifiedBatch(context);
+          resumedCurrentAnswerBatches.add(batch.id);
+          rpaConsoleInfo({
+            workerId: config.workerId,
+            event: "BATCH_CONVERSATION_RESUMED",
+            executionId: task.executionId,
+            brandId: task.brandId,
+            platformId: batch.platformId,
+            batchProgress: "existing-answer"
+          });
+          return;
+        }
+        await manager.startBatch(context, lastQuestion.get(batch.platformId) ?? "");
+        await storeConversationOwner(page, context);
       },
       async onBatchComplete(batch) {
         input.metrics.observeBrandBatchDuration(
@@ -809,7 +839,16 @@ async function executeClaimedBatches(input: ExecuteClaimedInput): Promise<void> 
           Math.max(0, Date.now() - (batch.startedAt ?? Date.now())),
           "completed"
         );
-        conversationManagers.get(batch.platformId)!.finishBatch(batch.id, "completed");
+        const manager = conversationManagers.get(batch.platformId)!;
+        manager.finishBatch(batch.id, "completed");
+        await clearConversationOwner(requirePage(input.pages, batch.platformId));
+        const opened = await manager.resetToBlank(lastQuestion.get(batch.platformId) ?? "");
+        if (!opened) {
+          throw Object.assign(
+            new Error(`${PLATFORMS[batch.platformId].name} 完成品牌批次后无法创建新对话。`),
+            { errorCode: "NEW_CONVERSATION_FAILED" }
+          );
+        }
         await releasePlatformLeaseAfterInterval(input, batch, batchPlatformLeases);
       },
       async onBatchFailed(batch, error) {
@@ -1005,6 +1044,27 @@ async function executeClaimedBatches(input: ExecuteClaimedInput): Promise<void> 
       let collected: Awaited<ReturnType<typeof executeQuestion>>;
       try {
         if (preflightError) throw preflightError;
+        if (resumedCurrentAnswerBatches.has(context.batch.id) && context.taskIndex === 0) {
+          submissionState = "submitted";
+          const recovered = await recoverSubmittedQuestionResult(
+            page,
+            PLATFORMS[context.platformId],
+            task.keyword,
+            webSearchState
+          );
+          const recoveredWebSearch = recovered.references.length > 0
+            ? confirmWebSearchFromAnswerEvidence(webSearchState)
+            : webSearchState;
+          return await finalizeSuccessfulAnswer(
+            recovered.answerContent,
+            recovered.references,
+            task.keyword,
+            task.failCount,
+            actualDeepThinking,
+            recoveredWebSearch,
+            recovered.referenceStatus
+          );
+        }
         collected = await executeQuestion({
           questionIndex: context.taskIndex,
           question: task.keyword
@@ -1042,27 +1102,34 @@ async function executeClaimedBatches(input: ExecuteClaimedInput): Promise<void> 
         if (reconnectable) {
           input.invalidateBrowserRuntime();
         }
-        if (reconnectable && submissionState !== "not_submitted") {
+        if (submissionState !== "not_submitted") {
           try {
-            const recoveredPage = await input.recoverPlatformPage(context.platformId);
-            input.pages[context.platformId] = recoveredPage;
-            manager.rebindOperations(conversationPageOperations(
-              recoveredPage,
-              PLATFORMS[context.platformId]
-            ));
+            const recoveredPage = reconnectable
+              ? await input.recoverPlatformPage(context.platformId)
+              : page;
+            if (reconnectable) {
+              input.pages[context.platformId] = recoveredPage;
+              manager.rebindOperations(conversationPageOperations(
+                recoveredPage,
+                PLATFORMS[context.platformId]
+              ));
+            }
             const recovered = await recoverSubmittedQuestionResult(
               recoveredPage,
               PLATFORMS[context.platformId],
               task.keyword,
               webSearchState
             );
+            const recoveredWebSearch = recovered.references.length > 0
+              ? confirmWebSearchFromAnswerEvidence(webSearchState)
+              : webSearchState;
             return await finalizeSuccessfulAnswer(
               recovered.answerContent,
               recovered.references,
               task.keyword,
               task.failCount,
               actualDeepThinking,
-              webSearchState,
+              recoveredWebSearch,
               recovered.referenceStatus
             );
           } catch (recoveryError) {
@@ -1437,6 +1504,58 @@ async function refreshWorkerMetrics(
   for (const [platformId, health] of session.platformHealth) {
     session.metrics.setPlatformHealth(platformId, health.status);
   }
+}
+
+const CONVERSATION_OWNER_STORAGE_KEY = "geno-rpa:conversation-owner:v1";
+
+interface ConversationOwnerContext {
+  batchId: string;
+  tenantId: string;
+  brandId: string;
+  businessTaskId: string;
+  businessGroupId: string;
+  platformId: PlatformId;
+}
+
+/** 在平台标签页的 sessionStorage 保存低敏感度归属，供同一标签页进程恢复使用。 */
+async function storeConversationOwner(
+  page: Page,
+  context: ConversationOwnerContext
+): Promise<void> {
+  await page.evaluate(({ key, owner }) => {
+    sessionStorage.setItem(key, JSON.stringify(owner));
+  }, { key: CONVERSATION_OWNER_STORAGE_KEY, owner: context });
+}
+
+/**
+ * 必须由租户、品牌、业务任务、业务分组和平台共同确认。batchId 是内存调度序号，
+ * 进程重启后会重新生成，不能作为跨进程恢复身份；解析失败或跨域则拒绝恢复。
+ */
+async function currentPageMatchesConversationOwner(
+  page: Page,
+  context: ConversationOwnerContext
+): Promise<boolean> {
+  return page.evaluate(({ key, expected }) => {
+    const raw = sessionStorage.getItem(key);
+    if (!raw) return false;
+    try {
+      const actual = JSON.parse(raw) as Record<string, unknown>;
+      return [
+        "tenantId",
+        "brandId",
+        "businessTaskId",
+        "businessGroupId",
+        "platformId"
+      ].every((field) => actual[field] === expected[field as keyof typeof expected]);
+    } catch {
+      return false;
+    }
+  }, { key: CONVERSATION_OWNER_STORAGE_KEY, expected: context }).catch(() => false);
+}
+
+async function clearConversationOwner(page: Page): Promise<void> {
+  await page.evaluate((key) => sessionStorage.removeItem(key), CONVERSATION_OWNER_STORAGE_KEY)
+    .catch(() => undefined);
 }
 
 function batchIdentity(task: CollectionTask): string {

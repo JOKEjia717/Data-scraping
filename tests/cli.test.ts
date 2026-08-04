@@ -47,7 +47,7 @@ test("执行模式默认保持 research，并支持显式 business", async () =>
   assert.equal(research.mode, "research");
   assert.equal(research.retryOnNoReferences, true);
   assert.equal(research.regenerateOnNoReferences, true);
-  assert.equal(research.deepThinking, undefined);
+  assert.equal(research.deepThinking, false);
   assert.equal(business.mode, "business");
   assert.equal(business.promptPrefix, "");
   assert.equal(business.retryOnNoReferences, false);
@@ -65,16 +65,16 @@ test("research 默认保留详细日志且可显式关闭，business 始终关�
   assert.equal(business.verbose, false);
 });
 
-test("research 只有显式配置时才设置深度思考，并校验不支持策略", async () => {
+test("所有平台默认关闭深度思考，仍可显式开启并校验不支持策略", async () => {
   const defaults = await parseCli([]);
   const configured = await parseCli([
-    "--deep-thinking=false",
+    "--deep-thinking=true",
     "--deep-thinking-unsupported-policy=allow_degrade"
   ]);
 
-  assert.equal(defaults.deepThinking, undefined);
+  assert.equal(defaults.deepThinking, false);
   assert.equal(defaults.deepThinkingUnsupportedPolicy, "fail");
-  assert.equal(configured.deepThinking, false);
+  assert.equal(configured.deepThinking, true);
   assert.equal(configured.deepThinkingUnsupportedPolicy, "allow_degrade");
   await assert.rejects(
     () => parseCli(["--deep-thinking=maybe"]),

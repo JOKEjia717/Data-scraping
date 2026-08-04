@@ -40,9 +40,8 @@ export async function parseCli(argv: string[]): Promise<CliOptions> {
     regenerateOnNoReferences: modeDefaults.regenerateOnNoReferences,
     resolveTitles: args.get("resolve-titles") !== "false",
     timeoutMs: Number(args.get("timeout-ms") || 300_000),
-    ...(args.has("deep-thinking")
-      ? { deepThinking: parseBoolean(args.get("deep-thinking")!, "deep-thinking") }
-      : {}),
+    // 四个平台默认关闭深度思考；仍允许通过 CLI 为特定运行显式开启。
+    deepThinking: parseBoolean(args.get("deep-thinking") ?? "false", "deep-thinking"),
     deepThinkingUnsupportedPolicy: parseDeepThinkingUnsupportedPolicy(
       args.get("deep-thinking-unsupported-policy")
     ),

@@ -6,8 +6,13 @@ import assert from "node:assert/strict";
 import { after, before, test } from "node:test";
 import { chromium, type Browser } from "playwright";
 import {
+  captureLatestPlatformAnswerWithRetries,
+  closeQianwenReferencePanel,
   detectQianwenAnswerLoop,
   executeQuestion,
+  inspectCurrentQuestionAnswer,
+  isAnswerGeneratingControlText,
+  submitQuestion,
   waitForYuanbaoCurrentAnswerComplete
 } from "../src/crawler.js";
 import { openNewConversation } from "../src/conversationManager.js";
@@ -55,6 +60,13 @@ test("千问回答重复循环检测能识别崩坏正文且不误判正常长�
   assert.equal(detectQianwenAnswerLoop(normalAnswer).detected, false);
 });
 
+test("千问深度研究的终止任务提示必须视为仍在生成", () => {
+  assert.equal(isAnswerGeneratingControlText("终止任务"), true);
+  assert.equal(isAnswerGeneratingControlText("终止研究"), true);
+  assert.equal(isAnswerGeneratingControlText("停止生成"), true);
+  assert.equal(isAnswerGeneratingControlText("回答已完成"), false);
+});
+
 // 所有用例复用同一个浏览器进程，每个用例创建独立页面避免 DOM 状态互相污染。
 before(async () => {
   browser = await chromium.launch({ channel: "chrome", headless: true });
@@ -89,6 +101,32 @@ test("千问 Apple 语义发送按钮与 Windows class 发送按钮都可定位"
 
   assert.equal(await matchesSelector("qianwen-apple-send"), true);
   assert.equal(await matchesSelector("qianwen-windows-send"), true);
+  await page.close();
+});
+
+test("并行新建对话时输入框持续动画也能直接填充并发送", async () => {
+  assert.ok(browser);
+  const page = await browser.newPage();
+  await page.setContent(`
+    <style>
+      @keyframes moving-input { from { transform: translateX(0); } to { transform: translateX(20px); } }
+      textarea { animation: moving-input 300ms linear infinite alternate; }
+    </style>
+    <textarea placeholder="给 DeepSeek 发送消息"></textarea>
+    <button aria-label="发送" type="button">发送</button>
+    <script>
+      document.querySelector("button").addEventListener("click", () => {
+        document.body.dataset.submitted = document.querySelector("textarea").value;
+      });
+    </script>
+  `);
+
+  await submitQuestion(page, PLATFORMS.deepseek, "四平台并行输入稳定性测试");
+
+  assert.equal(
+    await page.locator("body").getAttribute("data-submitted"),
+    "四平台并行输入稳定性测试"
+  );
   await page.close();
 });
 
@@ -433,6 +471,28 @@ test("豆包问题气泡被回收时通过提问前元素身份识别当前引�
   await page.close();
 });
 
+test("豆包首题导航到新会话丢失页面基线后按正文问题锚点识别引用", async () => {
+  assert.ok(browser);
+  const page = await browser.newPage();
+  const question = "测试当前问题";
+  const searchBlock = "block_type:10025 | search_query_result_block.search_type:1";
+
+  // 用拆分文本模拟富文本问题气泡：TreeWalker 没有完整问题文本节点；同时不调用
+  // markDoubaoSearchResultBaseline，模拟首题导航后新 document 丢失 WeakSet。
+  await page.setContent(`
+    <main>
+      <div class="question"><span>测试当前</span><span>问题</span></div>
+      <div data-plugin-identifier="${searchBlock}">
+        <div class="cursor-pointer">搜索 4 个关键词，参考 22 篇资料</div>
+      </div>
+    </main>
+  `);
+
+  assert.equal(await countDoubaoSearchResultBlocks(page), 1);
+  assert.equal(await hasCurrentDoubaoReferenceEntry(page, question, 1), true);
+  await page.close();
+});
+
 test("豆包只提取最后一次生成的正文块并排除搜索、视频和操作按钮", async () => {
   assert.ok(browser);
   const page = await browser.newPage();
@@ -554,6 +614,109 @@ test("DeepSeek、千问和元宝只提取最后一版回答正文并清理非正
     await extractLatestPlatformAnswer(page, "yuanbao"),
     "元宝最终回答\n正文内容。"
   );
+  await page.close();
+});
+
+test("千问新版 complete 回答节点延迟挂载时只等待恢复而不重新提问", async () => {
+  assert.ok(browser);
+  const page = await browser.newPage();
+  await page.setContent(`
+    <main id="chat">
+      <div class="user-question">测试问题</div>
+    </main>
+    <script>
+      setTimeout(() => {
+        document.querySelector("#chat").insertAdjacentHTML("beforeend", ` + "`" + `
+          <div class="chat-answers-card-wrap">
+            <div class="answer-common-card undefined">
+              <div class="qk-markdown qk-markdown-react qk-markdown-complete">
+                <div class="qk-md-paragraph">这是延迟挂载的千问完整回答。</div>
+              </div>
+            </div>
+          </div>
+        ` + "`" + `);
+      }, 1500);
+    </script>
+  `);
+
+  // 在回答节点出现前就开始检查，覆盖“题目快照先读取、回答随后挂载”的真实竞态。
+  const inspection = await inspectCurrentQuestionAnswer(
+    page,
+    PLATFORMS.qianwen,
+    "测试问题",
+    "business"
+  );
+  assert.equal(inspection.status, "answered", inspection.reason);
+  assert.equal(inspection.answerContent, "这是延迟挂载的千问完整回答。");
+  assert.equal(
+    await page.locator(".user-question").count(),
+    1,
+    "只读恢复不能重新插入或发送问题"
+  );
+  await page.close();
+});
+
+test("千问右侧问题导航重复文本不能覆盖真实问题气泡锚点", async () => {
+  assert.ok(browser);
+  const page = await browser.newPage();
+  const question = "千问第三题测试";
+  await page.setContent(`
+    <main>
+      <div class="message-card-wrap question">
+        <div class="question-text-card">${question}</div>
+      </div>
+      <div class="chat-answers-card-wrap">
+        <div class="answer-common-card">
+          <div class="qk-markdown qk-markdown-complete">这是第三题的完整回答正文。</div>
+        </div>
+      </div>
+    </main>
+    <aside class="rn-right-navigator">
+      <span class="rn-right-navigator-item-name">${question}</span>
+    </aside>
+  `);
+
+  const inspection = await inspectCurrentQuestionAnswer(
+    page,
+    PLATFORMS.qianwen,
+    question,
+    "business"
+  );
+  assert.equal(inspection.status, "answered", inspection.reason);
+  assert.equal(inspection.answerContent, "这是第三题的完整回答正文。");
+  await page.close();
+});
+
+test("千问每题结束后关闭参考来源侧栏且不触碰发送按钮", async () => {
+  assert.ok(browser);
+  const page = await browser.newPage();
+  await page.setContent(`
+    <main>
+      <button id="send">发送</button>
+      <aside id="reference-panel">
+        <div class="deep-think-source-tyxrYL">
+          <div class="header-imUI9F">
+            <div>参考来源 (2)</div>
+            <div id="close-reference"><svg><path></path></svg></div>
+          </div>
+          <div class="list-XPxyL2"><div>引用一</div><div>引用二</div></div>
+        </div>
+      </aside>
+    </main>
+    <script>
+      document.querySelector("#close-reference").addEventListener("click", () => {
+        document.querySelector("#reference-panel").style.display = "none";
+      });
+      document.querySelector("#send").addEventListener("click", () => {
+        document.body.dataset.sent = "true";
+      });
+    </script>
+  `);
+
+  await closeQianwenReferencePanel(page);
+
+  assert.equal(await page.locator(".list-XPxyL2:visible").count(), 0);
+  assert.equal(await page.locator("body").getAttribute("data-sent"), null);
   await page.close();
 });
 
@@ -954,19 +1117,164 @@ test("一轮问题结束后点击新建对话并等待空白输入界面", async
   await page.close();
 });
 
-test("已经处于空白聊天页时可直接作为首个品牌批次的独立对话", async () => {
+test("豆包品牌完成后点击新版 sidebar_nav_item 新对话入口", async () => {
+  assert.ok(browser);
+  const page = await browser.newPage();
+  const previousQuestion = "古装宫廷剧主要参与品牌";
+
+  await page.setContent(`
+    <aside>
+      <div
+        class="group/sidebar_nav_item cursor-pointer flex items-center px-8 rounded-dbx-lg h-36 nav-link-IKier0"
+        style="width:254px;height:36px"
+      >
+        <svg width="24" height="24"></svg>
+        <div>新对话</div>
+      </div>
+    </aside>
+    <main id="conversation">
+      <div data-container-type="block-v2">
+        <div>${previousQuestion}</div>
+        <div data-plugin-identifier="block_type:10000">上一品牌回答</div>
+      </div>
+    </main>
+    <textarea aria-label="聊天输入框"></textarea>
+    <script>
+      document.querySelector("[class*='sidebar_nav_item']").addEventListener("click", () => {
+        document.body.dataset.doubaoNewConversation = "true";
+        document.querySelector("#conversation").innerHTML = "";
+      });
+    </script>
+  `);
+
+  const opened = await openNewConversation(
+    page,
+    PLATFORMS.doubao,
+    previousQuestion,
+    3_000
+  );
+
+  assert.equal(opened, true);
+  assert.equal(
+    await page.locator("body").getAttribute("data-doubao-new-conversation"),
+    "true"
+  );
+  assert.equal(await page.getByText(previousQuestion).count(), 0);
+  assert.equal(await page.locator("textarea").isEnabled(), true);
+  await page.close();
+});
+
+test("DeepSeek 品牌完成后点击新版开启新对话 DIV", async () => {
+  assert.ok(browser);
+  const page = await browser.newPage();
+  const previousQuestion = "古装宫廷剧品牌盘点";
+
+  await page.setContent(`
+    <aside>
+      <div class="_5a8ac7a" tabindex="0" style="width:236px;height:40px">
+        <div class="ds-icon_1c42ad7"></div>
+        <span>开启新对话</span>
+      </div>
+    </aside>
+    <main id="conversation">
+      <div class="ds-message">${previousQuestion}</div>
+      <div class="ds-markdown ds-assistant-message-main-content">上一品牌回答</div>
+    </main>
+    <textarea aria-label="给 DeepSeek 发送消息"></textarea>
+    <script>
+      document.querySelector("._5a8ac7a").addEventListener("click", () => {
+        document.body.dataset.deepseekNewConversation = "true";
+        document.querySelector("#conversation").innerHTML = "";
+      });
+    </script>
+  `);
+
+  const opened = await openNewConversation(
+    page,
+    PLATFORMS.deepseek,
+    previousQuestion,
+    3_000
+  );
+
+  assert.equal(opened, true);
+  assert.equal(
+    await page.locator("body").getAttribute("data-deepseek-new-conversation"),
+    "true"
+  );
+  assert.equal(await page.getByText(previousQuestion).count(), 0);
+  assert.equal(await page.locator("textarea").isEnabled(), true);
+  await page.close();
+});
+
+test("元宝品牌完成后点击 data-desc=new-chat 的新版入口", async () => {
+  assert.ok(browser);
+  const page = await browser.newPage();
+  const previousQuestion = "古装宫廷剧参与品牌分析";
+
+  await page.setContent(`
+    <aside>
+      <div
+        class="yb-common-nav__trigger"
+        data-desc="new-chat"
+        style="width:28px;height:28px"
+      >
+        <span class="yb-icon iconfont-yb icon-yb_icon_newchat_20"></span>
+      </div>
+    </aside>
+    <main id="conversation">
+      <div data-conv-speaker="user">${previousQuestion}</div>
+      <div data-conv-speaker="ai">
+        <div class="agent-chat__speech-card__text">上一品牌回答</div>
+      </div>
+    </main>
+    <textarea aria-label="发送消息"></textarea>
+    <script>
+      document.querySelector("[data-desc='new-chat']").addEventListener("click", () => {
+        document.body.dataset.yuanbaoNewConversation = "true";
+        document.querySelector("#conversation").innerHTML = "";
+      });
+    </script>
+  `);
+
+  const opened = await openNewConversation(
+    page,
+    PLATFORMS.yuanbao,
+    previousQuestion,
+    3_000
+  );
+
+  assert.equal(opened, true);
+  assert.equal(
+    await page.locator("body").getAttribute("data-yuanbao-new-conversation"),
+    "true"
+  );
+  assert.equal(await page.getByText(previousQuestion).count(), 0);
+  assert.equal(await page.locator("textarea").isEnabled(), true);
+  await page.close();
+});
+
+test("已经处于空白聊天页时即使带有上一题也不会重复点击新建对话", async () => {
   assert.ok(browser);
   const page = await browser.newPage();
 
   await page.setContent(`
-    <aside><button aria-label="新建对话">新建对话</button></aside>
+    <aside><button aria-label="新建对话" id="new-chat">新建对话</button></aside>
     <main><div>开始新的对话</div></main>
     <textarea aria-label="聊天输入框"></textarea>
+    <script>
+      document.querySelector("#new-chat").addEventListener("click", () => {
+        document.body.dataset.newConversationClicked = "true";
+      });
+    </script>
   `);
 
-  const ready = await openNewConversation(page, PLATFORMS.doubao, "", 1_000);
+  const ready = await openNewConversation(page, PLATFORMS.doubao, "上一品牌最后一题", 1_000);
 
   assert.equal(ready, true);
+  assert.equal(
+    await page.locator("body").getAttribute("data-new-conversation-clicked"),
+    null
+  );
   await page.close();
 });
 

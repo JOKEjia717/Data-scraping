@@ -63,7 +63,10 @@ export async function ensureDeepThinkingState(
       "DOM_CHANGED"
     );
   }
-  const current = await readDeepThinkingState(control);
+  const current = await readDeepThinkingState(
+    control,
+    config.deepThinkingControl.enabledClassNameFragment
+  );
   if (current === null) {
     throw new DeepThinkingTechnicalError(
       `${config.name} 深度思考开关存在，但无法识别当前启用状态。`,
@@ -82,7 +85,10 @@ export async function ensureDeepThinkingState(
   });
   const deadline = Date.now() + 2_000;
   while (Date.now() < deadline) {
-    const actual = await readDeepThinkingState(control);
+    const actual = await readDeepThinkingState(
+      control,
+      config.deepThinkingControl.enabledClassNameFragment
+    );
     if (actual === requested) {
       return { requested, actual, changed: true, degraded: false };
     }
@@ -147,8 +153,11 @@ async function findDeepThinkingControl(
 }
 
 /** 只接受明确状态，不依据颜色、完整 className 或按钮文案猜测。 */
-async function readDeepThinkingState(locator: Locator): Promise<boolean | null> {
-  return locator.evaluate((node) => {
+async function readDeepThinkingState(
+  locator: Locator,
+  enabledClassNameFragment?: string
+): Promise<boolean | null> {
+  return locator.evaluate((node, classFragment) => {
     if (node instanceof HTMLInputElement && node.type === "checkbox") {
       return node.checked;
     }
@@ -165,8 +174,11 @@ async function readDeepThinkingState(locator: Locator): Promise<boolean | null> 
     if (["unchecked", "off", "inactive", "disabled", "unselected"].includes(state ?? "")) {
       return false;
     }
+    if (classFragment) {
+      return String(node.getAttribute("class") ?? "").includes(classFragment);
+    }
     return null;
-  }).catch(() => null);
+  }, enabledClassNameFragment).catch(() => null);
 }
 
 function shortError(error: unknown): string {

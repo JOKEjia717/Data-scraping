@@ -48,7 +48,7 @@ function conversationManager(onCreate?: () => void): ConversationManager {
   });
 }
 
-test("同平台按 A 第一批、B、A 第二次业务任务顺序执行并每批只开一次对话", async () => {
+test("同平台按 A 第一批、B、A 第二次业务任务顺序执行并在每批结束后新建对话", async () => {
   const tasks = [
     mockTask("A1", "A", "task-A-1", "A 第一题"),
     mockTask("A2", "A", "task-A-1", "A 第二题"),
@@ -83,7 +83,7 @@ test("同平台按 A 第一批、B、A 第二次业务任务顺序执行并每�
   const result = await worker.run();
 
   assert.deepEqual(executionOrder, ["A1", "A2", "B1", "A3", "A4"]);
-  assert.equal(conversationCreateCount, 3);
+  assert.equal(conversationCreateCount, 4);
   assert.equal(conversationIds[0], conversationIds[1]);
   assert.notEqual(conversationIds[1], conversationIds[2]);
   assert.notEqual(conversationIds[2], conversationIds[3]);
@@ -129,7 +129,7 @@ test("四个平台使用独立队列和独立 ConversationManager", async () => 
 
   const result = await worker.run();
   assert.equal(result.collectionResults.length, 4);
-  for (const platformId of platformIds) assert.equal(createCounts.get(platformId), 1);
+  for (const platformId of platformIds) assert.equal(createCounts.get(platformId), 2);
 });
 
 test("只接受 DIAGNOSIS 和 ARTICLE_PROBE，并保留 keyword 原文", () => {

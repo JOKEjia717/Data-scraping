@@ -65,6 +65,36 @@ test("品牌 A、品牌 B、品牌 A 第二次任务各自创建且绝不复用�
   assert.equal(stateA1.endReason, "batch-completed");
 });
 
+test("品牌完成后立即准备空白对话，下一品牌直接认领且不会重复创建", async () => {
+  const { manager, creations } = createManager();
+  const brandA = context("batch-a", "A", "task-a");
+  const brandB = context("batch-b", "B", "task-b");
+
+  await manager.startBatch(brandA);
+  manager.recordQuestion("A 最后一题");
+  manager.finishBatch(brandA.batchId);
+  assert.equal(await manager.resetToBlank("A 最后一题"), true);
+  assert.equal(creations.length, 2, "品牌 A 完成后必须立即创建空白对话");
+
+  const stateB = await manager.startBatch(brandB, "A 最后一题");
+  assert.equal(creations.length, 2, "品牌 B 应认领已准备的空白对话，不能重复点击");
+  assert.equal(stateB.brandId, "B");
+});
+
+test("已验证的同批次页面可在重启后接管且不会新建对话", async () => {
+  const { manager, creations } = createManager();
+  const interrupted = context("batch-a-retry", "A", "task-a");
+
+  const resumed = manager.resumeVerifiedBatch(interrupted);
+  assert.equal(creations.length, 0, "恢复已有回答时绝不能点击新建对话");
+  assert.equal(resumed.brandId, "A");
+
+  manager.recordQuestion("已恢复的第一题");
+  const next = await manager.acquireForQuestion(interrupted, "已恢复的第一题");
+  assert.equal(next.conversationGroupId, resumed.conversationGroupId);
+  assert.equal(creations.length, 0, "同批次第二题必须继续复用已恢复页面");
+});
+
 test("品牌、业务任务或租户变化时 acquireForQuestion 强制轮换", async () => {
   const { manager, creations } = createManager();
   const a = context("batch-a", "A", "task-1", "tenant-1");

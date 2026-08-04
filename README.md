@@ -130,7 +130,7 @@ research 模式下参考资料缺失时按平台检查或重新提问
   ↓
 单题事务写入 MySQL，同时刷新平台文件和根目录汇总
   ↓
-research 完成整轮、business 切换品牌批次时自动新建对话
+research 完成整轮、business 每个品牌完成后立即新建对话
   ↓
 按平台分桶 → 平台内按问题分组 → 合并四个平台的同题数据
 ```
@@ -290,7 +290,9 @@ npm run crawl -- --mode=business --questions=business-batches.json --database=fa
 ```
 
 执行器会先按 `tenantId + businessTaskId + brand` 合并重复批次。同一批次在
-每个平台使用一个独立对话连续执行全部问题；任一身份字段不同都会新建对话。
+每个平台使用一个独立对话连续执行全部问题；品牌最后一道题保存完成后会立即创建
+空白新对话，下一品牌直接认领该对话，避免重复点击。任一身份字段不同都不会复用
+上一品牌的会话。
 即使同一品牌稍后再次出现，只要属于新业务任务，也会完整执行新批次。问题文本
 按 JSON 中的原字符串发送，不拼接 `--prompt-prefix`。`CollectionMode` 的 business
 默认配置会同时关闭 `retryOnNoReferences` 和 `regenerateOnNoReferences`。联网已验证
@@ -312,8 +314,9 @@ npm run crawl -- --mode=business --questions=business-batches.json --database=fa
 ### 会话生命周期管理
 
 `src/conversationManager.ts` 负责批次与平台页面会话之间的唯一映射。会话在
-BrandBatch 开始时创建，批内问题通过 `acquireForQuestion` 复用；批次完成或失败
-后解除归属，不会分配给其他品牌、租户或业务任务。品牌/任务/租户变化、损坏标记、
+BrandBatch 开始时创建，批内问题通过 `acquireForQuestion` 复用；批次完成后立即
+解除归属并创建空白新对话，下一品牌只认领该空白对话，不会复用上一品牌的内容。
+品牌/任务/租户变化、损坏标记、
 最大时长或最大题数都会强制轮换。`conversationGroupId` 由租户、业务任务、品牌、
 业务组、平台、批次 ID 和轮换序号共同生成。
 
@@ -784,7 +787,7 @@ ORDER BY q.sort_order, p.id, r.rank;
 
 ## 平台模块
 
-四个平台均采用“记录提问前基线 → 等待新回答结束 → 只展开本题引用 → 等待列表稳定 → 结构化解析”的流程。每个平台完成问题库中的全部问题后，程序会自动点击“新建对话”并等待空白输入界面，为下一轮运行准备干净会话。找不到新对话入口时仅输出提醒，不影响已经写入的数据，也不阻塞其他并发平台。
+四个平台均采用“记录提问前基线 → 等待新回答结束 → 只展开本题引用 → 等待列表稳定 → 结构化解析”的流程。business 模式下，每个平台完成一个品牌的最后一道题并保存数据后，会立即点击“新建对话”并确认空白输入界面，再允许进入下一品牌；research 模式仍在整轮问题完成后创建新对话。某个平台切换失败只会影响该平台，不会中断其他并发平台，已经写入的数据仍会保留。
 
 ### 豆包
 
@@ -948,7 +951,7 @@ npm run crawl:yuanbao
 | `--prompt-prefix` | 覆盖 research 全局提问前缀；business 始终忽略该值并原样发送问题 | `--prompt-prefix="请联网搜索并保留参考来源。问题："` |
 | `--verbose=true\|false` | research 是否输出详细采集调试日志，默认 `true`；business 始终关闭 | `--verbose=false` |
 | `--resolve-titles=false` | 关闭 DeepSeek 文章标题补全 | `npm run crawl:deepseek -- --resolve-titles=false` |
-| `--deep-thinking=true\|false` | 显式设置每题发送前的深度思考状态；未传时 research 保持原页面行为 | `--deep-thinking=true` |
+| `--deep-thinking=true\|false` | 设置每题发送前的深度思考状态；豆包、DeepSeek、千问、元宝默认均为 `false`（关闭） | `--deep-thinking=true` |
 | `--deep-thinking-unsupported-policy` | 平台不支持时选择 `fail`（默认）或 `allow_degrade` | `--deep-thinking-unsupported-policy=allow_degrade` |
 | `--web-search-policy` | 联网条件：`REQUIRED`、`PREFERRED` 或 `DISABLED`；research 未传时保持原行为 | `--web-search-policy=REQUIRED` |
 | `--batch-name` | 自定义本次数据库批次名称；默认使用运行时间 | `--batch-name="理想L7调研第一轮"` |

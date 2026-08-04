@@ -77,6 +77,8 @@ export class ConversationManager {
   private current?: ConversationState;
   private readonly states: ConversationState[] = [];
   private rotationSequence = 0;
+  /** 上一品牌结束后已经创建、但尚未分配给下一品牌的空白对话。 */
+  private blankConversationPrepared = false;
 
   constructor(options: ConversationManagerOptions) {
     this.operations = options.operations;
@@ -95,6 +97,8 @@ export class ConversationManager {
   /** CDP 重连后只替换页面操作句柄，不改变当前批次/对话归属。 */
   rebindOperations(operations: ConversationPageOperations): void {
     this.operations = operations;
+    // 页面句柄变化后不能继续相信旧页面上的空白状态，下一批需重新确认。
+    this.blankConversationPrepared = false;
   }
 
   /** 当前 BrandBatch 开始时强制创建一次新对话。 */
@@ -104,7 +108,25 @@ export class ConversationManager {
   ): Promise<Readonly<ConversationState>> {
     validateContext(context);
     if (this.current) this.endCurrent("batch-started");
+    if (this.blankConversationPrepared) {
+      this.blankConversationPrepared = false;
+      return this.assignConversation(context);
+    }
     return this.createAssignedConversation(context, previousQuestion);
+  }
+
+  /**
+   * 进程重启或发送后结果不确定时，调用方已通过“当前问题锚点 + 完整回答正文”确认
+   * 页面仍属于同一个未完成 BrandBatch，才允许接管该页面继续恢复。该入口不会点击
+   * 新建对话，也不能用于新的品牌、业务任务或租户。
+   */
+  resumeVerifiedBatch(
+    context: ConversationBatchContext
+  ): Readonly<ConversationState> {
+    validateContext(context);
+    if (this.current) this.endCurrent("batch-started");
+    this.blankConversationPrepared = false;
+    return this.assignConversation(context);
   }
 
   /**
@@ -116,7 +138,13 @@ export class ConversationManager {
     previousQuestion = ""
   ): Promise<Readonly<ConversationState>> {
     validateContext(context);
-    if (!this.current) return this.createAssignedConversation(context, previousQuestion);
+    if (!this.current) {
+      if (this.blankConversationPrepared) {
+        this.blankConversationPrepared = false;
+        return this.assignConversation(context);
+      }
+      return this.createAssignedConversation(context, previousQuestion);
+    }
     if (!sameConversationOwner(this.current, context)) {
       this.endCurrent("identity-changed");
       return this.createAssignedConversation(context, previousQuestion);
@@ -168,10 +196,13 @@ export class ConversationManager {
   /** 兼容原 crawlPlatform：任务结束后切到未分配的空白会话。 */
   async resetToBlank(previousQuestion = ""): Promise<boolean> {
     if (this.current) this.endCurrent("reset");
-    return this.operations.createNewConversation(
+    this.blankConversationPrepared = false;
+    const opened = await this.operations.createNewConversation(
       previousQuestion,
       this.policy.newConversationTimeoutMs
     );
+    this.blankConversationPrepared = opened;
+    return opened;
   }
 
   private async createAssignedConversation(
@@ -186,6 +217,12 @@ export class ConversationManager {
       throw new Error(`无法为品牌批次创建独立新对话：${context.batchId}`);
     }
 
+    return this.assignConversation(context);
+  }
+
+  private assignConversation(
+    context: ConversationBatchContext
+  ): Readonly<ConversationState> {
     const rotationSequence = ++this.rotationSequence;
     const state: ConversationState = {
       ...context,
@@ -276,7 +313,13 @@ export async function openNewConversation(
   previousQuestion = "",
   timeoutMs = 15_000
 ): Promise<boolean> {
-  if (!previousQuestion && await isKnownConversationBlank(page, config)) return true;
+  // 上一品牌结束时可能已经准备好空白页。部分页面的消息选择器会短暂失配，
+  // 因此传入上一题时还必须确认页面已经不再包含该题，才可跳过点击。
+  if (await isKnownConversationBlank(page, config)) {
+    if (!previousQuestion) return true;
+    const bodyText = await page.locator("body").innerText({ timeout: 2_000 }).catch(() => "");
+    if (!bodyText.includes(previousQuestion)) return true;
+  }
 
   const beforeUrl = page.url();
   const beforeBody = await page.locator("body").innerText({ timeout: 3_000 }).catch(() => "");

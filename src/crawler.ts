@@ -30,6 +30,7 @@ import { ensureDeepThinkingState } from "./deepThinking.js";
 import {
   activateWebSearch,
   assertVerifiedWebSearchForZeroReferences,
+  confirmWebSearchFromAnswerEvidence,
   enforceWebSearchPolicy,
   type WebSearchActivationResult
 } from "./webSearch.js";
@@ -303,10 +304,21 @@ export async function crawlPlatform(
       batchQuestionIndex === batch.questions.length - 1
     ) {
       conversationManager.finishBatch(batch.key);
+      await retryTechnicalFailure(
+        options.mode,
+        `${config.name} 完成品牌批次后创建空白新对话`,
+        async () => {
+          const opened = await conversationManager.resetToBlank(question);
+          if (!opened) {
+            throw new Error(`${config.name} 完成品牌 ${batch.brand} 后无法创建新对话。`);
+          }
+        }
+      );
+      console.log(`[${config.name}] 品牌 ${batch.brand} 已完成，已自动创建新对话。`);
     }
   }
 
-  if (executionQuestions.length > 0) {
+  if (options.mode === "research" && executionQuestions.length > 0) {
     const opened = await conversationManager.resetToBlank(
       executionQuestions[executionQuestions.length - 1].question
     );
@@ -352,7 +364,8 @@ export async function executeQuestion(
   const requestedDeepThinking = deepThinking ?? null;
   let actualDeepThinking: boolean | null = null;
 
-  // 元宝引用抽屉会遮挡页面并污染本题基线，因此单题开始和提取结束时主动关闭。
+  // 千问/元宝引用抽屉会遮挡页面并污染本题基线，因此单题开始和提取结束时主动关闭。
+  if (config.id === "qianwen") await closeQianwenReferencePanel(page);
   if (config.id === "yuanbao") await closeYuanbaoReferencePanel(page);
   await retryTechnicalFailure(
     mode,
@@ -380,7 +393,7 @@ export async function executeQuestion(
       (resolution.changed ? "（已切换）" : resolution.degraded ? "（已按配置降级）" : "（无需切换）")
     );
   }
-  const webSearch = await activateWebSearch(page, config, webSearchPolicy);
+  let webSearch = await activateWebSearch(page, config, webSearchPolicy);
   runtime.onWebSearchStateResolved?.(webSearch);
   console.log(
     `[${config.name}] 联网搜索：policy=${webSearchPolicy}, requested=${webSearch.requested}, ` +
@@ -388,12 +401,12 @@ export async function executeQuestion(
     (webSearch.failureReason ? `（${webSearch.failureReason}）` : "")
   );
   enforceWebSearchPolicy(webSearchPolicy, webSearch);
-  const webSearchResultFields = {
+  const webSearchResultFields = () => ({
     webSearchRequested: webSearch.requested,
     webSearchEnabled: webSearch.enabled,
     webSearchVerified: webSearch.verified,
     webSearchFailureReason: webSearch.failureReason
-  };
+  });
 
   // 所有基线必须在发送问题前采集，之后只接受相对基线新增的回答和引用入口。
   const baselineBottom = await snapshotDocumentBottom(page);
@@ -451,12 +464,27 @@ export async function executeQuestion(
         submittedQuestion,
         requestedDeepThinking,
         actualDeepThinking,
-        ...webSearchResultFields
+        ...webSearchResultFields()
       };
     }
     throw error;
   }
   await scrollToBottom(page);
+
+  // 豆包即使隐藏了联网开关，也会在当前回答中明确显示“搜索 N 个关键词，参考
+  // N 篇资料”。该结构属于本题且比开关样式更可靠，可作为联网已经执行的证据。
+  if (
+    config.id === "doubao" &&
+    !webSearch.verified &&
+    await hasCurrentDoubaoReferenceEntry(
+      page,
+      submittedQuestion,
+      baselineDoubaoSearchBlockCount
+    )
+  ) {
+    webSearch = confirmWebSearchFromAnswerEvidence(webSearch);
+    runtime.onWebSearchStateResolved?.(webSearch);
+  }
 
   let finalAnswer = "";
   let finalGeneration = 1;
@@ -518,6 +546,7 @@ export async function executeQuestion(
   };
 
   if (!referenceReady) {
+    if (config.id === "qianwen") await closeQianwenReferencePanel(page);
     if (config.id === "yuanbao") await closeYuanbaoReferencePanel(page);
     if (mode === "business") {
       assertVerifiedWebSearchForZeroReferences(webSearch);
@@ -542,7 +571,7 @@ export async function executeQuestion(
       submittedQuestion,
       requestedDeepThinking,
       actualDeepThinking,
-      ...webSearchResultFields,
+      ...webSearchResultFields(),
       ...(mode === "research"
         ? { errorMessage: "多次检查后仍没有找到属于当前问题的有效参考资料。" }
         : {})
@@ -558,6 +587,7 @@ export async function executeQuestion(
     config.name,
     extractionBaseline
   );
+  if (config.id === "qianwen") await closeQianwenReferencePanel(page);
   if (config.id === "yuanbao") await closeYuanbaoReferencePanel(page);
   const resolvedQuestionRecords = resolveTitles && config.id === "deepseek"
     ? await resolveRecordTitles(extractedRecords)
@@ -566,6 +596,10 @@ export async function executeQuestion(
     ...record,
     submittedQuestion
   }));
+  if (questionRecords.length > 0 && !webSearch.verified) {
+    webSearch = confirmWebSearchFromAnswerEvidence(webSearch);
+    runtime.onWebSearchStateResolved?.(webSearch);
+  }
   console.log(`[${config.name}] 抽取到 ${questionRecords.length} 条参考链接`);
   if (questionRecords.length === 0) {
     if (mode === "business") {
@@ -588,7 +622,7 @@ export async function executeQuestion(
       submittedQuestion,
       requestedDeepThinking,
       actualDeepThinking,
-      ...webSearchResultFields
+      ...webSearchResultFields()
     };
   }
 
@@ -603,7 +637,7 @@ export async function executeQuestion(
     submittedQuestion,
     requestedDeepThinking,
     actualDeepThinking,
-    ...webSearchResultFields
+    ...webSearchResultFields()
   };
   } catch (error) {
     // 正式 Worker 的后续错误摘要即使包含原问题，也能自动完整移除。
@@ -626,26 +660,56 @@ export async function inspectCurrentQuestionAnswer(
   if (page.isClosed()) {
     return { status: "uncertain", reason: "平台页面已关闭，无法确认发送后的回答" };
   }
-  const [bodyText, busy, answerContent] = await Promise.all([
-    page.locator("body").innerText({ timeout: 3_000 }).catch(() => ""),
-    isAnswerGenerating(page).catch(() => true),
-    captureLatestPlatformAnswerWithRetries(page, config.id, config.name).catch(() => "")
-  ]);
+  // 先核对问题锚点。页面不是本批次时立即返回，避免为了一个无关历史回答额外
+  // 等待最长 10 秒的正文挂载窗口。
+  const bodyText = await page.locator("body").innerText({ timeout: 3_000 }).catch(() => "");
   const body = normalizeInspectionText(bodyText);
   const question = normalizeInspectionText(submittedQuestion);
-  const answer = normalizeInspectionText(answerContent);
   const questionIndex = question ? body.lastIndexOf(question) : -1;
   if (questionIndex < 0) {
     return { status: "uncertain", reason: "当前页面未确认到本题问题锚点" };
   }
+  // 回答节点可能在上面的正文快照之后才完成挂载。先等最新回答稳定，再重新读取
+  // 生成状态和正文；不能用回答挂载前的旧快照做题目/回答对应校验。
+  const answerContent = await captureLatestPlatformAnswerWithRetries(
+    page,
+    config.id,
+    config.name
+  ).catch(() => "");
+  const busy = await isAnswerGenerating(page).catch(() => true);
+  const answer = normalizeInspectionText(answerContent);
   if (busy) {
     return { status: "uncertain", reason: "当前页面仍显示回答生成中" };
   }
   if (!answer) {
     return { status: "uncertain", reason: "当前页面未解析到本题回答正文" };
   }
+  const settledBodyText = await page.locator("body").innerText({ timeout: 3_000 }).catch(() => "");
+  const settledBody = normalizeInspectionText(settledBodyText);
+  const settledQuestionIndex = question ? settledBody.lastIndexOf(question) : -1;
+  if (settledQuestionIndex < 0) {
+    return { status: "uncertain", reason: "回答稳定后当前页面未确认到本题问题锚点" };
+  }
   const answerProbe = answer.slice(0, Math.min(80, answer.length));
-  if (!body.slice(questionIndex + question.length).includes(answerProbe)) {
+  if (config.id === "qianwen") {
+    const qianwenOrder = await qianwenAnswerFollowsRealQuestionBubble(
+      page,
+      submittedQuestion,
+      answerProbe
+    );
+    if (qianwenOrder === false) {
+      return { status: "uncertain", reason: "最新回答正文无法与千问真实问题气泡对应" };
+    }
+    if (qianwenOrder === true) {
+      return {
+        status: "answered",
+        answerContent,
+        reason: "当前页面已确认千问真实问题气泡和完整回答正文"
+      };
+    }
+    // 旧版千问没有稳定问题气泡 class 时继续使用下方正文兼容路径。
+  }
+  if (!settledBody.slice(settledQuestionIndex + question.length).includes(answerProbe)) {
     return { status: "uncertain", reason: "最新回答正文无法与本题问题锚点对应" };
   }
   return {
@@ -677,6 +741,7 @@ export async function recoverSubmittedQuestionResult(
       throw Object.assign(new Error(inspection.reason), { errorCode: "REFERENCE_UNKNOWN" });
     }
 
+    if (config.id === "qianwen") await closeQianwenReferencePanel(page);
     if (config.id === "yuanbao") await closeYuanbaoReferencePanel(page);
     const doubaoBlockCount = config.id === "doubao"
       ? await countDoubaoSearchResultBlocks(page)
@@ -709,6 +774,7 @@ export async function recoverSubmittedQuestionResult(
       config.name,
       config.id === "doubao" ? Math.max(0, doubaoBlockCount - 1) : 0
     );
+    if (config.id === "qianwen") await closeQianwenReferencePanel(page);
     if (config.id === "yuanbao") await closeYuanbaoReferencePanel(page);
     if (references.length === 0) {
       throw Object.assign(new Error("重连后引用入口存在但引用无法解析"), {
@@ -1041,18 +1107,23 @@ async function retryTechnicalFailure<T>(
 }
 
 /** 回答刚结束时短暂重试正文节点，避免最后一批 Markdown/block 节点尚未挂载。 */
-async function captureLatestPlatformAnswerWithRetries(
+export async function captureLatestPlatformAnswerWithRetries(
   page: Page,
   platformId: PlatformConfig["id"],
   platformName: string
 ): Promise<string> {
-  for (let attempt = 1; attempt <= REFERENCE_CHECK_ATTEMPTS; attempt += 1) {
+  // 千问流式结束后会把临时回答节点替换成 complete 节点；替换期间生命周期信号
+  // 已结束但正文容器可能短暂为空。最长等待 10 秒，只读取页面，绝不重新发送。
+  const deadline = Date.now() + 10_000;
+  let attempt = 0;
+  while (Date.now() < deadline) {
+    attempt += 1;
     const answer = await extractLatestPlatformAnswer(page, platformId).catch((error) => {
       console.log(`[${platformName}] 第 ${attempt} 次解析回答正文异常：${formatError(error)}`);
       return "";
     });
     if (answer) return answer;
-    if (attempt < REFERENCE_CHECK_ATTEMPTS) await page.waitForTimeout(500);
+    await page.waitForTimeout(250);
   }
   return "";
 }
@@ -1066,10 +1137,82 @@ function normalizeInspectionText(value: string): string {
   return value.replace(/\s+/g, " ").trim();
 }
 
+/**
+ * 千问右侧问题导航会复制当前问题并放在全部回答之后，不能用 body.lastIndexOf
+ * 判断题目与回答顺序。这里只认聊天流内的真实问题气泡，并要求最新回答节点位于
+ * 该气泡之后；返回 null 表示旧版 DOM 没有稳定气泡，可交给兼容路径判断。
+ */
+async function qianwenAnswerFollowsRealQuestionBubble(
+  page: Page,
+  submittedQuestion: string,
+  answerProbe: string
+): Promise<boolean | null> {
+  return page.evaluate<boolean | null, { question: string; probe: string }>(
+    ({ question, probe }) => {
+      // 不在 page.evaluate 内声明辅助函数，避免 TS 运行时给函数注入 Node 侧
+      // __name 包装后在浏览器上下文不可用。
+      const expectedQuestion = (question || "").replace(/\s+/g, " ").trim();
+      const normalizedProbe = (probe || "").replace(/\s+/g, " ").trim();
+      const questionBubbles = Array.from(document.querySelectorAll(
+        ".message-card-wrap.question, .question-text-card, .chat-question-card-wrap"
+      )).filter((element) =>
+        (element.textContent || "").replace(/\s+/g, " ").trim() === expectedQuestion
+      );
+      const questionBubble = questionBubbles[questionBubbles.length - 1];
+      if (!questionBubble) return null;
+
+      const answers = Array.from(document.querySelectorAll(
+        ".message-select-wrapper-answer-rqWekn .qk-markdown, " +
+        ".chat-answers-card-wrap .answer-common-card .qk-markdown, " +
+        ".chat-answers-card-wrap .qk-markdown.qk-markdown-complete"
+      )).filter((element) =>
+        Boolean(questionBubble.compareDocumentPosition(element) & Node.DOCUMENT_POSITION_FOLLOWING)
+      );
+      const latestAnswer = answers[answers.length - 1];
+      if (!latestAnswer || !normalizedProbe) return false;
+      const latestText = (
+        latestAnswer instanceof HTMLElement ? latestAnswer.innerText : latestAnswer.textContent || ""
+      ).replace(/\s+/g, " ").trim();
+      return latestText.includes(normalizedProbe);
+    },
+    { question: submittedQuestion, probe: answerProbe }
+  );
+}
+
 /** 将视口移到最新回答区域，避免引用入口因懒加载而尚未挂载。 */
 async function scrollToBottom(page: Page): Promise<void> {
   await page.evaluate("window.scrollTo(0, document.body.scrollHeight)").catch(() => undefined);
   await page.waitForTimeout(500);
+}
+
+/**
+ * 关闭千问已打开的参考来源侧栏。千问的关闭控件没有 button/aria 语义，因此从
+ * 可见引用列表向上定位面板标题栏及其最后一个控件；失败时仅使用 Escape，绝不
+ * 点击回答区或发送控件。
+ */
+export async function closeQianwenReferencePanel(page: Page): Promise<void> {
+  const visibleLists = page.locator('[class~="list-XPxyL2"]:visible');
+  const listCount = await visibleLists.count().catch(() => 0);
+  if (listCount === 0) return;
+
+  const list = visibleLists.last();
+  const panel = list.locator("..");
+  const header = panel.locator(":scope > div").first();
+  const closeControl = header.locator(":scope > div").last();
+  await closeControl.click({ timeout: 2_000 }).catch(() => undefined);
+
+  const closed = await list.waitFor({ state: "hidden", timeout: 3_000 })
+    .then(() => true)
+    .catch(() => false);
+  if (closed) return;
+
+  await page.keyboard.press("Escape").catch(() => undefined);
+  const closedByEscape = await list.waitFor({ state: "hidden", timeout: 2_000 })
+    .then(() => true)
+    .catch(() => false);
+  if (!closedByEscape) {
+    console.log("[千问] 提醒：参考来源面板未能自动关闭，已停止进行任何额外点击。");
+  }
 }
 
 /** 关闭元宝已打开的引用抽屉；按钮失败时再尝试 Escape。 */
@@ -1121,20 +1264,25 @@ async function ensureReadyForInput(page: Page, config: PlatformConfig): Promise<
 }
 
 /** 兼容 textarea/input 与 contenteditable，并优先点击发送按钮、回退 Enter。 */
-async function submitQuestion(page: Page, config: PlatformConfig, question: string): Promise<void> {
+export async function submitQuestion(
+  page: Page,
+  config: PlatformConfig,
+  question: string
+): Promise<void> {
   const inputBox = await findInput(page, config.inputSelectors, 30_000);
   if (!inputBox) throw new Error(`没有在 ${config.name} 页面找到聊天输入框。`);
 
-  await inputBox.click({ timeout: 5_000 });
-  const tagName = await inputBox.evaluate((node) => node.tagName.toLowerCase()).catch(() => "");
-  if (tagName === "textarea" || tagName === "input") {
-    await inputBox.fill(question);
-  } else {
-    const filled = await inputBox.fill(question).then(() => true).catch(() => false);
-    if (!filled) {
-      await page.keyboard.press(process.platform === "darwin" ? "Meta+A" : "Control+A");
-      await page.keyboard.insertText(question);
-    }
+  // 四个平台同时创建新对话时，页面可能仍在执行布局动画。click 会额外要求元素位置
+  // 持续稳定，容易让多个平台同时在 5 秒内超时；fill 只要求输入框可见、启用且可编辑。
+  // 直接 fill 也能同时覆盖 textarea、input 和 contenteditable，且不会额外提交问题。
+  const filled = await inputBox.fill(question, { timeout: 15_000 })
+    .then(() => true)
+    .catch(() => false);
+  if (!filled) {
+    // 少数富文本编辑器不支持 fill；等待页面动画稳定后再使用键盘回退。
+    await inputBox.click({ timeout: 15_000 });
+    await page.keyboard.press(process.platform === "darwin" ? "Meta+A" : "Control+A");
+    await page.keyboard.insertText(question);
   }
 
   if (await clickSendButton(page, config.sendButtonSelectors)) return;
@@ -1173,7 +1321,8 @@ async function findInput(page: Page, selectors: string[], timeoutMs: number): Pr
       for (const locator of locators.slice().reverse()) {
         const visible = await locator.isVisible().catch(() => false);
         const enabled = await locator.isEnabled().catch(() => false);
-        if (visible && enabled) return locator;
+        const editable = await locator.isEditable().catch(() => false);
+        if (visible && enabled && editable) return locator;
       }
     }
     await page.waitForTimeout(500);
@@ -1643,7 +1792,7 @@ async function stopQianwenGeneration(page: Page): Promise<boolean> {
         element.getAttribute("title") || ""
       ].join(" ")).catch(() => "")
     ]);
-    if (!visible || !/停止生成|停止回答|暂停生成|中止生成|Stop generating|Stop responding/i.test(text)) {
+    if (!visible || !isAnswerGeneratingControlText(text)) {
       continue;
     }
     const clicked = await control.click({ timeout: 2_000 }).then(() => true).catch(() => false);
@@ -1682,10 +1831,16 @@ async function isAnswerGenerating(page: Page): Promise<boolean> {
         element.getAttribute("aria-label") || "",
         element.getAttribute("title") || ""
       ].join(" ");
-      return /停止生成|停止回答|暂停生成|中止生成|Stop generating|Stop responding/i.test(text);
+      return ${String(isAnswerGeneratingControlText)}(text);
     });
 })()
 `).catch(() => false);
+}
+
+/** 千问新版“研究”会长期显示终止任务，必须继续视为生成中。 */
+export function isAnswerGeneratingControlText(text: string): boolean {
+  return /停止生成|停止回答|暂停生成|中止生成|终止任务|终止研究|Stop generating|Stop responding/i
+    .test(text);
 }
 
 /** 没有平台专属信号时，以整页正文连续不变作为回答完成的通用兜底。 */

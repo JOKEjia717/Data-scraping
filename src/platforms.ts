@@ -38,6 +38,8 @@ export const PLATFORMS: Record<PlatformId, PlatformConfig> = {
       "[role='button'][aria-label*='发送']"
     ],
     newConversationButtonSelectors: [
+      "div[class~='group/sidebar_nav_item']:has-text('新对话')",
+      "div[class*='sidebar_nav_item']:has-text('新对话')",
       "[data-testid*='new-chat']",
       "[class*='new-chat']",
       ...COMMON_NEW_CONVERSATION_SELECTORS
@@ -94,6 +96,8 @@ export const PLATFORMS: Record<PlatformId, PlatformConfig> = {
       "button[title*='Send']"
     ],
     newConversationButtonSelectors: [
+      "div._5a8ac7a[tabindex='0']:has-text('开启新对话')",
+      "div[tabindex='0']:has-text('开启新对话')",
       "[data-testid*='new-chat']",
       "[class*='new-chat']",
       "button:has-text('开启新对话')",
@@ -182,8 +186,6 @@ export const PLATFORMS: Record<PlatformId, PlatformConfig> = {
       ...COMMON_NEW_CONVERSATION_SELECTORS
     ],
     webSearchButtonSelectors: [
-      "span[data-input-login-gate='deep-research:primary'] button[aria-label='研究'][aria-pressed]",
-      "button[aria-label='研究'][aria-pressed]",
       "button:has-text('联网搜索')",
       "button:has-text('搜索')",
       "button:has-text('全网搜索')",
@@ -258,12 +260,15 @@ export const PLATFORMS: Record<PlatformId, PlatformConfig> = {
       "[role='button'][title*='发送']"
     ],
     newConversationButtonSelectors: [
+      "div.yb-common-nav__trigger[data-desc='new-chat']",
+      "[data-desc='new-chat']",
       "[data-testid*='new-chat']",
       "[class*='new-chat']",
       "[class*='create-chat']",
       ...COMMON_NEW_CONVERSATION_SELECTORS
     ],
     webSearchButtonSelectors: [
+      "li.t-dropdown__item:has-text('联网搜索')",
       "button:has-text('联网搜索')",
       "button:has-text('搜索')",
       "button:has-text('深度搜索')",
@@ -276,17 +281,25 @@ export const PLATFORMS: Record<PlatformId, PlatformConfig> = {
       "[title*='联网搜索']",
       "[title*='搜索']"
     ],
+    webSearchMenuTriggerSelectors: [
+      ".ybc-atomSelect-tools-wrapper"
+    ],
+    webSearchEnabledIndicatorSelectors: [
+      "span.application-blot-ai-atom:has-text('联网搜索')"
+    ],
     webSearchSupported: true,
     deepThinkingControl: {
       supported: true,
       selectors: [
+        "div[dt-button-id='deep_think'][aria-label='深度思考']",
         "button[aria-label*='深度思考']",
         "button[title*='深度思考']",
         "button:has-text('深度思考')",
         "button:has-text('深度推理')",
         "[role='switch'][aria-label*='深度思考']",
         "[role='button']:has-text('深度思考')"
-      ]
+      ],
+      enabledClassNameFragment: "ThinkSelector_selected__"
     },
     referenceRevealSelectors: [
       ".ToolbarSearchGuid_searchGuidTool__M81L2.Toolbar_icon__xGP8b",

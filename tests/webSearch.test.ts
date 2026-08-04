@@ -7,12 +7,38 @@ import {
   WebSearchTechnicalError,
   activateWebSearch,
   assertVerifiedWebSearchForZeroReferences,
+  confirmWebSearchFromAnswerEvidence,
   enforceWebSearchPolicy,
   webSearchPolicyForBusinessType
 } from "../src/webSearch.js";
 
 let browser: Browser | undefined;
 const platformIds: PlatformId[] = ["doubao", "deepseek", "qianwen", "yuanbao"];
+
+test("回答来源证据可回填已请求且受支持的联网状态", () => {
+  assert.deepEqual(confirmWebSearchFromAnswerEvidence({
+    requested: true,
+    supported: true,
+    enabled: false,
+    verified: false,
+    failureReason: "页面未显示开关"
+  }), {
+    requested: true,
+    supported: true,
+    enabled: true,
+    verified: true,
+    failureReason: null
+  });
+
+  const disabled = {
+    requested: false,
+    supported: true,
+    enabled: false,
+    verified: false,
+    failureReason: null
+  } as const;
+  assert.equal(confirmWebSearchFromAnswerEvidence(disabled), disabled);
+});
 
 before(async () => {
   browser = await chromium.launch({ channel: "chrome", headless: true });
@@ -224,7 +250,7 @@ test("DeepSeek 新版 DIV aria-pressed 可验证智能搜索已开启且不点�
   }
 });
 
-test("千问新版研究入口可幂等开启并验证联网状态", async () => {
+test("千问深度研究入口不能被误当作普通联网搜索开关", async () => {
   assert.ok(browser);
   const page = await browser.newPage();
   try {
@@ -232,19 +258,50 @@ test("千问新版研究入口可幂等开启并验证联网状态", async () =>
       <span data-input-login-gate="deep-research:primary">
         <button id="research" aria-label="研究" aria-pressed="false">研究</button>
       </span>
+      <script>document.querySelector("#research").addEventListener("click", () => {
+        document.body.dataset.clickCount = "1";
+      });</script>
+    `);
+    const result = await activateWebSearch(
+      page,
+      PLATFORMS.qianwen,
+      "PREFERRED"
+    );
+    assert.equal(result.enabled, false);
+    assert.equal(result.verified, false);
+    assert.match(result.failureReason ?? "", /找不到/);
+    assert.equal(await clickCount(page), 0);
+  } finally {
+    await page.close();
+  }
+});
+
+test("元宝通过工具菜单开启联网后使用输入栏标志验证", async () => {
+  assert.ok(browser);
+  const page = await browser.newPage();
+  try {
+    await page.setContent(`
+      <div class="ybc-atomSelect-tools-wrapper">工具</div>
+      <ul id="menu" style="display:none">
+        <li id="web-search" class="t-dropdown__item">联网搜索</li>
+      </ul>
+      <div id="selected"></div>
       <script>
-        const control = document.querySelector("#research");
-        control.addEventListener("click", () => {
-          control.setAttribute("aria-pressed", "true");
-          document.body.dataset.clickCount = String(
-            Number(document.body.dataset.clickCount || "0") + 1
-          );
+        document.querySelector(".ybc-atomSelect-tools-wrapper")
+          .addEventListener("click", () => {
+            document.querySelector("#menu").style.display = "block";
+          });
+        document.querySelector("#web-search").addEventListener("click", () => {
+          document.querySelector("#menu").style.display = "none";
+          document.querySelector("#selected").innerHTML =
+            '<span class="application-blot-ai-atom">联网搜索</span>';
+          document.body.dataset.clickCount = "1";
         });
       </script>
     `);
     const result = await activateWebSearch(
       page,
-      PLATFORMS.qianwen,
+      PLATFORMS.yuanbao,
       "REQUIRED"
     );
     assert.equal(result.enabled, true);

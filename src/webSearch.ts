@@ -11,6 +11,18 @@ export interface WebSearchActivationResult {
   failureReason: string | null;
 }
 
+/**
+ * 页面回答本身已经给出可核验的联网证据（例如“搜索 N 个关键词，参考 N 篇
+ * 资料”或成功打开的来源列表）时，回填开关探测结果。它不会把未请求联网或配置
+ * 为不支持的平台强行改成成功。
+ */
+export function confirmWebSearchFromAnswerEvidence(
+  result: WebSearchActivationResult
+): WebSearchActivationResult {
+  if (!result.requested || !result.supported) return result;
+  return successfulResult(true);
+}
+
 export class WebSearchTechnicalError extends Error {
   readonly errorCode: "WEB_SEARCH_UNSUPPORTED" | "WEB_SEARCH_UNVERIFIED";
 
@@ -52,16 +64,25 @@ export async function activateWebSearch(
     };
   }
 
-  const located = await findWebSearchControl(page, config);
+  const indicatorEnabled = await hasEnabledWebSearchIndicator(page, config);
+  let located = indicatorEnabled
+    ? undefined
+    : await findWebSearchControl(page, config);
   // DISABLED 明确不点击；若页面恰好暴露状态，则只读记录真实状态。
   if (!requested) {
     return {
       requested: false,
       supported: true,
-      enabled: located?.state === true,
-      verified: located?.state !== null && located?.state !== undefined,
+      enabled: indicatorEnabled || located?.state === true,
+      verified: indicatorEnabled ||
+        (located?.state !== null && located?.state !== undefined),
       failureReason: null
     };
+  }
+  if (indicatorEnabled) return successfulResult(requested);
+  if (!located) {
+    await revealWebSearchMenu(page, config);
+    located = await findWebSearchControl(page, config);
   }
   if (!located) {
     return failedResult(requested, true, `${config.name} 找不到联网搜索开关。`);
@@ -83,6 +104,9 @@ export async function activateWebSearch(
 
   const deadline = Date.now() + 2_000;
   while (Date.now() < deadline) {
+    if (await hasEnabledWebSearchIndicator(page, config)) {
+      return successfulResult(requested);
+    }
     const state = await readToggleState(located.locator);
     if (state === true) return successfulResult(requested);
     await page.waitForTimeout(50);
@@ -92,6 +116,42 @@ export async function activateWebSearch(
     true,
     `${config.name} 联网搜索开关点击后无法确认已启用。`
   );
+}
+
+async function revealWebSearchMenu(
+  page: Page,
+  config: PlatformConfig
+): Promise<void> {
+  for (const selector of config.webSearchMenuTriggerSelectors ?? []) {
+    const locators = await page.locator(selector).all().catch(() => []);
+    for (const locator of locators.slice().reverse()) {
+      const [visible, enabled] = await Promise.all([
+        locator.isVisible().catch(() => false),
+        locator.isEnabled().catch(() => false)
+      ]);
+      if (!visible || !enabled) continue;
+      const clicked = await locator.click({ timeout: 1_500 })
+        .then(() => true)
+        .catch(() => false);
+      if (clicked) {
+        await page.waitForTimeout(200);
+        return;
+      }
+    }
+  }
+}
+
+async function hasEnabledWebSearchIndicator(
+  page: Page,
+  config: PlatformConfig
+): Promise<boolean> {
+  for (const selector of config.webSearchEnabledIndicatorSelectors ?? []) {
+    const locators = await page.locator(selector).all().catch(() => []);
+    for (const locator of locators.slice().reverse()) {
+      if (await locator.isVisible().catch(() => false)) return true;
+    }
+  }
+  return false;
 }
 
 /** REQUIRED 必须确认 enabled；不支持平台使用稳定错误码。 */

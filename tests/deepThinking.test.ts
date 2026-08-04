@@ -286,3 +286,44 @@ test("千问新版思考按钮可直接确认深度思考关闭且不点击", as
     await page.close();
   }
 });
+
+test("元宝新版 selected class 可幂等识别并切换深度思考", async () => {
+  assert.ok(browser);
+  const page = await browser.newPage();
+  try {
+    await page.setContent(`
+      <div id="thinking" dt-button-id="deep_think" aria-label="深度思考"
+        class="ThinkSelector_iconContainer__fixture">深度思考</div>
+      <script>
+        const control = document.querySelector("#thinking");
+        control.addEventListener("click", () => {
+          control.classList.toggle("ThinkSelector_selected__fixture");
+          document.body.dataset.clickCount = String(
+            Number(document.body.dataset.clickCount || "0") + 1
+          );
+        });
+      </script>
+    `);
+    const closed = await ensureDeepThinkingState(
+      page,
+      PLATFORMS.yuanbao,
+      false,
+      "fail"
+    );
+    assert.equal(closed.actual, false);
+    assert.equal(closed.changed, false);
+    assert.equal(await clickCount(page), 0);
+
+    const opened = await ensureDeepThinkingState(
+      page,
+      PLATFORMS.yuanbao,
+      true,
+      "fail"
+    );
+    assert.equal(opened.actual, true);
+    assert.equal(opened.changed, true);
+    assert.equal(await clickCount(page), 1);
+  } finally {
+    await page.close();
+  }
+});

@@ -35,8 +35,13 @@ const DOUBAO_ANSWER_BLOCK_SELECTOR = '[data-plugin-identifier*="block_type:10000
 const DOUBAO_BASELINE_ANSWERS_KEY = "__codexDoubaoBaselineAnswerContainers";
 const DEEPSEEK_ANSWER_SELECTOR = ".ds-markdown.ds-assistant-message-main-content";
 const DEEPSEEK_REFERENCE_CONTAINER_SELECTOR = '[class~="_223dd7b"]';
-const QIANWEN_ANSWER_SELECTOR =
-  ".message-select-wrapper-answer-rqWekn .qk-markdown";
+const QIANWEN_ANSWER_SELECTOR = [
+  // 旧版稳定包装层。
+  ".message-select-wrapper-answer-rqWekn .qk-markdown",
+  // 2026-08 新版回答卡片；外层哈希 class 可能变化，使用稳定语义 class 组合。
+  ".chat-answers-card-wrap .answer-common-card .qk-markdown",
+  ".chat-answers-card-wrap .qk-markdown.qk-markdown-complete"
+].join(", ");
 const QIANWEN_REFERENCE_TRIGGER_SELECTOR = '[class~="link-title-igf0OC"]';
 const QIANWEN_REFERENCE_LIST_SELECTOR = '[class~="list-XPxyL2"]';
 const QIANWEN_ANSWER_ACTION_SELECTOR =
@@ -618,6 +623,7 @@ async function resolveDoubaoBlockScope(
   }
 
   let firstBlockIndex = Math.max(minBlockIndex, 0);
+  let anchoredByBodyText = false;
   if (firstBlockIndex >= allBlocks.length && currentQuestion) {
     const bodyText = await page.locator("body").innerText({ timeout: 3_000 }).catch(() => "");
     const questionIndex = bodyText.lastIndexOf(currentQuestion);
@@ -627,13 +633,16 @@ async function resolveDoubaoBlockScope(
     if (/搜索\s*\d+\s*个关键词，\s*参考\s*\d+\s*篇资料/.test(currentAnswerText)) {
       // 极端情况下问题文本节点被框架合并，仍只检查 DOM 末尾的结果块和占位块。
       firstBlockIndex = Math.max(allBlocks.length - 2, 0);
+      // 首题发送会从空白页导航到新会话，页面内 WeakSet 基线会随文档重载丢失。
+      // 此时只有“当前问题之后明确出现搜索/参考文案”才视为可靠的题目锚点。
+      anchoredByBodyText = true;
     }
   }
 
   return {
     allBlocks,
     firstBlockIndex,
-    anchoredByQuestion: false,
+    anchoredByQuestion: anchoredByBodyText,
     anchoredByBaseline: false
   };
 }

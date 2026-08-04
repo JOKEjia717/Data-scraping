@@ -25,6 +25,8 @@ export type DeepThinkingUnsupportedPolicy = "allow_degrade" | "fail";
 export interface DeepThinkingControlConfig {
   supported: boolean;
   selectors: string[];
+  /** 控件 class 包含该语义片段时为开启，不包含时为明确关闭。 */
+  enabledClassNameFragment?: string;
   /** 页面明确展示“已关闭”模式时使用；仅用于读状态，不会被点击。 */
   disabledStateSelectors?: string[];
 }
@@ -54,8 +56,8 @@ export interface CliOptions {
   regenerateOnNoReferences: boolean;
   resolveTitles: boolean;
   timeoutMs: number;
-  /** 未配置时保持 research 的历史页面行为，不读取或点击深度思考控件。 */
-  deepThinking?: boolean;
+  /** 每题发送前需要确认的深度思考状态；CLI 默认关闭。 */
+  deepThinking: boolean;
   deepThinkingUnsupportedPolicy: DeepThinkingUnsupportedPolicy;
   /** 未配置时 research 继续使用历史的宽松尝试行为。 */
   webSearchPolicy?: WebSearchPolicy;
@@ -74,6 +76,10 @@ export interface PlatformConfig {
   sendButtonSelectors: string[];
   newConversationButtonSelectors: string[];
   webSearchButtonSelectors: string[];
+  /** 联网入口收纳在工具菜单时，先点击这些触发器再定位具体入口。 */
+  webSearchMenuTriggerSelectors?: string[];
+  /** 页面出现任一可见节点时，表示联网搜索已经明确启用。 */
+  webSearchEnabledIndicatorSelectors?: string[];
   /** false 表示平台配置明确声明不提供联网搜索能力。 */
   webSearchSupported: boolean;
   deepThinkingControl: DeepThinkingControlConfig;

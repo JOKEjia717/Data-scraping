@@ -352,6 +352,11 @@ export class MockRpaWorker {
         manager.markDamaged(batch.errorMessage ?? "品牌批次技术失败");
       }
       manager.finishBatch(batch.id, outcome);
+      const lastTask = this.requireMockTask(batch.tasks[batch.tasks.length - 1]?.id);
+      const opened = await manager.resetToBlank(lastTask.keyword);
+      if (!opened) {
+        throw new Error(`批次 ${batch.id} 完成后无法创建新对话。`);
+      }
     }
     this.conversationByPlatform.delete(batch.platformId);
   }
