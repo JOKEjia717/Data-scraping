@@ -10,13 +10,18 @@ import {
   clickLatestYuanbaoRegenerate,
   closeQianwenReferencePanel,
   detectQianwenAnswerLoop,
+  dismissInterruptingPopup,
   executeQuestion,
   inspectCurrentQuestionAnswer,
+  inspectDeepSeekQuestionAttempt,
+  inspectQianwenQuestionAttempt,
   isAnswerGenerating,
   isAnswerGeneratingControlText,
   permitsUnverifiedZeroReferences,
   qianwenAnswerFollowsRealQuestionBubble,
+  shouldCompleteQianwenAttempt,
   shouldCompleteDoubaoAnswer,
+  shouldCompleteTrackedAnswerFromStableState,
   submitQuestion,
   waitForYuanbaoCurrentAnswerComplete
 } from "../src/crawler.js";
@@ -103,6 +108,53 @@ test("千问深度研究的终止任务提示必须视为仍在生成", () => {
   assert.equal(isAnswerGeneratingControlText("回答已完成"), false);
 });
 
+test("千问结构化回答不能被阶段性稳定误判为完成", () => {
+  assert.equal(shouldCompleteTrackedAnswerFromStableState({
+    platformId: "qianwen",
+    sawAnswerStart: true,
+    busy: false,
+    stableForMs: 60_000,
+    elapsedMs: 90_000,
+    stableWindowMs: 12_000,
+    minimumWaitMs: 15_000,
+    qianwenStructuredAttemptObserved: true
+  }), false);
+
+  assert.equal(shouldCompleteTrackedAnswerFromStableState({
+    platformId: "qianwen",
+    sawAnswerStart: true,
+    busy: false,
+    stableForMs: 12_000,
+    elapsedMs: 15_000,
+    stableWindowMs: 12_000,
+    minimumWaitMs: 15_000,
+    qianwenStructuredAttemptObserved: false
+  }), true, "没有结构化 message-id 的旧版页面仍保留稳定兜底");
+});
+
+test("千问本题完成标记或本题来源入口才能放行结构化回答", () => {
+  const incomplete = {
+    status: "answered" as const,
+    messageId: "message-3",
+    answerContent: "仍在生成的正文",
+    answerComplete: false,
+    hasReferenceTrigger: false
+  };
+  assert.equal(shouldCompleteQianwenAttempt(incomplete, false), false);
+  assert.equal(shouldCompleteQianwenAttempt({
+    ...incomplete,
+    answerComplete: true
+  }, false), true);
+  assert.equal(shouldCompleteQianwenAttempt({
+    ...incomplete,
+    hasReferenceTrigger: true
+  }, false), true);
+  assert.equal(shouldCompleteQianwenAttempt({
+    ...incomplete,
+    answerComplete: true
+  }, true), false, "仍有生成信号时不能放行");
+});
+
 // 所有用例复用同一个浏览器进程，每个用例创建独立页面避免 DOM 状态互相污染。
 before(async () => {
   browser = await chromium.launch({ channel: "chrome", headless: true });
@@ -110,6 +162,78 @@ before(async () => {
 
 after(async () => {
   await browser?.close();
+});
+
+test("四个平台回答过程中出现普通弹窗时只点击安全的取消或关闭控件", async () => {
+  assert.ok(browser);
+  const page = await browser.newPage();
+  for (const platformId of ["doubao", "deepseek", "qianwen", "yuanbao"] as const) {
+    await page.setContent(`
+      <main>回答仍在生成</main>
+      <div role="dialog" aria-modal="true" id="interrupting-popup">
+        <div>体验新版功能</div>
+        <button id="confirm">立即体验</button>
+        <button id="cancel">稍后再说</button>
+      </div>
+      <script>
+        document.querySelector("#confirm").addEventListener("click", () => {
+          document.body.dataset.confirmed = "true";
+        });
+        document.querySelector("#cancel").addEventListener("click", () => {
+          document.body.dataset.cancelled = "true";
+          document.querySelector("#interrupting-popup").remove();
+        });
+      </script>
+    `);
+    const result = await dismissInterruptingPopup(page, platformId);
+    assert.equal(result.dismissed, true, `${platformId} 应关闭弹窗`);
+    assert.equal(await page.locator("body").getAttribute("data-cancelled"), "true");
+    assert.equal(await page.locator("body").getAttribute("data-confirmed"), null);
+  }
+  await page.close();
+});
+
+test("弹窗守卫不会关闭参考来源面板，也不会点击验证码", async () => {
+  assert.ok(browser);
+  const page = await browser.newPage();
+  await page.setContent(`
+    <div role="dialog" aria-modal="true" id="reference-dialog">
+      <div>参考来源 (2)</div>
+      <ul class="agent-dialogue-references__list"><li>来源一</li></ul>
+      <button id="reference-close" aria-label="关闭">关闭</button>
+    </div>
+    <script>
+      document.querySelector("#reference-close").addEventListener("click", () => {
+        document.body.dataset.referenceClosed = "true";
+      });
+    </script>
+  `);
+  assert.deepEqual(
+    await dismissInterruptingPopup(page, "yuanbao"),
+    { dismissed: false }
+  );
+  assert.equal(await page.locator("body").getAttribute("data-reference-closed"), null);
+
+  await page.setContent(`
+    <div role="dialog" aria-modal="true">
+      <div>请完成验证码或滑块验证</div>
+      <button id="captcha-close" aria-label="关闭">关闭</button>
+    </div>
+    <script>
+      document.querySelector("#captcha-close").addEventListener("click", () => {
+        document.body.dataset.captchaClosed = "true";
+      });
+    </script>
+  `);
+  await assert.rejects(
+    () => dismissInterruptingPopup(page, "qianwen"),
+    (error: unknown) =>
+      typeof error === "object" && error !== null &&
+      "errorCode" in error &&
+      (error as { errorCode?: unknown }).errorCode === "CAPTCHA_REQUIRED"
+  );
+  assert.equal(await page.locator("body").getAttribute("data-captcha-closed"), null);
+  await page.close();
 });
 
 test("豆包输入框右侧无文字方形图标必须视为仍在生成", async () => {
@@ -126,6 +250,47 @@ test("豆包输入框右侧无文字方形图标必须视为仍在生成", async
   assert.equal(await isAnswerGenerating(page, "qianwen"), false);
   await page.locator("#stop").evaluate((element) => element.remove());
   assert.equal(await isAnswerGenerating(page, "doubao"), false);
+  await page.close();
+});
+
+test("豆包新版普通 DIV 停止控件和 data-streaming 能阻止提前发送下一题", async () => {
+  assert.ok(browser);
+  const page = await browser.newPage({ viewport: { width: 1280, height: 720 } });
+  await page.setContent(`
+    <textarea style="position:fixed;left:160px;top:600px;width:900px;height:24px"></textarea>
+    <div data-message-id="question" class="flex w-full justify-end">测试问题</div>
+    <div data-message-id="answer" class="relative grid w-full">
+      <div id="stream" data-streaming="true">正在回答</div>
+    </div>
+    <div
+      id="stop"
+      class="break-btn-fISNgC size-36 rounded-full cursor-pointer"
+      style="position:fixed;left:980px;top:620px;width:36px;height:36px"
+    >
+      <svg viewBox="0 0 24 24"><path d="M7.5 7.5h9v9h-9z"></path></svg>
+    </div>
+    <div
+      id="voice"
+      class="size-36 rounded-full cursor-pointer"
+      style="position:fixed;left:930px;top:620px;width:36px;height:36px"
+    >
+      <svg viewBox="0 0 24 24"><path d="M8 7v10M12 4v16M16 7v10"></path></svg>
+    </div>
+  `);
+
+  assert.equal(await isAnswerGenerating(page, "doubao"), true);
+  await page.locator("#stop").evaluate((element) => element.remove());
+  assert.equal(
+    await isAnswerGenerating(page, "doubao"),
+    true,
+    "即使停止控件短暂重挂载，最新回答的 streaming 标志仍应阻止放行"
+  );
+  await page.locator("#stream").evaluate((element) => element.setAttribute("data-streaming", "false"));
+  assert.equal(
+    await isAnswerGenerating(page, "doubao"),
+    false,
+    "回答完成后的语音图标不能被误判为停止控件"
+  );
   await page.close();
 });
 
@@ -226,6 +391,67 @@ test("豆包点击发送但没有真实问题消息时停止且不重复发送",
 
   await assert.rejects(
     () => submitQuestion(page, PLATFORMS.doubao, "不得重复发送的问题", 500),
+    /没有出现本题真实问题消息.*不会自动重复发送/
+  );
+  assert.equal(await page.locator("body").getAttribute("data-click-count"), "1");
+  await page.close();
+});
+
+test("豆包第二题问题气泡未命中时用本次新增流式回答确认提交", async () => {
+  assert.ok(browser);
+  const page = await browser.newPage({ viewport: { width: 1280, height: 720 } });
+  await page.setContent(`
+    <main id="conversation">
+      <div data-message-id="first-question" class="justify-end">第一题</div>
+      <div data-message-id="first-answer"><div data-streaming="false">第一题回答</div></div>
+    </main>
+    <textarea style="position:fixed;left:160px;top:600px;width:900px;height:24px"></textarea>
+    <button aria-label="发送" type="button">发送</button>
+    <script>
+      document.querySelector("button").addEventListener("click", () => {
+        document.body.dataset.clickCount = String(Number(document.body.dataset.clickCount || 0) + 1);
+        document.querySelector("textarea").value = "";
+        // 模拟真实故障：第二题已被接受，但豆包没有挂载符合 justify-end/user 的问题根。
+        setTimeout(() => {
+          document.querySelector("#conversation").insertAdjacentHTML(
+            "beforeend",
+            '<div data-message-id="second-answer">' +
+              '<div data-streaming="true">第二题正在回答</div>' +
+              '<div data-plugin-identifier="search_query_result_block">' +
+                '搜索 3 个关键词，参考 18 篇资料' +
+              '</div>' +
+            '</div>'
+          );
+        }, 100);
+      });
+    </script>
+  `);
+
+  await submitQuestion(page, PLATFORMS.doubao, "第二题", 2_000);
+  assert.equal(await page.locator("body").getAttribute("data-click-count"), "1");
+  assert.equal(await page.locator("[data-message-id='second-answer']").count(), 1);
+  await page.close();
+});
+
+test("豆包上一题残留生成状态不能误判为新题已提交", async () => {
+  assert.ok(browser);
+  const page = await browser.newPage();
+  await page.setContent(`
+    <main>
+      <div data-message-id="old-answer"><div data-streaming="true">上一题仍在生成</div></div>
+    </main>
+    <textarea></textarea>
+    <button aria-label="发送" type="button">发送</button>
+    <script>
+      document.querySelector("button").addEventListener("click", () => {
+        document.body.dataset.clickCount = String(Number(document.body.dataset.clickCount || 0) + 1);
+        document.querySelector("textarea").value = "";
+      });
+    </script>
+  `);
+
+  await assert.rejects(
+    () => submitQuestion(page, PLATFORMS.doubao, "没有被接收的新题", 500),
     /没有出现本题真实问题消息.*不会自动重复发送/
   );
   assert.equal(await page.locator("body").getAttribute("data-click-count"), "1");
@@ -800,6 +1026,46 @@ test("DeepSeek、千问和元宝只提取最后一版回答正文并清理非正
   await page.close();
 });
 
+test("DeepSeek 按虚拟列表相邻项恢复当前题回答，不受正文引用序号影响", async () => {
+  assert.ok(browser);
+  const page = await browser.newPage();
+  const question = "在电脑上安装软件时，哪些品牌更值得推荐？";
+  await page.setContent(`
+    <main>
+      <div data-virtual-list-item-key="old-q"><div class="ds-message">上一题</div></div>
+      <div data-virtual-list-item-key="old-a"><div class="ds-message">
+        <div class="ds-markdown ds-assistant-message-main-content">上一题回答</div>
+      </div></div>
+      <div data-virtual-list-item-key="current-q"><div class="ds-message">${question}</div></div>
+      <div data-virtual-list-item-key="current-a"><div class="ds-message">
+        <div class="ds-markdown ds-assistant-message-main-content">
+          当前题完整回答<sup>1</sup>，正文还带有 -1-3-5 形式的来源序号。
+        </div>
+      </div></div>
+    </main>
+  `);
+
+  const paired = await inspectDeepSeekQuestionAttempt(
+    page,
+    question,
+    ["old-q", "old-a"]
+  );
+  assert.equal(paired.status, "answered");
+  assert.equal(paired.questionKey, "current-q");
+  assert.equal(paired.answerKey, "current-a");
+  assert.match(paired.answerContent ?? "", /当前题完整回答/);
+
+  const inspection = await inspectCurrentQuestionAnswer(
+    page,
+    PLATFORMS.deepseek,
+    question,
+    "business"
+  );
+  assert.equal(inspection.status, "answered", inspection.reason);
+  assert.match(inspection.answerContent ?? "", /当前题完整回答/);
+  await page.close();
+});
+
 test("千问新版 complete 回答节点延迟挂载时只等待恢复而不重新提问", async () => {
   assert.ok(browser);
   const page = await browser.newPage();
@@ -988,6 +1254,208 @@ test("千问消息 ID 不会把后一题回答错配给前一题", async () => {
     await qianwenAnswerFollowsRealQuestionBubble(page, "第二题", "第二题回答"),
     true
   );
+  await page.close();
+});
+
+test("千问恢复检查会等待本题回答节点和完成标记异步挂载", async () => {
+  assert.ok(browser);
+  const page = await browser.newPage();
+  const question = "第二题异步回答测试";
+  await page.setContent(`
+    <main id="chat">
+      <div data-chat-question-wrap="message-1">第一题</div>
+      <div data-chat-answers-wrap="message-1">
+        <div class="qk-markdown qk-markdown-complete">第一题完整回答</div>
+        <button class="link-title-igf0OC">8篇来源</button>
+      </div>
+      <div data-chat-question-wrap="message-2">${question}</div>
+    </main>
+    <script>
+      setTimeout(() => {
+        document.querySelector("#chat").insertAdjacentHTML(
+          "beforeend",
+          '<div data-chat-answers-wrap="message-2">' +
+            '<div class="qk-markdown">第二题正在生成的回答</div>' +
+          '</div>'
+        );
+      }, 100);
+      setTimeout(() => {
+        const answer = document.querySelector('[data-chat-answers-wrap="message-2"]');
+        answer.querySelector(".qk-markdown").classList.add("qk-markdown-complete");
+        answer.querySelector(".qk-markdown").textContent = "第二题完整回答";
+        answer.insertAdjacentHTML("beforeend", '<button class="link-title-igf0OC">7篇来源</button>');
+      }, 300);
+    </script>
+  `);
+
+  const inspection = await inspectCurrentQuestionAnswer(
+    page,
+    PLATFORMS.qianwen,
+    question,
+    "business"
+  );
+
+  assert.equal(inspection.status, "answered", inspection.reason);
+  assert.equal(inspection.answerContent, "第二题完整回答");
+  const structured = await inspectQianwenQuestionAttempt(page, question);
+  assert.equal(structured.answerComplete, true);
+  assert.equal(structured.hasReferenceTrigger, true);
+  assert.equal(await countQianwenReferenceTriggers(page), 2);
+  await page.close();
+});
+
+test("千问系统超时卡不会复用上一题正文", async () => {
+  assert.ok(browser);
+  const page = await browser.newPage();
+  await page.setContent(`
+    <main>
+      <div data-chat-question-wrap="old-question">上一题</div>
+      <div data-chat-answers-wrap="old-question">
+        <div class="qk-markdown qk-markdown-complete">上一题成功回答</div>
+      </div>
+      <div data-chat-question-wrap="current-question">当前问题</div>
+      <div data-chat-answers-wrap="current-question">抱歉，系统超时，请稍后重试。</div>
+    </main>
+  `);
+
+  const inspection = await inspectQianwenQuestionAttempt(
+    page,
+    "当前问题",
+    ["old-question"]
+  );
+  assert.equal(inspection.status, "system_timeout");
+  assert.equal(inspection.messageId, "current-question");
+  assert.equal(inspection.answerContent, undefined);
+  await page.close();
+});
+
+test("千问自己追加同文重试时优先采用最后一次成功回答", async () => {
+  assert.ok(browser);
+  const page = await browser.newPage();
+  await page.setContent(`
+    <main>
+      <div data-chat-question-wrap="attempt-1">当前问题</div>
+      <div data-chat-answers-wrap="attempt-1">抱歉，系统超时，请稍后重试。</div>
+      <div data-chat-question-wrap="attempt-2">当前问题</div>
+      <div data-chat-answers-wrap="attempt-2">
+        <div class="qk-markdown qk-markdown-complete">千问自动重试后的回答</div>
+      </div>
+    </main>
+  `);
+
+  const inspection = await inspectQianwenQuestionAttempt(page, "当前问题");
+  assert.equal(inspection.status, "answered");
+  assert.equal(inspection.messageId, "attempt-2");
+  assert.equal(inspection.answerContent, "千问自动重试后的回答");
+  assert.equal(inspection.answerComplete, true);
+  await page.close();
+});
+
+test("千问明确系统超时后 executeQuestion 只重发原问题并取得配对回答", async () => {
+  assert.ok(browser);
+  const page = await browser.newPage();
+  await page.setContent(`
+    <main id="chat"></main>
+    <textarea aria-label="聊天输入框"></textarea>
+    <button aria-label="发送" id="send">发送</button>
+    <script>
+      let attempt = 0;
+      document.querySelector("#send").addEventListener("click", () => {
+        attempt += 1;
+        const input = document.querySelector("textarea");
+        const question = input.value;
+        input.value = "";
+        const messageId = "attempt-" + attempt;
+        const answer = attempt === 1
+          ? "抱歉，系统超时，请稍后重试。"
+          : '<div class="qk-markdown qk-markdown-complete">第二次发送成功回答</div>';
+        document.querySelector("#chat").insertAdjacentHTML("beforeend",
+          '<div data-chat-question-wrap="' + messageId + '">' + question + '</div>' +
+          '<div data-chat-answers-wrap="' + messageId + '">' + answer + '</div>'
+        );
+        document.body.dataset.sendCount = String(attempt);
+      });
+    </script>
+  `);
+
+  const result = await executeQuestion(
+    { questionIndex: 0, question: "需要重试的问题" },
+    {
+      page,
+      config: PLATFORMS.qianwen,
+      mode: "business",
+      promptPrefix: "",
+      retryOnNoReferences: false,
+      regenerateOnNoReferences: false,
+      requireReferences: false,
+      resolveTitles: false,
+      timeoutMs: 10_000,
+      webSearchPolicy: "DISABLED",
+      allowUnverifiedZeroReferences: true,
+      qianwenSystemTimeoutResubmissionAttempts: 1
+    }
+  );
+
+  assert.equal(await page.locator("body").getAttribute("data-send-count"), "2");
+  assert.equal(await page.locator("[data-chat-question-wrap]").count(), 2);
+  assert.ok(result.answer);
+  assert.equal(result.answer.answer, "第二次发送成功回答");
+  await page.close();
+});
+
+test("千问在宽限期内自己重试成功时 executeQuestion 不重复点击发送", async () => {
+  assert.ok(browser);
+  const page = await browser.newPage();
+  await page.setContent(`
+    <main id="chat"></main>
+    <textarea aria-label="聊天输入框"></textarea>
+    <button aria-label="发送" id="send">发送</button>
+    <script>
+      let sendCount = 0;
+      document.querySelector("#send").addEventListener("click", () => {
+        sendCount += 1;
+        const input = document.querySelector("textarea");
+        const question = input.value;
+        input.value = "";
+        document.querySelector("#chat").insertAdjacentHTML("beforeend",
+          '<div data-chat-question-wrap="attempt-timeout">' + question + '</div>' +
+          '<div data-chat-answers-wrap="attempt-timeout">抱歉，系统超时，请稍后重试。</div>'
+        );
+        document.body.dataset.sendCount = String(sendCount);
+        setTimeout(() => {
+          document.querySelector("#chat").insertAdjacentHTML("beforeend",
+            '<div data-chat-question-wrap="attempt-auto">' + question + '</div>' +
+            '<div data-chat-answers-wrap="attempt-auto">' +
+              '<div class="qk-markdown qk-markdown-complete">平台自动重试成功回答</div>' +
+            '</div>'
+          );
+        }, 1250);
+      });
+    </script>
+  `);
+
+  const result = await executeQuestion(
+    { questionIndex: 0, question: "平台会自动重试的问题" },
+    {
+      page,
+      config: PLATFORMS.qianwen,
+      mode: "business",
+      promptPrefix: "",
+      retryOnNoReferences: false,
+      regenerateOnNoReferences: false,
+      requireReferences: false,
+      resolveTitles: false,
+      timeoutMs: 10_000,
+      webSearchPolicy: "DISABLED",
+      allowUnverifiedZeroReferences: true,
+      qianwenSystemTimeoutResubmissionAttempts: 1
+    }
+  );
+
+  assert.equal(await page.locator("body").getAttribute("data-send-count"), "1");
+  assert.equal(await page.locator("[data-chat-question-wrap]").count(), 2);
+  assert.ok(result.answer);
+  assert.equal(result.answer.answer, "平台自动重试成功回答");
   await page.close();
 });
 
@@ -1415,6 +1883,10 @@ test("元宝来源入口提前出现时仍等待当前正文停止增长", async
         </div>
       </section>
     </main>
+    <div role="dialog" aria-modal="true" id="answer-popup" style="display:none">
+      <div>发现新功能</div>
+      <button id="answer-popup-cancel">取消</button>
+    </div>
     <script>
       setTimeout(() => {
         document.querySelector("#yuanbao-streaming-answer").textContent =
@@ -1424,6 +1896,13 @@ test("元宝来源入口提前出现时仍等待当前正文停止增长", async
         document.querySelector("#yuanbao-streaming-answer").textContent +=
           "第一部分仍在生成。";
       }, 350);
+      setTimeout(() => {
+        document.querySelector("#answer-popup").style.display = "block";
+      }, 400);
+      document.querySelector("#answer-popup-cancel").addEventListener("click", () => {
+        document.body.dataset.popupClosed = "true";
+        document.querySelector("#answer-popup").remove();
+      });
       setTimeout(() => {
         document.querySelector("#yuanbao-streaming-answer").textContent +=
           "这是最终完整答案。";
@@ -1447,6 +1926,7 @@ test("元宝来源入口提前出现时仍等待当前正文停止增长", async
     "回答开头。第一部分仍在生成。这是最终完整答案。"
   );
   assert.ok(elapsed >= 900, `不应在最终正文出现前结束等待，实际等待 ${elapsed}ms`);
+  assert.equal(await page.locator("body").getAttribute("data-popup-closed"), "true");
   await page.close();
 });
 

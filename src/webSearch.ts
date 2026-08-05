@@ -81,8 +81,7 @@ export async function activateWebSearch(
   }
   if (indicatorEnabled) return successfulResult(requested);
   if (!located) {
-    await revealWebSearchMenu(page, config);
-    located = await findWebSearchControl(page, config);
+    located = await revealWebSearchMenu(page, config);
   }
   if (!located) {
     return failedResult(requested, true, `${config.name} 找不到联网搜索开关。`);
@@ -121,7 +120,7 @@ export async function activateWebSearch(
 async function revealWebSearchMenu(
   page: Page,
   config: PlatformConfig
-): Promise<void> {
+): Promise<LocatedWebSearchControl | undefined> {
   for (const selector of config.webSearchMenuTriggerSelectors ?? []) {
     const locators = await page.locator(selector).all().catch(() => []);
     for (const locator of locators.slice().reverse()) {
@@ -134,12 +133,21 @@ async function revealWebSearchMenu(
         .then(() => true)
         .catch(() => false);
       if (clicked) {
-        // 元宝 Windows 新版菜单带展开动画，200ms 内菜单项可能仍未挂载。
-        await page.waitForTimeout(config.id === "yuanbao" ? 600 : 200);
-        return;
+        // 元宝 Windows 新版工具菜单可能经过动画、接口配置和 Portal 挂载，
+        // 固定等待 600ms 偶发早于“联网搜索”菜单项。点击后直接轮询真实入口。
+        const deadline = Date.now() + (config.id === "yuanbao" ? 3_000 : 1_000);
+        while (Date.now() < deadline) {
+          const located = await findWebSearchControl(page, config);
+          if (located) return located;
+          await page.waitForTimeout(100);
+        }
+        // 本次触发器没有展开有效菜单，先收起再尝试下一个兼容入口，避免
+        // 下一次点击同一区域时反而把已经打开的菜单关闭。
+        await page.keyboard.press("Escape").catch(() => undefined);
       }
     }
   }
+  return undefined;
 }
 
 async function hasEnabledWebSearchIndicator(

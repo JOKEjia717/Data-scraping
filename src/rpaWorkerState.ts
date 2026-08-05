@@ -350,7 +350,14 @@ WHERE e.status = 1
   AND e.answer_id IS NULL
   AND e.deleted = 0
   AND d.business_type = ?
-  AND e.modify_time < ?
+  -- mysql2 按 UTC 序列化 Date，但业务库的 DATETIME/CURRENT_TIMESTAMP 使用
+  -- 数据库本地时区。先按数据库当前 UTC 偏移换算截止时间，避免 +08:00
+  -- 环境下僵尸任务要多等 8 小时才会被发现。
+  AND e.modify_time < TIMESTAMPADD(
+    SECOND,
+    TIMESTAMPDIFF(SECOND, UTC_TIMESTAMP(), CURRENT_TIMESTAMP()),
+    ?
+  )
 ORDER BY e.modify_time ASC, e.id ASC
 LIMIT ?`;
 
@@ -369,7 +376,11 @@ WHERE e.id = ?
   AND e.task_status = 1
   AND e.answer_id IS NULL
   AND e.deleted = 0
-  AND e.modify_time < ?
+  AND e.modify_time < TIMESTAMPADD(
+    SECOND,
+    TIMESTAMPDIFF(SECOND, UTC_TIMESTAMP(), CURRENT_TIMESTAMP()),
+    ?
+  )
   AND d.business_type = ?`;
 
 function normalizeIds(values: readonly string[]): string[] {

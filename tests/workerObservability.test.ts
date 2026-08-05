@@ -31,6 +31,60 @@ test("日志隐私函数会脱敏并限制无界文本和 URL 凭据", () => {
   assert.match(url, /access_token=/);
 });
 
+test("四个平台 DOM 历史写入同一个有界脱敏 JSON 文件", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "rpa-dom-history-"));
+  try {
+    const page = {
+      url: () => "https://chat.example.com/path?access_token=secret#private",
+      evaluate: async () =>
+        "<!doctype html><html><body password=secret>DOM snapshot</body></html>"
+    } as unknown as Page;
+    const store = new FailureEvidenceStore({
+      evidenceDirectory: path.join(root, "evidence"),
+      maxDomChars: 1_000,
+      maxDomSnapshotsPerPlatform: 2,
+      retentionDays: 7
+    });
+    for (let index = 1; index <= 3; index++) {
+      await store.captureDomSnapshot({
+        page,
+        workerId: "diagnosis-worker",
+        brandId: "brand-1",
+        businessGroupId: "business-1",
+        platformId: "doubao",
+        questionIndex: index,
+        outcome: "success"
+      });
+    }
+    await store.captureDomSnapshot({
+      page,
+      workerId: "diagnosis-worker",
+      brandId: "brand-1",
+      businessGroupId: "business-1",
+      platformId: "yuanbao",
+      questionIndex: 1,
+      outcome: "failure",
+      errorCode: "REFERENCE_UNKNOWN"
+    });
+
+    assert.equal(path.basename(store.domHistoryPath), "dom-history.json");
+    const history = JSON.parse(await fs.readFile(store.domHistoryPath, "utf8")) as {
+      schemaVersion: number;
+      snapshots: Array<{
+        platform: string;
+        currentUrl: string;
+        html: string;
+      }>;
+    };
+    assert.equal(history.schemaVersion, 1);
+    assert.equal(history.snapshots.filter(({ platform }) => platform === "doubao").length, 2);
+    assert.equal(history.snapshots.filter(({ platform }) => platform === "yuanbao").length, 1);
+    assert.doesNotMatch(JSON.stringify(history), /password=secret|access_token=secret|#private/);
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
 test("结构化任务日志达到大小上限后滚动，且不触碰 Outbox 目录", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "rpa-log-rotation-"));
   try {

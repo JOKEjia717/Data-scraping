@@ -291,6 +291,7 @@ export const PLATFORMS: Record<PlatformId, PlatformConfig> = {
       "[title*='联网搜索']"
     ],
     webSearchMenuTriggerSelectors: [
+      "button[aria-label='工具']",
       ".ybc-atomSelect-tools-wrapper.web-margin",
       ".ybc-atomSelect-tools-wrapper",
       "button:has-text('工具')",

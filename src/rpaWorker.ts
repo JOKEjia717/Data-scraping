@@ -10,6 +10,7 @@ import {
 import {
   executeQuestion,
   inspectCurrentQuestionAnswer,
+  isSafeSameQuestionRetryError,
   recoverSubmittedQuestionResult,
   type ExecuteQuestionRuntime
 } from "./crawler.js";
@@ -36,7 +37,12 @@ import {
   type SuccessResultWriter
 } from "./resultOutbox.js";
 import type { CollectionTask } from "./rpaTask.js";
-import { routeRpaFailure, taskRetryDelayMs } from "./rpaRetryPolicy.js";
+import {
+  routeRpaFailure,
+  taskRetryDelayMs,
+  type RpaFailureCode,
+  type RpaFailureRoute
+} from "./rpaRetryPolicy.js";
 import {
   ExecutionHeartbeat,
   MysqlAdvisoryLeaseCoordinator,
@@ -690,25 +696,34 @@ export async function runRpaWorkerHealthCheck(
     cdpEndpoint: config.cdpEndpoint,
     platforms: config.platforms.map((platformId) => PLATFORMS[platformId])
   });
-  rpaConsoleInfo({
-    workerId: config.workerId,
-    event: "HEALTH_CHECK",
-    batchProgress: `pendingSample=${tasks.length},cdp=${selfCheck.connected ? "READY" : "FAILED"}`
-  });
-  let failed = !selfCheck.connected;
-  for (const platformId of config.platforms) {
-    const result = selfCheck.platforms[platformId];
+  try {
     rpaConsoleInfo({
       workerId: config.workerId,
-      event: "PLATFORM_HEALTH",
-      platformId,
-      errorCode: result?.ready ? "READY" : result?.errorCode ?? result?.healthStatus ?? "UNKNOWN"
+      event: "HEALTH_CHECK",
+      batchProgress: `pendingSample=${tasks.length},cdp=${selfCheck.connected ? "READY" : "FAILED"}`
     });
-    if (!result?.ready) failed = true;
+    let failed = !selfCheck.connected;
+    for (const platformId of config.platforms) {
+      const result = selfCheck.platforms[platformId];
+      rpaConsoleInfo({
+        workerId: config.workerId,
+        event: "PLATFORM_HEALTH",
+        platformId,
+        errorCode: result?.ready ? "READY" : result?.errorCode ?? result?.healthStatus ?? "UNKNOWN"
+      });
+      if (!result?.ready) failed = true;
+    }
+    // 保留参数，避免健康检查和正式运行使用不同的证据目录配置。
+    void evidenceStore;
+    if (failed) throw new Error("Worker 健康检查未全部通过。");
+  } finally {
+    // health-check 路径不进入 session.browserRuntime，必须在这里释放 CDP
+    // 连接，否则已经输出 SUMMARY 的一次性进程仍会占住事件循环。
+    if (selfCheck.browser?.isConnected()) {
+      await selfCheck.browser.close({ reason: "RPA health check completed" })
+        .catch(() => undefined);
+    }
   }
-  // 保留参数，避免健康检查和正式运行使用不同的证据目录配置。
-  void evidenceStore;
-  if (failed) throw new Error("Worker 健康检查未全部通过。");
 }
 
 interface ExecuteClaimedInput {
@@ -741,13 +756,16 @@ export function deepThinkingRuntimeForTask(
   };
 }
 
-/** ARTICLE_PROBE 永远 REQUIRED；只有 DIAGNOSIS 读取部署策略。 */
+/** ARTICLE_PROBE 永远 REQUIRED；元宝诊断允许入口探测降级，但仍由参考列表结果严格验收。 */
 export function webSearchRuntimeForTask(
   task: Pick<CollectionTask, "businessType">,
-  config: Pick<RpaWorkerConfig, "webSearchPolicy">
+  config: Pick<RpaWorkerConfig, "webSearchPolicy">,
+  platformId?: PlatformId
 ): Pick<ExecuteQuestionRuntime, "webSearchPolicy"> {
   return {
-    webSearchPolicy: webSearchPolicyForBusinessType(task.businessType, config.webSearchPolicy)
+    webSearchPolicy: task.businessType === "DIAGNOSIS" && platformId === "yuanbao"
+      ? "PREFERRED"
+      : webSearchPolicyForBusinessType(task.businessType, config.webSearchPolicy)
   };
 }
 
@@ -957,7 +975,7 @@ async function executeClaimedBatches(input: ExecuteClaimedInput): Promise<void> 
       }
       let submissionState: "not_submitted" | "submitted" | "uncertain" = "not_submitted";
       let actualDeepThinking: boolean | null = null;
-      const taskWebSearchRuntime = webSearchRuntimeForTask(task, config);
+      const taskWebSearchRuntime = webSearchRuntimeForTask(task, config, context.platformId);
       const referenceRecoveryRuntime = referenceRecoveryRuntimeForTask(task, context.platformId);
       const allowUnverifiedZeroReferences =
         task.businessType === "DIAGNOSIS" && context.platformId === "qianwen";
@@ -1088,6 +1106,16 @@ async function executeClaimedBatches(input: ExecuteClaimedInput): Promise<void> 
             ? {}
             : { errorMessage: `结果待持久化：${boundedError(persistenceError)}` })
         }).catch(() => undefined);
+        await input.evidenceStore.captureDomSnapshot({
+          page,
+          workerId: config.workerId,
+          brandId: task.brandId,
+          businessGroupId: task.businessGroupId,
+          platformId: context.platformId,
+          questionIndex: context.taskIndex + 1,
+          outcome: persistenceStatus === "saved" ? "success" : "persistence_pending",
+          errorCode: databasePersistenceError ? "DATABASE_ERROR" : null
+        }).catch(() => undefined);
         return {
           status: references.length === 0 ? "zero_references" as const : "success" as const,
           referenceCount: references.length,
@@ -1204,7 +1232,10 @@ async function executeClaimedBatches(input: ExecuteClaimedInput): Promise<void> 
           } catch (recoveryError) {
             error = recoveryError;
             errorCode = classifyTechnicalError(recoveryError);
-            if (errorCode !== "REFERENCE_UNKNOWN") errorCode = "REFERENCE_UNKNOWN";
+            if (
+              errorCode !== "REFERENCE_UNKNOWN" &&
+              !isSafeSameQuestionRetryError(recoveryError)
+            ) errorCode = "REFERENCE_UNKNOWN";
           }
         }
         let postSubmitUncertain = false;
@@ -1219,17 +1250,26 @@ async function executeClaimedBatches(input: ExecuteClaimedInput): Promise<void> 
             status: "uncertain" as const,
             reason: `发送后检查异常：${boundedError(inspectionError)}`
           }));
-          if (inspection.status === "answered" && inspection.answerContent?.trim()) {
+          if (inspection.status === "retryable") {
+            // 明确的千问系统超时已经由题内重发达到上限，可安全走任务级退避重试，
+            // 不应误判成结果未知并暂停整个平台。
+            errorCode = "ANSWER_TIMEOUT";
+            inspectionReason = inspection.reason;
+          } else if (inspection.status === "answered" && inspection.answerContent?.trim()) {
             // 只确认正文不能证明引用为空。保留页面回答，不再把提取异常伪造成零引用。
             errorCode = "REFERENCE_UNKNOWN";
+            postSubmitUncertain = true;
+          } else {
+            postSubmitUncertain = true;
+            if (inspection.status !== "answered") errorCode = "REFERENCE_UNKNOWN";
           }
-          postSubmitUncertain = true;
-          lifecycleStates.set(task.executionId, "POST_SUBMIT_UNCERTAIN");
-          inspectionReason = errorCode === "WEB_SEARCH_UNSUPPORTED" ||
-            errorCode === "WEB_SEARCH_UNVERIFIED"
-            ? "已取得回答，但联网状态未确认，不能作为普通零引用成功"
-            : inspection.reason;
-          if (inspection.status !== "answered") errorCode = "REFERENCE_UNKNOWN";
+          if (postSubmitUncertain) {
+            lifecycleStates.set(task.executionId, "POST_SUBMIT_UNCERTAIN");
+            inspectionReason = errorCode === "WEB_SEARCH_UNSUPPORTED" ||
+              errorCode === "WEB_SEARCH_UNVERIFIED"
+              ? "已取得回答，但联网状态未确认，不能作为普通零引用成功"
+              : inspection.reason;
+          }
         }
         const evidence = await input.evidenceStore.capture({
           page,
@@ -1267,10 +1307,15 @@ async function executeClaimedBatches(input: ExecuteClaimedInput): Promise<void> 
           ...evidence
         }).catch(() => undefined);
 
-        const route = routeRpaFailure(errorCode);
+        const route = routePlatformTaskFailure(context.platformId, errorCode);
         // 平台阻断发生在发送前时不消耗任务次数；批次失败钩子会安全释放未发题任务。
         if (route === "pause_platform") {
-          throw executionErrorFor(error, errorCode, config.rateLimitCooldownMs);
+          throw executionErrorFor(
+            error,
+            errorCode,
+            config.rateLimitCooldownMs,
+            config.pollIntervalMs
+          );
         }
 
         // 任务级重试闭环：先从心跳集合移除，退避期间继续持有 execution lock；
@@ -1309,7 +1354,12 @@ async function executeClaimedBatches(input: ExecuteClaimedInput): Promise<void> 
             error: databaseError,
             secrets: [task.keyword]
           });
-          throw executionErrorFor(error, errorCode, config.rateLimitCooldownMs);
+          throw executionErrorFor(
+            error,
+            errorCode,
+            config.rateLimitCooldownMs,
+            config.pollIntervalMs
+          );
         }
         owned.delete(task.executionId);
         await input.leases.release(executionLeaseName(task.executionId)).catch(() => undefined);
@@ -1350,7 +1400,12 @@ async function executeClaimedBatches(input: ExecuteClaimedInput): Promise<void> 
             "finalFailed"
           );
         }
-        throw executionErrorFor(error, errorCode, config.rateLimitCooldownMs);
+        throw executionErrorFor(
+          error,
+          errorCode,
+          config.rateLimitCooldownMs,
+          config.pollIntervalMs
+        );
       }
 
       return finalizeSuccessfulAnswer(
@@ -1530,19 +1585,47 @@ function platformBlockedError(
   );
 }
 
-function executionErrorFor(
+export function executionErrorFor(
   error: unknown,
   errorCode: WorkerErrorCode,
-  rateLimitCooldownMs: number
+  rateLimitCooldownMs: number,
+  pollIntervalMs: number
 ): unknown {
   const health = healthStatusForErrorCode(errorCode);
   if (health === "RATE_LIMITED") {
     return new PlatformExecutionError(boundedError(error), health, rateLimitCooldownMs);
   }
+  if (
+    health === "COOLING_DOWN" &&
+    (errorCode === "WEB_SEARCH_UNVERIFIED" || errorCode === "REFERENCE_UNKNOWN")
+  ) {
+    // 这两类错误通常来自入口动画、懒加载或 A/B DOM 的短暂不可见。
+    // 冷却时间与轮询周期对齐，使平台在下一轮恢复，而不是永久熔断。
+    return new PlatformExecutionError(
+      boundedError(error),
+      "COOLING_DOWN",
+      pollIntervalMs
+    );
+  }
   if (health === "CAPTCHA_REQUIRED" || health === "LOGIN_REQUIRED" || health === "DOM_CHANGED") {
     return new PlatformExecutionError(boundedError(error), health);
   }
   return error;
+}
+
+/**
+ * 元宝诊断已在题内完成有限次参考列表检查与重新生成；仍无列表时允许把同一题
+ * 释放回数据库做有上限的跨轮询重试。其他平台的发送后引用未知仍保持平台级保护，
+ * 避免在不能确认页面结果时盲目重复提交。
+ */
+export function routePlatformTaskFailure(
+  platformId: PlatformId,
+  errorCode: RpaFailureCode
+): RpaFailureRoute {
+  if (platformId === "yuanbao" && errorCode === "REFERENCE_UNKNOWN") {
+    return "retry_task";
+  }
+  return routeRpaFailure(errorCode);
 }
 
 /** 指标是旁路能力：数据库聚合或本地 Outbox 扫描失败都不得改变业务结果。 */

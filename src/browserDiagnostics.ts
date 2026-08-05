@@ -140,9 +140,13 @@ export function healthStatusForErrorCode(errorCode: WorkerErrorCode): PlatformHe
       return "RATE_LIMITED";
     case "DOM_CHANGED":
     case "WEB_SEARCH_UNSUPPORTED":
+      return "DOM_CHANGED";
+    // 联网开关或引用入口可能因页面动画、懒加载、A/B DOM 短暂不可见。
+    // 单次未确认不应永久熔断整个平台；执行层会进入技术冷却，
+    // 到期后在下一轮轮询自动恢复 READY，并重新领取该平台的最早待办批次。
     case "WEB_SEARCH_UNVERIFIED":
     case "REFERENCE_UNKNOWN":
-      return "DOM_CHANGED";
+      return "COOLING_DOWN";
     case "CDP_CONNECTION_FAILED":
     case "PLATFORM_TAB_MISSING":
       return "DISABLED";

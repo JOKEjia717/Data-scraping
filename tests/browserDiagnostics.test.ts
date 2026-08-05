@@ -43,7 +43,8 @@ test("技术错误分类稳定映射到执行层健康状态", () => {
   assert.equal(healthStatusForErrorCode("ANONYMOUS_QUOTA_EXCEEDED"), "RATE_LIMITED");
   assert.equal(healthStatusForErrorCode("DOM_CHANGED"), "DOM_CHANGED");
   assert.equal(healthStatusForErrorCode("WEB_SEARCH_UNSUPPORTED"), "DOM_CHANGED");
-  assert.equal(healthStatusForErrorCode("WEB_SEARCH_UNVERIFIED"), "DOM_CHANGED");
+  assert.equal(healthStatusForErrorCode("WEB_SEARCH_UNVERIFIED"), "COOLING_DOWN");
+  assert.equal(healthStatusForErrorCode("REFERENCE_UNKNOWN"), "COOLING_DOWN");
   assert.equal(healthStatusForErrorCode("INPUT_UNAVAILABLE"), "COOLING_DOWN");
   assert.equal(healthStatusForErrorCode("ANSWER_TIMEOUT"), "COOLING_DOWN");
   assert.equal(healthStatusForErrorCode("DATABASE_ERROR"), "READY");

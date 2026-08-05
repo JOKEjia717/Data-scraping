@@ -362,3 +362,40 @@ test("元宝 Windows 新版工具按钮可展开菜单并确认联网搜索", as
     await page.close();
   }
 });
+
+test("元宝工具菜单延迟挂载时会等待联网搜索选项出现", async () => {
+  assert.ok(browser);
+  const page = await browser.newPage();
+  try {
+    await page.setContent(`
+      <button aria-label="工具" class="ybc-atomSelect-tools">工具</button>
+      <div id="selected"></div>
+      <script>
+        document.querySelector("button[aria-label='工具']").addEventListener("click", () => {
+          setTimeout(() => {
+            const popup = document.createElement("div");
+            popup.className = "t-popup";
+            popup.innerHTML = '<ul><li id="delayed-web-search" class="t-dropdown__item"><span>联网搜索</span></li></ul>';
+            document.body.appendChild(popup);
+            document.querySelector("#delayed-web-search").addEventListener("click", () => {
+              document.querySelector("#selected").innerHTML =
+                '<span class="application-blot-ai-atom">联网搜索</span>';
+              document.body.dataset.clickCount = "1";
+            });
+          }, 1200);
+        });
+      </script>
+    `);
+
+    const result = await activateWebSearch(
+      page,
+      PLATFORMS.yuanbao,
+      "REQUIRED"
+    );
+    assert.equal(result.enabled, true, result.failureReason ?? undefined);
+    assert.equal(result.verified, true);
+    assert.equal(await clickCount(page), 1);
+  } finally {
+    await page.close();
+  }
+});

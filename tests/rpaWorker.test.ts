@@ -11,15 +11,38 @@ import type {
 import {
   deepThinkingRuntimeForTask,
   browserRuntimeNeedsReconnect,
+  executionErrorFor,
   nextPlatformBatches,
   planGreyRpaBatches,
   readySessionPlatforms,
   referenceRecoveryRuntimeForTask,
   releaseableExecutionIds,
+  routePlatformTaskFailure,
   taskInGrayScope,
   webSearchRuntimeForTask,
   type RpaWorkerSession
 } from "../src/rpaWorker.js";
+import { PlatformExecutionError } from "../src/platformExecution.js";
+
+test("联网开关和引用入口短暂不可见时仅冷却到下一轮询", () => {
+  for (const errorCode of ["WEB_SEARCH_UNVERIFIED", "REFERENCE_UNKNOWN"] as const) {
+    const error = executionErrorFor(new Error(errorCode), errorCode, 900_000, 10_000);
+    assert.ok(error instanceof PlatformExecutionError);
+    assert.equal(error.healthStatus, "COOLING_DOWN");
+    assert.equal(error.cooldownMs, 10_000);
+  }
+});
+
+test("元宝参考列表重生成耗尽后释放同一题到下一轮有限重试", () => {
+  assert.equal(
+    routePlatformTaskFailure("yuanbao", "REFERENCE_UNKNOWN"),
+    "retry_task"
+  );
+  assert.equal(
+    routePlatformTaskFailure("doubao", "REFERENCE_UNKNOWN"),
+    "pause_platform"
+  );
+});
 
 test("批次失败只释放明确尚未发送的任务", () => {
   const states = new Map([
@@ -289,6 +312,14 @@ test("正式 Worker 强制 ARTICLE_PROBE 联网并允许配置 DIAGNOSIS 策略"
     { webSearchPolicy: "DISABLED" }
   );
   assert.deepEqual(
+    webSearchRuntimeForTask({ businessType: "DIAGNOSIS" }, workerConfig, "yuanbao"),
+    { webSearchPolicy: "PREFERRED" }
+  );
+  assert.deepEqual(
+    webSearchRuntimeForTask({ businessType: "DIAGNOSIS" }, workerConfig, "qianwen"),
+    { webSearchPolicy: "DISABLED" }
+  );
+  assert.deepEqual(
     webSearchRuntimeForTask({ businessType: "ARTICLE_PROBE" }, workerConfig),
     { webSearchPolicy: "REQUIRED" }
   );
@@ -481,7 +512,8 @@ test("僵尸恢复跳过仍持有 execution 锁的其他 Worker", async () => {
   assert.deepEqual(result.recoveredExecutionIds, ["21"]);
   assert.equal(client.updates.length, 1);
   assert.deepEqual(client.updates[0]!.parameters, ["21", cutoff, "DIAGNOSIS"]);
-  assert.match(client.updates[0]!.sql, /e\.modify_time < \?/);
+  assert.match(client.updates[0]!.sql, /UTC_TIMESTAMP\(\)/);
+  assert.match(client.updates[0]!.sql, /CURRENT_TIMESTAMP\(\)/);
   assert.deepEqual(leases.releases, [executionLeaseName("21")]);
 });
 

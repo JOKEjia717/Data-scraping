@@ -65,7 +65,20 @@ export interface StructuredTaskLoggerOptions {
 export interface FailureEvidenceStoreOptions {
   evidenceDirectory: string;
   maxDiagnosticChars?: number;
+  maxDomChars?: number;
+  maxDomSnapshotsPerPlatform?: number;
   retentionDays?: number;
+}
+
+export interface DomHistorySnapshotInput {
+  page: Page;
+  workerId: string;
+  brandId: string;
+  businessGroupId: string;
+  platformId: PlatformId;
+  questionIndex: number;
+  outcome: "success" | "failure" | "persistence_pending";
+  errorCode?: WorkerErrorCode | null;
 }
 
 export interface FailureEvidenceInput {
@@ -113,6 +126,8 @@ export interface SelfCheckEvidenceHandlerOptions {
 const DEFAULT_MAX_QUESTION_CHARS = 2_000;
 const DEFAULT_MAX_ERROR_CHARS = 500;
 const DEFAULT_MAX_DIAGNOSTIC_CHARS = 4_000;
+const DEFAULT_MAX_DOM_CHARS = 200_000;
+const DEFAULT_MAX_DOM_SNAPSHOTS_PER_PLATFORM = 10;
 
 /** 逐行 JSON，方便长期运行时流式收集和按错误码聚合。 */
 export class StructuredTaskLogger {
@@ -202,20 +217,39 @@ export class StructuredTaskLogger {
 /** 截图与受限文本诊断按失败任务单独落盘，普通日志只保存文件路径。 */
 export class FailureEvidenceStore {
   private readonly rootDirectory: string;
+  private readonly domHistoryFilePath: string;
   private readonly maxDiagnosticChars: number;
+  private readonly maxDomChars: number;
+  private readonly maxDomSnapshotsPerPlatform: number;
   private readonly retentionDays: number;
   private lastCleanupDay = "";
   private sequence = 0;
+  private pendingDomHistoryWrite = Promise.resolve();
 
   constructor(options: FailureEvidenceStoreOptions) {
     requireDirectory(options.evidenceDirectory, "evidenceDirectory");
     this.rootDirectory = path.resolve(options.evidenceDirectory);
+    this.domHistoryFilePath = path.join(path.dirname(this.rootDirectory), "dom-history.json");
     this.maxDiagnosticChars = positiveLimit(
       options.maxDiagnosticChars,
       DEFAULT_MAX_DIAGNOSTIC_CHARS,
       "maxDiagnosticChars"
     );
+    this.maxDomChars = positiveLimit(
+      options.maxDomChars,
+      DEFAULT_MAX_DOM_CHARS,
+      "maxDomChars"
+    );
+    this.maxDomSnapshotsPerPlatform = positiveLimit(
+      options.maxDomSnapshotsPerPlatform,
+      DEFAULT_MAX_DOM_SNAPSHOTS_PER_PLATFORM,
+      "maxDomSnapshotsPerPlatform"
+    );
     this.retentionDays = positiveLimit(options.retentionDays, 7, "retentionDays");
+  }
+
+  get domHistoryPath(): string {
+    return this.domHistoryFilePath;
   }
 
   async capture(input: FailureEvidenceInput): Promise<FailureEvidenceResult> {
@@ -260,11 +294,60 @@ export class FailureEvidenceStore {
       pageTextTruncated: diagnosticText.truncated
     };
     await fs.writeFile(diagnosticPath, `${JSON.stringify(diagnostic, null, 2)}\n`, "utf8");
+    await this.captureDomSnapshot({
+      page: input.page,
+      workerId: input.workerId,
+      brandId: input.brandId,
+      businessGroupId: input.businessGroupId,
+      platformId: input.platformId,
+      questionIndex: input.questionIndex,
+      outcome: "failure",
+      errorCode: input.errorCode
+    }).catch(() => undefined);
 
     return {
       ...(screenshotSaved ? { screenshotPath } : {}),
       diagnosticPath
     };
+  }
+
+  /** 四个平台共用一个有界 JSON 文件；只保存排查选择器所需的脱敏 DOM。 */
+  captureDomSnapshot(input: DomHistorySnapshotInput): Promise<void> {
+    const operation = this.pendingDomHistoryWrite.then(async () => {
+      const capturedAt = new Date();
+      const rawHtml = await captureSanitizedDom(input.page);
+      if (!rawHtml) return;
+      const boundedHtml = redactAndLimit(rawHtml, this.maxDomChars);
+      const cutoff = capturedAt.getTime() - this.retentionDays * 86_400_000;
+      const existing = await readDomHistory(this.domHistoryFilePath);
+      const snapshots = existing.snapshots
+        .filter((snapshot) => Date.parse(snapshot.capturedAt) >= cutoff)
+        .concat({
+          capturedAt: capturedAt.toISOString(),
+          workerId: boundedIdentifier(input.workerId),
+          brandId: boundedIdentifier(input.brandId),
+          businessGroupId: boundedIdentifier(input.businessGroupId),
+          platform: input.platformId,
+          questionIndex: nonNegativeInteger(input.questionIndex),
+          outcome: input.outcome,
+          errorCode: input.errorCode ?? null,
+          currentUrl: sanitizeUrl(safePageUrl(input.page)),
+          html: boundedHtml.text,
+          htmlTruncated: boundedHtml.truncated
+        });
+      const retained = retainRecentDomSnapshots(
+        snapshots,
+        this.maxDomSnapshotsPerPlatform
+      );
+      await fs.mkdir(path.dirname(this.domHistoryFilePath), { recursive: true });
+      await fs.writeFile(this.domHistoryFilePath, `${JSON.stringify({
+        schemaVersion: 1,
+        updatedAt: capturedAt.toISOString(),
+        snapshots: retained
+      }, null, 2)}\n`, "utf8");
+    });
+    this.pendingDomHistoryWrite = operation.catch(() => undefined);
+    return operation;
   }
 
   private async cleanupExpiredEvidence(now: Date): Promise<void> {
@@ -281,6 +364,98 @@ export class FailureEvidenceStore {
       }
     }
   }
+}
+
+interface DomHistorySnapshot {
+  capturedAt: string;
+  workerId: string;
+  brandId: string;
+  businessGroupId: string;
+  platform: PlatformId;
+  questionIndex: number;
+  outcome: DomHistorySnapshotInput["outcome"];
+  errorCode: WorkerErrorCode | null;
+  currentUrl: string;
+  html: string;
+  htmlTruncated: boolean;
+}
+
+interface DomHistoryFile {
+  schemaVersion: 1;
+  updatedAt: string;
+  snapshots: DomHistorySnapshot[];
+}
+
+async function captureSanitizedDom(page: Page): Promise<string> {
+  return page.evaluate(() => {
+    const clone = document.documentElement.cloneNode(true) as HTMLElement;
+    clone.querySelectorAll("script,style,noscript,svg,canvas").forEach((node) => node.remove());
+    clone.querySelectorAll("input,textarea").forEach((node) => {
+      node.removeAttribute("value");
+      node.textContent = "";
+    });
+    clone.querySelectorAll("*").forEach((node) => {
+      for (const attribute of [...node.attributes]) {
+        const name = attribute.name.toLowerCase();
+        if (
+          name === "srcdoc" ||
+          name === "nonce" ||
+          name === "integrity" ||
+          /(?:token|secret|password|passwd|cookie|session|authorization)/i.test(name) ||
+          (name.startsWith("data-") &&
+            !["data-testid", "data-test", "data-role", "data-state", "data-desc"]
+              .includes(name))
+        ) {
+          node.removeAttribute(attribute.name);
+          continue;
+        }
+        if (name === "href" || name === "src") {
+          try {
+            const url = new URL(attribute.value, document.baseURI);
+            url.search = "";
+            url.hash = "";
+            node.setAttribute(attribute.name, url.toString());
+          } catch {
+            node.removeAttribute(attribute.name);
+          }
+        }
+      }
+    });
+    return `<!doctype html>\n${clone.outerHTML}`;
+  }).catch(() => "");
+}
+
+async function readDomHistory(filePath: string): Promise<DomHistoryFile> {
+  const empty: DomHistoryFile = {
+    schemaVersion: 1,
+    updatedAt: new Date(0).toISOString(),
+    snapshots: []
+  };
+  const content = await fs.readFile(filePath, "utf8").catch(() => "");
+  if (!content) return empty;
+  try {
+    const parsed = JSON.parse(content) as Partial<DomHistoryFile>;
+    if (parsed.schemaVersion !== 1 || !Array.isArray(parsed.snapshots)) return empty;
+    return parsed as DomHistoryFile;
+  } catch {
+    return empty;
+  }
+}
+
+function retainRecentDomSnapshots(
+  snapshots: readonly DomHistorySnapshot[],
+  maxPerPlatform: number
+): DomHistorySnapshot[] {
+  const counts = new Map<PlatformId, number>();
+  return [...snapshots]
+    .sort((a, b) => Date.parse(b.capturedAt) - Date.parse(a.capturedAt))
+    .filter((snapshot) => {
+      const count = counts.get(snapshot.platform) ?? 0;
+      if (count >= maxPerPlatform) return false;
+      counts.set(snapshot.platform, count + 1);
+      return true;
+    })
+    .sort((a, b) => Date.parse(a.capturedAt) - Date.parse(b.capturedAt));
 }
 
 /**

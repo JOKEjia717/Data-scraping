@@ -43,6 +43,7 @@ import {
   createPageConversationManager,
   type ConversationBatchContext
 } from "./conversationManager.js";
+import { classifyPageBlockerText } from "./browserDiagnostics.js";
 export { openNewConversation } from "./conversationManager.js";
 import {
   buildSubmittedQuestion,
@@ -153,10 +154,12 @@ export interface ExecuteQuestionRuntime {
     state: "submitted" | "uncertain",
     submittedQuestion: string
   ) => void;
+  /** 测试或受控部署可收紧；生产默认在原始发送后最多再提问 3 次。 */
+  qianwenSystemTimeoutResubmissionAttempts?: number;
 }
 
 export interface CurrentQuestionAnswerInspection {
-  status: "answered" | "absent" | "uncertain";
+  status: "answered" | "absent" | "retryable" | "uncertain";
   answerContent?: string;
   reason: string;
 }
@@ -181,6 +184,10 @@ interface TrackedAnswerBaseline {
   documentBottom: number;
   referenceCount: number;
   referenceMarker?: string;
+  /** 千问使用稳定消息 ID 区分历史同文问题与本次重新提问。 */
+  qianwenQuestionMessageIds?: string[];
+  /** DeepSeek 虚拟列表键用于排除提问前已经存在的同文历史消息。 */
+  deepseekVirtualItemKeys?: string[];
 }
 
 /** 千问回答正文进入重复循环时使用的可恢复错误；外层只跳过当前题。 */
@@ -191,9 +198,22 @@ class QianwenAnswerLoopError extends Error {
   }
 }
 
+/** 千问明确返回系统超时时可以安全重新发送原问题；不能用于普通解析失败。 */
+export class QianwenSystemTimeoutError extends Error {
+  readonly errorCode = "ANSWER_TIMEOUT" as const;
+  readonly safeToRetrySameQuestion = true;
+
+  constructor(message: string) {
+    super(message);
+    this.name = "QianwenSystemTimeoutError";
+  }
+}
+
 const REFERENCE_CHECK_ATTEMPTS = 3;
 const TECHNICAL_RETRY_ATTEMPTS = 3;
 const DOUBAO_RESUBMISSION_ATTEMPTS = 3;
+const QIANWEN_SYSTEM_TIMEOUT_RESUBMISSION_ATTEMPTS = 3;
+const QIANWEN_AUTOMATIC_RETRY_GRACE_MS = 2_000;
 const YUANBAO_REGENERATION_ATTEMPTS = 2;
 const REFERENCE_REVEAL_TIMEOUT_MS = 10_000;
 const REFERENCE_STABLE_TIMEOUT_MS = 5_000;
@@ -394,8 +414,17 @@ export async function executeQuestion(
     deepThinking,
     deepThinkingUnsupportedPolicy = "fail",
     webSearchPolicy = "PREFERRED",
-    allowUnverifiedZeroReferences = false
+    allowUnverifiedZeroReferences = false,
+    qianwenSystemTimeoutResubmissionAttempts =
+      QIANWEN_SYSTEM_TIMEOUT_RESUBMISSION_ATTEMPTS
   } = runtime;
+  if (
+    !Number.isSafeInteger(qianwenSystemTimeoutResubmissionAttempts) ||
+    qianwenSystemTimeoutResubmissionAttempts < 0 ||
+    qianwenSystemTimeoutResubmissionAttempts > 10
+  ) {
+    throw new Error("qianwenSystemTimeoutResubmissionAttempts 必须是 0 到 10 的整数。");
+  }
   const acceptUnverifiedZeroReferences = permitsUnverifiedZeroReferences(
     config.id,
     mode,
@@ -450,16 +479,16 @@ export async function executeQuestion(
   });
 
   // 所有基线必须在发送问题前采集，之后只接受相对基线新增的回答和引用入口。
-  const baselineBottom = await snapshotDocumentBottom(page);
+  let baselineBottom = await snapshotDocumentBottom(page);
   const baselineDoubaoSearchBlockCount = config.id === "doubao"
     ? await countDoubaoSearchResultBlocks(page)
     : 0;
-  const baselineRevealButtonCount = await countReferenceRevealButtons(
+  let baselineRevealButtonCount = await countReferenceRevealButtons(
     page,
     config.referenceRevealSelectors
   );
   const submittedQuestion = buildSubmittedQuestion(mode, promptPrefix, question);
-  const trackedBaseline = await snapshotTrackedAnswerBaseline(page, config.id);
+  let trackedBaseline = await snapshotTrackedAnswerBaseline(page, config.id);
   // 豆包长会话会同时回收问题气泡和历史搜索块，因此在真正发送前保存现存
   // 搜索块的元素身份；后续可识别数量减少或索引前移后的本题新入口。
   if (config.id === "doubao") await markDoubaoSearchResultBaseline(page);
@@ -475,18 +504,67 @@ export async function executeQuestion(
   }
   runtime.onSubmissionStateChange?.("submitted", submittedQuestion);
 
+  let qianwenSendAttempt = 1;
   try {
-    await retryTechnicalFailure(
-      mode,
-      `${config.name} 等待回答完成`,
-      () => waitForAnswerComplete(
-        page,
-        config,
-        timeoutMs,
-        trackedBaseline,
-        submittedQuestion
-      )
-    );
+    while (true) {
+      try {
+        await retryTechnicalFailure(
+          mode,
+          `${config.name} 等待回答完成`,
+          () => waitForAnswerComplete(
+            page,
+            config,
+            timeoutMs,
+            trackedBaseline,
+            submittedQuestion
+          )
+        );
+      } catch (error) {
+        if (!(error instanceof QianwenSystemTimeoutError) || config.id !== "qianwen") {
+          throw error;
+        }
+        if (qianwenSendAttempt > qianwenSystemTimeoutResubmissionAttempts) {
+          throw new QianwenSystemTimeoutError(
+            `[千问] 当前问题连续 ${qianwenSendAttempt} 次返回“系统超时，请稍后重试”，` +
+            "已达到原题重新发送上限。"
+          );
+        }
+
+        console.log(
+          `[千问] 当前问题返回明确系统超时，正在执行第 ${qianwenSendAttempt}/` +
+          `${qianwenSystemTimeoutResubmissionAttempts} 次原题重新发送。`
+        );
+        await waitForReadyToSend(page, config, timeoutMs);
+        webSearch = await activateWebSearch(page, config, webSearchPolicy);
+        runtime.onWebSearchStateResolved?.(webSearch);
+        enforceWebSearchPolicy(webSearchPolicy, webSearch);
+        baselineBottom = await snapshotDocumentBottom(page);
+        baselineRevealButtonCount = await countReferenceRevealButtons(
+          page,
+          config.referenceRevealSelectors
+        );
+        trackedBaseline = await snapshotTrackedAnswerBaseline(page, "qianwen");
+        await submitQuestion(page, config, submittedQuestion);
+        runtime.onSubmissionStateChange?.("submitted", submittedQuestion);
+        qianwenSendAttempt += 1;
+        continue;
+      }
+
+      if (config.id === "qianwen") {
+        const outcome = await inspectQianwenQuestionAttempt(
+          page,
+          submittedQuestion,
+          trackedBaseline.qianwenQuestionMessageIds ?? []
+        );
+        if (outcome.status !== "answered" || !outcome.answerContent?.trim()) {
+          throw new Error(
+            `[千问] 本题生命周期结束后未找到与当前问题消息 ID 配对的完整回答，` +
+            "已停止后续问题以避免复用上一题正文。"
+          );
+        }
+      }
+      break;
+    }
   } catch (error) {
     if (
       mode === "research" &&
@@ -531,11 +609,17 @@ export async function executeQuestion(
   let finalGeneration = 1;
   let finalAnswerExtractedAt = new Date().toISOString();
   const captureAnswer = async (generationNumber: number): Promise<void> => {
-    const answer = await captureLatestPlatformAnswerWithRetries(
-      page,
-      config.id,
-      config.name
-    );
+    const answer = config.id === "qianwen"
+      ? (await inspectQianwenQuestionAttempt(
+          page,
+          submittedQuestion,
+          trackedBaseline.qianwenQuestionMessageIds ?? []
+        )).answerContent ?? ""
+      : await captureLatestPlatformAnswerWithRetries(
+          page,
+          config.id,
+          config.name
+        );
     if (!answer) {
       console.log(
         `[${config.name}] 第 ${generationNumber} 版回答正文未能解析，暂时保留上一版缓存。`
@@ -549,14 +633,15 @@ export async function executeQuestion(
       `[${config.name}] 已缓存第 ${generationNumber} 版回答正文（${answer.length} 字符）。`
     );
   };
-  await captureAnswer(1);
+  await captureAnswer(qianwenSendAttempt);
   if (mode === "business" && !finalAnswer) {
     throw new Error(
       `[${config.name}] 当前问题已有回答生命周期信号，但回答正文为空，按技术失败停止该批次。`
     );
   }
 
-  // business 不会因为引用缺失而重新提问或重新生成；research 保留原恢复流程。
+  // 是否因引用缺失恢复由 Worker 按业务类型和平台显式传入；元宝正式诊断会
+  // 重新生成，其他 business 任务默认只检查当前回答。
   const referenceReady = await prepareCurrentReferenceList(
     page,
     config,
@@ -567,7 +652,11 @@ export async function executeQuestion(
     submittedQuestion,
     captureAnswer,
     retryOnNoReferences,
-    regenerateOnNoReferences
+    regenerateOnNoReferences,
+    (result) => {
+      webSearch = result;
+      runtime.onWebSearchStateResolved?.(result);
+    }
   );
   const createAnswerRecord = (referenceCount: number): AnswerRecord => {
     const answerRecord: AnswerRecord = {
@@ -706,6 +795,50 @@ export async function inspectCurrentQuestionAnswer(
   return runWithConsolePrivacy({ mode, verbose: mode === "research" }, async () => {
   if (page.isClosed()) {
     return { status: "uncertain", reason: "平台页面已关闭，无法确认发送后的回答" };
+  }
+  if (config.id === "qianwen") {
+    const outcome = await inspectQianwenQuestionAttemptSettled(page, submittedQuestion);
+    if (outcome.status === "answered" && outcome.answerContent?.trim()) {
+      const busy = await isAnswerGenerating(page, config.id).catch(() => true);
+      if (busy) return { status: "uncertain", reason: "当前页面仍显示回答生成中" };
+      return {
+        status: "answered",
+        answerContent: outcome.answerContent,
+        reason: "当前页面已按千问消息 ID 确认真实问题与完整回答"
+      };
+    }
+    if (outcome.status === "system_timeout") {
+      return {
+        status: "retryable",
+        reason: "当前问题对应的千问回答卡明确显示系统超时，可以安全重新发送原问题"
+      };
+    }
+    if (outcome.status === "pending") {
+      return { status: "uncertain", reason: "当前问题对应的千问回答仍未完成" };
+    }
+  }
+  if (config.id === "deepseek") {
+    const structured = await inspectDeepSeekQuestionAttempt(page, submittedQuestion);
+    if (structured.status === "answered") {
+      const busy = await isAnswerGenerating(page, config.id).catch(() => true);
+      if (busy) return { status: "uncertain", reason: "当前页面仍显示回答生成中" };
+      const answerContent = await captureLatestPlatformAnswerWithRetries(
+        page,
+        config.id,
+        config.name
+      );
+      if (answerContent.trim()) {
+        return {
+          status: "answered",
+          answerContent,
+          reason: "已按 DeepSeek 虚拟列表消息键配对当前问题与回答"
+        };
+      }
+      return { status: "uncertain", reason: "已配对 DeepSeek 当前回答，但正文解析为空" };
+    }
+    if (structured.status === "pending") {
+      return { status: "uncertain", reason: "DeepSeek 当前问题后的回答仍未完成" };
+    }
   }
   if (config.id === "yuanbao" || config.id === "doubao") {
     const structured = await inspectStructuredMessagePair(
@@ -901,6 +1034,193 @@ export function canonicalQuestionIdentity(value: string): string {
     .replace(/[\s\p{P}\p{S}]+/gu, "");
 }
 
+export interface QianwenQuestionAttemptInspection {
+  status: "answered" | "system_timeout" | "pending" | "absent";
+  messageId?: string;
+  answerContent?: string;
+  answerComplete?: boolean;
+  hasReferenceTrigger?: boolean;
+}
+
+const QIANWEN_INSPECTION_SETTLE_TIMEOUT_MS = 5_000;
+const QIANWEN_INSPECTION_POLL_INTERVAL_MS = 200;
+
+/**
+ * 千问会先挂载问题节点，再异步挂载同 message-id 的回答节点和 complete class。
+ * 发送后恢复如果只读一次 DOM，容易在这段很短的窗口内把正常回答误判为 pending，
+ * 进而触发平台级暂停。这里只等待已经确认属于本题的 pending/流式回答；找不到
+ * 本题问题时仍立即返回，避免在错误会话上无意义等待。
+ */
+async function inspectQianwenQuestionAttemptSettled(
+  page: Page,
+  submittedQuestion: string,
+  excludedQuestionMessageIds: readonly string[] = [],
+  timeoutMs = QIANWEN_INSPECTION_SETTLE_TIMEOUT_MS
+): Promise<QianwenQuestionAttemptInspection> {
+  const deadline = Date.now() + Math.max(0, timeoutMs);
+  let outcome = await inspectQianwenQuestionAttempt(
+    page,
+    submittedQuestion,
+    excludedQuestionMessageIds
+  );
+
+  while (
+    Date.now() < deadline &&
+    (
+      outcome.status === "pending" ||
+      (outcome.status === "answered" && outcome.answerComplete === false)
+    )
+  ) {
+    await page.waitForTimeout(Math.min(
+      QIANWEN_INSPECTION_POLL_INTERVAL_MS,
+      Math.max(1, deadline - Date.now())
+    ));
+    outcome = await inspectQianwenQuestionAttempt(
+      page,
+      submittedQuestion,
+      excludedQuestionMessageIds
+    );
+  }
+
+  return outcome;
+}
+
+/**
+ * 按千问 question/answer 共享的 message-id 配对当前题，避免把上一题正文当成
+ * 本题回答。若千问自己追加了同文问题，则只检查最后一个新消息 ID。
+ */
+export async function inspectQianwenQuestionAttempt(
+  page: Page,
+  submittedQuestion: string,
+  excludedQuestionMessageIds: readonly string[] = []
+): Promise<QianwenQuestionAttemptInspection> {
+  return page.evaluate(({ expectedQuestion, excludedIds }) => {
+    // 不在 page.evaluate 内声明命名/赋值函数；tsx/esbuild 会给它注入只存在于
+    // Node 侧的 __name，导致真实浏览器上下文直接 ReferenceError。
+    const expectedIdentity = (expectedQuestion || "")
+      .normalize("NFKC")
+      .toLocaleLowerCase()
+      .replace(/[\s\p{P}\p{S}]+/gu, "");
+    const excluded = new Set(excludedIds);
+    const questions = Array.from(document.querySelectorAll<HTMLElement>(
+      "[data-chat-question-wrap]"
+    )).filter((element) => {
+      const messageId = element.getAttribute("data-chat-question-wrap") || "";
+      return messageId && !excluded.has(messageId) &&
+        (element.innerText || element.textContent || "")
+          .normalize("NFKC")
+          .toLocaleLowerCase()
+          .replace(/[\s\p{P}\p{S}]+/gu, "") === expectedIdentity;
+    });
+    const question = questions.at(-1);
+    if (!question) return { status: "absent" as const };
+
+    const messageId = question.getAttribute("data-chat-question-wrap") || "";
+    const answer = Array.from(document.querySelectorAll<HTMLElement>(
+      "[data-chat-answers-wrap]"
+    )).find((element) => element.getAttribute("data-chat-answers-wrap") === messageId);
+    if (!answer) return { status: "pending" as const, messageId };
+
+    const markdown = answer.querySelector<HTMLElement>(".qk-markdown");
+    const answerContent = (markdown?.innerText || markdown?.textContent || "")
+      .replace(/\s+/g, " ")
+      .trim();
+    if (answerContent) {
+      return {
+        status: "answered" as const,
+        messageId,
+        answerContent,
+        answerComplete: markdown?.classList.contains("qk-markdown-complete") === true,
+        hasReferenceTrigger: Boolean(answer.querySelector('[class~="link-title-igf0OC"]'))
+      };
+    }
+
+    const answerText = (answer.innerText || answer.textContent || "")
+      .replace(/\s+/g, " ")
+      .trim();
+    const systemTimeout = /(?:系统|请求|服务).{0,8}超时.{0,12}(?:稍后|重新)(?:重试|再试)/u
+      .test(answerText);
+    return systemTimeout
+      ? { status: "system_timeout" as const, messageId }
+      : { status: "pending" as const, messageId };
+  }, {
+    expectedQuestion: submittedQuestion,
+    excludedIds: [...excludedQuestionMessageIds]
+  });
+}
+
+export interface DeepSeekQuestionAttemptInspection {
+  status: "answered" | "pending" | "absent";
+  questionKey?: string;
+  answerKey?: string;
+  answerContent?: string;
+}
+
+/**
+ * DeepSeek 当前页面把一条问题和紧随其后的回答分别放在连续的
+ * data-virtual-list-item-key 节点中。按该结构配对，不比较带引用角标的整页正文。
+ */
+export async function inspectDeepSeekQuestionAttempt(
+  page: Page,
+  submittedQuestion: string,
+  excludedVirtualItemKeys: readonly string[] = []
+): Promise<DeepSeekQuestionAttemptInspection> {
+  return page.evaluate(({ expectedQuestion, excludedKeys }) => {
+    const expectedIdentity = (expectedQuestion || "")
+      .normalize("NFKC")
+      .toLocaleLowerCase()
+      .replace(/[\s\p{P}\p{S}]+/gu, "");
+    const excluded = new Set(excludedKeys);
+    const items = Array.from(document.querySelectorAll<HTMLElement>(
+      "[data-virtual-list-item-key]"
+    ));
+    let questionIndex = -1;
+    for (let index = items.length - 1; index >= 0; index -= 1) {
+      const element = items[index]!;
+      const key = element.getAttribute("data-virtual-list-item-key") || "";
+      if (!key || excluded.has(key)) continue;
+      const directMessage = element.querySelector<HTMLElement>(":scope > .ds-message");
+      if (!directMessage) continue;
+      const identity = (directMessage.innerText || directMessage.textContent || "")
+        .normalize("NFKC")
+        .toLocaleLowerCase()
+        .replace(/[\s\p{P}\p{S}]+/gu, "");
+      if (identity !== expectedIdentity) continue;
+      questionIndex = index;
+      break;
+    }
+    if (questionIndex < 0) return { status: "absent" as const };
+
+    const question = items[questionIndex]!;
+    const questionKey = question.getAttribute("data-virtual-list-item-key") || "";
+    const answer = items[questionIndex + 1];
+    if (!answer) return { status: "pending" as const, questionKey };
+    const answerRoot = answer.querySelector<HTMLElement>(
+      ".ds-markdown.ds-assistant-message-main-content, " +
+      ".ds-assistant-message-main-content, .ds-markdown"
+    ) ?? answer.querySelector<HTMLElement>(":scope > .ds-message");
+    const answerContent = (answerRoot?.innerText || answerRoot?.textContent || "")
+      .replace(/\s+/g, " ")
+      .trim();
+    const answerKey = answer.getAttribute("data-virtual-list-item-key") || "";
+    return answerContent
+      ? { status: "answered" as const, questionKey, answerKey, answerContent }
+      : { status: "pending" as const, questionKey, answerKey };
+  }, {
+    expectedQuestion: submittedQuestion,
+    excludedKeys: [...excludedVirtualItemKeys]
+  });
+}
+
+/** 只有明确标记为“原问题可安全重发”的错误才能绕过发送后不重试保护。 */
+export function isSafeSameQuestionRetryError(error: unknown): boolean {
+  return error instanceof QianwenSystemTimeoutError || (
+    typeof error === "object" && error !== null &&
+    "safeToRetrySameQuestion" in error &&
+    (error as { safeToRetrySameQuestion?: unknown }).safeToRetrySameQuestion === true
+  );
+}
+
 /**
  * CDP/标签页恢复后的只读结果恢复。该函数绝不发送、重新生成或新建对话；它先
  * 用问题锚点确认当前回答，再按现有平台 DOM 规则判断并抽取引用。
@@ -924,6 +1244,11 @@ export async function recoverSubmittedQuestionResult(
       submittedQuestion,
       "business"
     );
+    if (inspection.status === "retryable" && config.id === "qianwen") {
+      throw new QianwenSystemTimeoutError(
+        `[千问] 当前问题对应的回答卡明确显示系统超时，需要重新发送原问题。`
+      );
+    }
     if (inspection.status !== "answered" || !inspection.answerContent?.trim()) {
       throw Object.assign(new Error(inspection.reason), { errorCode: "REFERENCE_UNKNOWN" });
     }
@@ -1057,6 +1382,7 @@ async function waitForYuanbaoRegenerationStart(
   let lastSnapshot = baseline.bodyText;
   let meaningfulChanges = 0;
   while (Date.now() - startedAt < timeoutMs) {
+    await dismissInterruptingPopup(page, "yuanbao");
     const [snapshot, busy] = await Promise.all([
       page.locator("body").innerText({ timeout: 3_000 }).catch(() => ""),
       isAnswerGenerating(page, "yuanbao")
@@ -1107,7 +1433,8 @@ async function prepareYuanbaoReferenceList(
   answerTimeoutMs: number,
   trackedBaseline: TrackedAnswerBaseline | undefined,
   submittedQuestion: string,
-  onGenerationComplete?: (generationNumber: number) => Promise<void>
+  onGenerationComplete?: (generationNumber: number) => Promise<void>,
+  onWebSearchStateResolved?: (result: WebSearchActivationResult) => void
 ): Promise<boolean> {
   if (await checkYuanbaoReferenceListWithRetries(
     page,
@@ -1119,7 +1446,11 @@ async function prepareYuanbaoReferenceList(
   console.log(`[元宝] 当前回答没有参考列表，最多重新生成 ${YUANBAO_REGENERATION_ATTEMPTS} 次。`);
   for (let attempt = 1; attempt <= YUANBAO_REGENERATION_ATTEMPTS; attempt += 1) {
     await closeYuanbaoReferencePanel(page);
-    await activateWebSearch(page, config, "PREFERRED");
+    // 元宝的联网入口会因工具菜单动画、灰度 DOM 或默认联网状态而短暂不可见。
+    // 入口探测失败时仍允许重新生成；最终是否成功只由当前回答的参考列表决定。
+    const webSearch = await activateWebSearch(page, config, "PREFERRED");
+    onWebSearchStateResolved?.(webSearch);
+    enforceWebSearchPolicy("PREFERRED", webSearch);
     const regenerationBaseline = await snapshotTrackedAnswerBaseline(page, "yuanbao");
     const clicked = await clickLatestYuanbaoRegenerate(page, submittedQuestion);
     if (!clicked) {
@@ -1169,7 +1500,8 @@ async function prepareCurrentReferenceList(
   submittedQuestion: string,
   onGenerationComplete?: (generationNumber: number) => Promise<void>,
   retryOnNoReferences = true,
-  regenerateOnNoReferences = true
+  regenerateOnNoReferences = true,
+  onWebSearchStateResolved?: (result: WebSearchActivationResult) => void
 ): Promise<boolean> {
   if (!retryOnNoReferences && !regenerateOnNoReferences) {
     return retryTechnicalFailure(
@@ -1225,7 +1557,8 @@ async function prepareCurrentReferenceList(
       answerTimeoutMs,
       trackedBaseline,
       submittedQuestion,
-      onGenerationComplete
+      onGenerationComplete,
+      onWebSearchStateResolved
     );
   }
 
@@ -1375,6 +1708,7 @@ async function checkCurrentReferenceListOnce(
   baselineDoubaoSearchBlockCount: number,
   submittedQuestion: string
 ): Promise<boolean> {
+  await dismissInterruptingPopup(page, config.id);
   if (config.id === "doubao") {
     const revealed = await revealLatestDoubaoReferenceList(
       page,
@@ -1471,6 +1805,8 @@ async function retryTechnicalFailure<T>(
     try {
       return await operation();
     } catch (error) {
+      // 千问明确系统超时必须交给原题重发闭环，不能把同一次等待重复三遍。
+      if (error instanceof QianwenSystemTimeoutError) throw error;
       lastError = error;
       if (attempt >= attempts) break;
       console.log(
@@ -1754,6 +2090,12 @@ export async function submitQuestion(
   const inputBox = await findInput(page, config.inputSelectors, 30_000);
   if (!inputBox) throw new Error(`没有在 ${config.name} 页面找到聊天输入框。`);
   const messageBaseline = await snapshotSubmittedQuestionMessages(page, config.id, question);
+  // 第二题开始后豆包可能回收/改挂用户问题气泡，但本次新回答的流式状态仍能
+  // 证明平台已经接收了问题。必须保存发送前状态，只接受 false -> true 的变化，
+  // 避免把上一题残留的生成控件误认成本题提交成功。
+  const doubaoGeneratingBeforeSubmit = config.id === "doubao"
+    ? await isAnswerGenerating(page, "doubao").catch(() => false)
+    : false;
 
   // 四个平台同时创建新对话时，页面可能仍在执行布局动画。click 会额外要求元素位置
   // 持续稳定，容易让多个平台同时在 5 秒内超时；fill 只要求输入框可见、启用且可编辑。
@@ -1777,15 +2119,145 @@ export async function submitQuestion(
       config,
       question,
       messageBaseline,
-      confirmationTimeoutMs
+      confirmationTimeoutMs,
+      doubaoGeneratingBeforeSubmit
     );
   }
 
 }
 
+export interface InterruptingPopupDismissal {
+  dismissed: boolean;
+  controlLabel?: string;
+}
+
+/**
+ * 关闭回答过程中突然出现的非业务弹窗。只在明确的 dialog/modal/popup 容器内
+ * 点击“取消/关闭/稍后再说”等安全控件；参考列表、验证码、限流提示和聊天正文
+ * 都不会被当成普通弹窗处理。
+ */
+export async function dismissInterruptingPopup(
+  page: Page,
+  platformId: PlatformId
+): Promise<InterruptingPopupDismissal> {
+  if (page.isClosed()) return { dismissed: false };
+  const candidateSelector = [
+    "[role='dialog']",
+    "[aria-modal='true']",
+    ".ant-modal-wrap",
+    ".semi-modal",
+    ".t-dialog",
+    "[class*='Modal']",
+    "[class*='modal']",
+    "[class*='Popup']",
+    "[class*='popup']",
+    "[class^='dialog-']",
+    "[class^='Dialog-']",
+    "[class~='dialog']",
+    "[class~='Dialog']",
+    "[class*='overlay']",
+    "[class*='Overlay']",
+    "[class*='mask']",
+    "[class*='Mask']"
+  ].join(",");
+  const candidates = await page.locator(candidateSelector).all().catch(() => []);
+
+  for (const candidate of candidates.slice(-30).reverse()) {
+    if (!await candidate.isVisible().catch(() => false)) continue;
+    const isChatOrReferenceUi = await candidate.locator([
+      ".agent-dialogue-references__list",
+      ".deep-think-source-tyxrYL",
+      "[class*='reference-panel']",
+      "[class*='source-panel']",
+      "[data-chat-question-wrap]",
+      "[data-chat-answers-wrap]",
+      "[data-conv-speaker='human']",
+      "[data-conv-speaker='ai']"
+    ].join(",")).count().then((count) => count > 0).catch(() => false);
+    if (isChatOrReferenceUi) continue;
+
+    const popupText = await candidate.innerText({ timeout: 500 }).catch(() => "");
+    if (/参考来源|引用来源|参考文献|搜索结果|\bSources\b/i.test(popupText)) continue;
+
+    const controls = await candidate.locator([
+      "button",
+      "[role='button']",
+      "[aria-label]",
+      "[title]",
+      "[data-testid*='close' i]",
+      "[data-testid*='cancel' i]",
+      "[class*='closeBtn']",
+      "[class*='close-btn']",
+      "[class*='modal-close']",
+      "[class*='popup-close']"
+    ].join(",")).all().catch(() => []);
+    let safeControl: Locator | undefined;
+    let safeControlLabel = "";
+    for (const control of controls.slice(-30).reverse()) {
+      if (!await control.isVisible().catch(() => false)) continue;
+      const descriptor = await control.evaluate((element) => ({
+        text: ((element as HTMLElement).innerText || element.textContent || "")
+          .replace(/\s+/g, " ").trim(),
+        ariaLabel: element.getAttribute("aria-label") || "",
+        title: element.getAttribute("title") || "",
+        testId: element.getAttribute("data-testid") || "",
+        className: typeof element.className === "string" ? element.className : ""
+      })).catch(() => undefined);
+      if (!descriptor) continue;
+      const compactText = descriptor.text.replace(/\s+/g, "");
+      const semanticLabel = [
+        descriptor.ariaLabel,
+        descriptor.title,
+        descriptor.testId,
+        descriptor.className
+      ].join(" ");
+      const safeText = /^(?:取消|关闭|暂不|暂时不用|稍后再说|以后再说|我知道了|知道了|跳过|×|✕|cancel|close|dismiss|notnow|gotit|skip)$/i
+        .test(compactText);
+      const safeSemantic = /(?:^|[\s_-])(?:close|cancel|dismiss)(?:$|[\s_-])|关闭|取消/i
+        .test(semanticLabel);
+      if (!safeText && !safeSemantic) continue;
+      safeControl = control;
+      safeControlLabel = descriptor.text || descriptor.ariaLabel || descriptor.title || "关闭控件";
+      break;
+    }
+
+    const blocker = classifyPageBlockerText(popupText);
+    if (
+      blocker &&
+      blocker.errorCode !== "LOGIN_REQUIRED"
+    ) {
+      throw Object.assign(new Error(`[${platformId}] 弹窗提示：${blocker.reason}`), {
+        errorCode: blocker.errorCode
+      });
+    }
+    if (!safeControl) {
+      if (blocker?.errorCode === "LOGIN_REQUIRED") {
+        throw Object.assign(new Error(`[${platformId}] 弹窗提示：${blocker.reason}`), {
+          errorCode: blocker.errorCode
+        });
+      }
+      continue;
+    }
+
+    const clicked = await safeControl.click({ timeout: 2_000 })
+      .then(() => true)
+      .catch(() => false);
+    if (!clicked) continue;
+    console.log(`[${platformId}] 已关闭回答过程中的弹窗，控件=${safeControlLabel.slice(0, 80)}`);
+    await page.waitForTimeout(100);
+    return { dismissed: true, controlLabel: safeControlLabel };
+  }
+  return { dismissed: false };
+}
+
 interface SubmittedQuestionMessageSnapshot {
   totalCount: number;
   matchingKeys: string[];
+  /** 豆包动态消息根即使暂时缺少 user class，也可由本题精确文本确认。 */
+  doubaoQuestionEvidenceKeys: string[];
+  /** 本题回答流式标志或搜索参考结构所在的消息根。 */
+  doubaoAnswerEvidenceKeys: string[];
+  doubaoReferenceEntryCount: number;
 }
 
 /**
@@ -1805,8 +2277,10 @@ async function snapshotSubmittedQuestionMessages(
     ({ platform, expected }) => {
       let messages: Element[] = [];
       let keyAttribute = "";
+      let doubaoMessageRoots: Element[] = [];
       if (platform === "doubao") {
-        messages = Array.from(document.querySelectorAll("[data-message-id]")).filter((element) =>
+        doubaoMessageRoots = Array.from(document.querySelectorAll("[data-message-id]"));
+        messages = doubaoMessageRoots.filter((element) =>
           element.classList.contains("justify-end") ||
           element.getAttribute("data-message-role") === "user"
         );
@@ -1831,10 +2305,58 @@ async function snapshotSubmittedQuestionMessages(
         if (identity !== expected) return [];
         return [element.getAttribute(keyAttribute) || `index:${index}`];
       });
-      return { totalCount: messages.length, matchingKeys };
+
+      const doubaoQuestionEvidenceKeys = platform === "doubao"
+        ? doubaoMessageRoots.flatMap((element, index) => {
+            const candidates = [element, ...Array.from(element.querySelectorAll("div, p, span"))];
+            const hasExactQuestion = candidates.some((candidate) =>
+              (candidate.textContent || "")
+                .normalize("NFKC")
+                .toLocaleLowerCase()
+                .replace(/[\s\p{P}\p{S}]+/gu, "") === expected
+            );
+            return hasExactQuestion
+              ? [element.getAttribute("data-message-id") || `index:${index}`]
+              : [];
+          })
+        : [];
+      const doubaoAnswerEvidenceKeys = platform === "doubao"
+        ? doubaoMessageRoots.flatMap((element, index) => {
+            const text = (element.textContent || "").replace(/\s+/g, " ").trim();
+            const hasStreamingAnswer = Boolean(element.querySelector("[data-streaming='true']"));
+            const hasReferenceEntry = Boolean(element.querySelector(
+              '[data-plugin-identifier*="search_query_result_block"]'
+            )) && /搜索\s*\d+\s*个关键词，?\s*参考\s*\d+\s*篇资料/.test(text);
+            return hasStreamingAnswer || hasReferenceEntry
+              ? [element.getAttribute("data-message-id") || `index:${index}`]
+              : [];
+          })
+        : [];
+      const doubaoReferenceEntryCount = platform === "doubao"
+        ? Array.from(document.querySelectorAll(
+            '[data-plugin-identifier*="search_query_result_block"]'
+          )).filter((element) =>
+            /搜索\s*\d+\s*个关键词，?\s*参考\s*\d+\s*篇资料/.test(
+              (element.textContent || "").replace(/\s+/g, " ").trim()
+            )
+          ).length
+        : 0;
+      return {
+        totalCount: messages.length,
+        matchingKeys,
+        doubaoQuestionEvidenceKeys,
+        doubaoAnswerEvidenceKeys,
+        doubaoReferenceEntryCount
+      };
     },
     { platform: platformId, expected: canonicalQuestionIdentity(question) }
-  ).catch(() => ({ totalCount: 0, matchingKeys: [] }));
+  ).catch(() => ({
+    totalCount: 0,
+    matchingKeys: [],
+    doubaoQuestionEvidenceKeys: [],
+    doubaoAnswerEvidenceKeys: [],
+    doubaoReferenceEntryCount: 0
+  }));
 }
 
 async function waitForSubmittedQuestionMessage(
@@ -1842,17 +2364,40 @@ async function waitForSubmittedQuestionMessage(
   config: PlatformConfig,
   question: string,
   baseline: SubmittedQuestionMessageSnapshot,
-  timeoutMs: number
+  timeoutMs: number,
+  doubaoGeneratingBeforeSubmit = false
 ): Promise<void> {
   const startedAt = Date.now();
   const baselineKeys = new Set(baseline.matchingKeys);
+  const baselineDoubaoQuestionEvidenceKeys = new Set(baseline.doubaoQuestionEvidenceKeys);
+  const baselineDoubaoAnswerEvidenceKeys = new Set(baseline.doubaoAnswerEvidenceKeys);
   while (Date.now() - startedAt < timeoutMs) {
     if (page.isClosed()) throw new Error(`[${config.name}] 提交后页面已关闭，无法确认问题消息。`);
+    await dismissInterruptingPopup(page, config.id);
     const current = await snapshotSubmittedQuestionMessages(page, config.id, question);
     if (current) {
       const hasNewMatchingKey = current.matchingKeys.some((key) => !baselineKeys.has(key));
       const matchingCountGrew = current.matchingKeys.length > baseline.matchingKeys.length;
       if (hasNewMatchingKey || matchingCountGrew) return;
+
+      if (config.id === "doubao") {
+        const hasNewQuestionEvidence = current.doubaoQuestionEvidenceKeys.some(
+          (key) => !baselineDoubaoQuestionEvidenceKeys.has(key)
+        );
+        const hasNewAnswerEvidence = current.doubaoAnswerEvidenceKeys.some(
+          (key) => !baselineDoubaoAnswerEvidenceKeys.has(key)
+        );
+        const hasNewReferenceEntry =
+          current.doubaoReferenceEntryCount > baseline.doubaoReferenceEntryCount;
+        const generationStarted = !doubaoGeneratingBeforeSubmit &&
+          await isAnswerGenerating(page, "doubao").catch(() => false);
+        if (
+          hasNewQuestionEvidence ||
+          hasNewAnswerEvidence ||
+          hasNewReferenceEntry ||
+          generationStarted
+        ) return;
+      }
     }
     await page.waitForTimeout(250);
   }
@@ -1908,6 +2453,7 @@ async function findInput(page: Page, selectors: string[], timeoutMs: number): Pr
 async function waitForReadyToSend(page: Page, config: PlatformConfig, timeoutMs: number): Promise<void> {
   const startedAt = Date.now();
   while (Date.now() - startedAt < timeoutMs) {
+    await dismissInterruptingPopup(page, config.id);
     const inputBox = await findInput(page, config.inputSelectors, 1_500);
     const busy = config.id === "doubao" || config.id === "deepseek" || config.id === "qianwen" || config.id === "yuanbao"
       ? await isAnswerGenerating(page, config.id)
@@ -2046,6 +2592,7 @@ export async function waitForYuanbaoCurrentAnswerComplete(
 
   await page.waitForTimeout(500);
   while (Date.now() - startedAt < timeoutMs) {
+    await dismissInterruptingPopup(page, "yuanbao");
     const [snapshot, busy] = await Promise.all([
       snapshotCurrentYuanbaoAnswer(page, submittedQuestion),
       isAnswerGenerating(page, "yuanbao")
@@ -2113,6 +2660,20 @@ async function snapshotTrackedAnswerBaseline(
   const yuanbaoBaseline = platformId === "yuanbao"
     ? await markYuanbaoReferenceTriggerBaseline(page)
     : undefined;
+  const qianwenQuestionMessageIds = platformId === "qianwen"
+    ? await page.locator("[data-chat-question-wrap]").evaluateAll((elements) =>
+        elements
+          .map((element) => element.getAttribute("data-chat-question-wrap") || "")
+          .filter(Boolean)
+      ).catch(() => [])
+    : undefined;
+  const deepseekVirtualItemKeys = platformId === "deepseek"
+    ? await page.locator("[data-virtual-list-item-key]").evaluateAll((elements) =>
+        elements
+          .map((element) => element.getAttribute("data-virtual-list-item-key") || "")
+          .filter(Boolean)
+      ).catch(() => [])
+    : undefined;
   return {
     bodyText,
     documentBottom: await snapshotDocumentBottom(page),
@@ -2125,7 +2686,9 @@ async function snapshotTrackedAnswerBaseline(
         : platformId === "yuanbao"
           ? yuanbaoBaseline?.count ?? 0
         : bodyText.split(referenceLabel).length - 1,
-    referenceMarker: yuanbaoBaseline?.marker
+    referenceMarker: yuanbaoBaseline?.marker,
+    qianwenQuestionMessageIds,
+    deepseekVirtualItemKeys
   };
 }
 
@@ -2142,6 +2705,7 @@ async function waitForQianwenRegenerationStart(
   let meaningfulChanges = 0;
 
   while (Date.now() - startedAt < timeoutMs) {
+    await dismissInterruptingPopup(page, "qianwen");
     const [snapshot, busy, referenceCount] = await Promise.all([
       page.locator("body").innerText({ timeout: 3_000 }).catch(() => ""),
       isAnswerGenerating(page, "qianwen"),
@@ -2181,6 +2745,7 @@ async function waitForTrackedAnswerComplete(
   let meaningfulChanges = 0;
   let sawAnswerStart = answerStartAlreadyConfirmed;
   let doubaoReferenceReadySince = 0;
+  let qianwenStructuredAttemptObserved = false;
   const referenceLabel = platformId === "qianwen" ? "参考来源" : "引用来源";
   const stableWindowMs = 12_000;
   const minWaitMs = 15_000;
@@ -2189,6 +2754,7 @@ async function waitForTrackedAnswerComplete(
 
   await page.waitForTimeout(1_000);
   while (Date.now() - startedAt < timeoutMs) {
+    await dismissInterruptingPopup(page, platformId);
     const [snapshot, busy, documentBottom, structuredReferenceCount, currentDoubaoHasReferences] = await Promise.all([
       page.locator("body").innerText({ timeout: 3_000 }).catch(() => ""),
       isAnswerGenerating(page, platformId),
@@ -2232,7 +2798,42 @@ async function waitForTrackedAnswerComplete(
       (meaningfulChanges >= 3 && textGrowth >= 60) ||
       (bottomGrowth >= 250 && textGrowth >= 60);
 
+    if (platformId === "deepseek" && sawAnswerStart && !busy) {
+      const attempt = await inspectDeepSeekQuestionAttempt(
+        page,
+        submittedQuestion,
+        baseline.deepseekVirtualItemKeys ?? []
+      );
+      if (attempt.status === "answered") return;
+    }
+
     if (platformId === "qianwen" && sawAnswerStart) {
+      let attempt = await inspectQianwenQuestionAttempt(
+        page,
+        submittedQuestion,
+        baseline.qianwenQuestionMessageIds ?? []
+      );
+      if (attempt.status !== "absent") qianwenStructuredAttemptObserved = true;
+      if (attempt.status === "system_timeout" && !busy) {
+        // 千问偶尔会自己重新提交同一个问题；先留出短暂窗口，只在错误卡仍是
+        // 最后一个新尝试时才由 Worker 重发，避免形成重复提问。
+        const graceDeadline = Date.now() + QIANWEN_AUTOMATIC_RETRY_GRACE_MS;
+        while (Date.now() < graceDeadline && attempt.status === "system_timeout") {
+          await page.waitForTimeout(250);
+          attempt = await inspectQianwenQuestionAttempt(
+            page,
+            submittedQuestion,
+            baseline.qianwenQuestionMessageIds ?? []
+          );
+        }
+        if (attempt.status === "system_timeout") {
+          throw new QianwenSystemTimeoutError(
+            "[千问] 当前问题对应的回答卡显示“系统超时，请稍后重试”。"
+          );
+        }
+      }
+      if (shouldCompleteQianwenAttempt(attempt, busy)) return;
+
       const currentAnswerText = extractCurrentQianwenAnswerText(
         snapshot,
         baseline.bodyText,
@@ -2272,7 +2873,16 @@ async function waitForTrackedAnswerComplete(
         minimumWaitMs: minWaitMs
       })
     ) return;
-    if (sawAnswerStart && !busy && stableFor >= stableWindowMs && elapsed >= minWaitMs) return;
+    if (shouldCompleteTrackedAnswerFromStableState({
+      platformId,
+      sawAnswerStart,
+      busy,
+      stableForMs: stableFor,
+      elapsedMs: elapsed,
+      stableWindowMs,
+      minimumWaitMs: minWaitMs,
+      qianwenStructuredAttemptObserved
+    })) return;
 
     if ((platformId === "doubao" || platformId === "deepseek" || platformId === "qianwen") && elapsed >= nextProgressLogAt) {
       console.log(
@@ -2298,6 +2908,40 @@ export interface QianwenAnswerLoopDetection {
   maxRepeatCount: number;
   duplicateLineCount: number;
   repeatedLine: string;
+}
+
+export function shouldCompleteQianwenAttempt(
+  attempt: QianwenQuestionAttemptInspection,
+  busy: boolean
+): boolean {
+  return attempt.status === "answered" &&
+    !busy &&
+    (attempt.answerComplete === true || attempt.hasReferenceTrigger === true);
+}
+
+export interface TrackedAnswerStableCompletionInput {
+  platformId: "doubao" | "deepseek" | "qianwen";
+  sawAnswerStart: boolean;
+  busy: boolean;
+  stableForMs: number;
+  elapsedMs: number;
+  stableWindowMs: number;
+  minimumWaitMs: number;
+  qianwenStructuredAttemptObserved: boolean;
+}
+
+/**
+ * 千问一旦识别到本题 message-id，就只能由本题配对回答的生命周期信号放行。
+ * 正文阶段性静止和停止按钮短暂消失不能再触发通用稳定兜底。
+ */
+export function shouldCompleteTrackedAnswerFromStableState(
+  input: TrackedAnswerStableCompletionInput
+): boolean {
+  if (input.platformId === "qianwen" && input.qianwenStructuredAttemptObserved) return false;
+  return input.sawAnswerStart &&
+    !input.busy &&
+    input.stableForMs >= input.stableWindowMs &&
+    input.elapsedMs >= input.minimumWaitMs;
 }
 
 /**
@@ -2416,6 +3060,19 @@ export async function isAnswerGenerating(page: Page, platformId?: PlatformId): P
     })) return true;
 
   if (${platform} !== "doubao") return false;
+
+  // Doubao's current composer renders the stop control as a plain DIV, so it
+  // is absent from the button/role scan above. The latest assistant message
+  // exposes an explicit streaming flag; prefer that lifecycle signal and keep
+  // the stable stop-control class prefix as a second, visible-page fallback.
+  const messages = Array.from(document.querySelectorAll("[data-message-id]"));
+  const latestAssistantMessage = [...messages].reverse().find((element) =>
+    !element.classList.contains("justify-end") &&
+    element.getAttribute("data-message-role") !== "user"
+  );
+  if (latestAssistantMessage?.querySelector("[data-streaming='true']")) return true;
+  if (Array.from(document.querySelectorAll("[class*='break-btn-']")).some(isVisible)) return true;
+
   const inputs = Array.from(document.querySelectorAll(
     "textarea, [contenteditable='true'], [role='textbox']"
   )).filter(isVisible);
