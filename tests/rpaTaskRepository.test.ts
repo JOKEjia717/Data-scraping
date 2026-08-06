@@ -5,7 +5,10 @@ import path from "node:path";
 import test from "node:test";
 import type { Pool } from "mysql2/promise";
 import { parseCheckOptions } from "../src/checkRpaTasks.js";
-import { readRpaDatabaseConfig } from "../src/rpaDatabase.js";
+import {
+  acquireRpaPoolConnection,
+  readRpaDatabaseConfig
+} from "../src/rpaDatabase.js";
 import { JsonlRpaTaskAuditLogger } from "../src/rpaTaskAudit.js";
 import {
   MysqlRpaSqlClient,
@@ -92,6 +95,9 @@ test("diagnosis 查询只读 DIAGNOSIS，并从 diagnosis_task.profile_id 解析
   assert.doesNotMatch(query.sql, /probe_article_task/);
   assert.match(query.sql, /e\.status = 0/);
   assert.match(query.sql, /e\.task_status = 0/);
+  assert.match(query.sql, /NOT EXISTS/);
+  assert.match(query.sql, /active_e\.status = 1/);
+  assert.match(query.sql, /active_e\.ai_model_id = e\.ai_model_id/);
   assert.match(query.sql, /d\.status = 'DISPATCHED'/);
   assert.deepEqual(query.parameters, ["DIAGNOSIS", 25]);
 });
@@ -254,6 +260,9 @@ test("RPA 数据库密码和库名必须来自环境变量", () => {
   assert.equal(config.host, "127.0.0.1");
   assert.equal(config.database, "geno_digital_test");
   assert.equal(config.connectionLimit, 4);
+  assert.equal(config.maxIdle, 4);
+  assert.equal(config.timeouts.queryTimeoutMs, 15_000);
+  assert.equal(config.timeouts.lockQueryTimeoutMs, 5_000);
   assert.throws(
     () => readRpaDatabaseConfig({
       RPA_DB_USER: "rpa_reader",
@@ -266,19 +275,30 @@ test("RPA 数据库密码和库名必须来自环境变量", () => {
 test("只读查询使用参数化文本协议以兼容不支持 LIMIT 预编译的 MySQL", async () => {
   let queryCalls = 0;
   let executeCalls = 0;
-  const pool = {
-    async query(sql: string, parameters: unknown[]) {
+  let releaseCalls = 0;
+  const connection = {
+    async query(options: { sql: string; values: unknown[]; timeout: number }) {
       queryCalls += 1;
-      assert.equal(sql, "SELECT ? AS marker LIMIT ?");
-      assert.deepEqual(parameters, ["ok", 1]);
+      assert.equal(options.sql, "SELECT ? AS marker LIMIT ?");
+      assert.deepEqual(options.values, ["ok", 1]);
+      assert.equal(options.timeout, 3210);
       return [[{ marker: "ok" }], []];
     },
     async execute() {
       executeCalls += 1;
       return [[], []];
+    },
+    release() {
+      releaseCalls += 1;
+    },
+    destroy() {}
+  };
+  const pool = {
+    async getConnection() {
+      return connection;
     }
   } as unknown as Pool;
-  const client = new MysqlRpaSqlClient(pool);
+  const client = new MysqlRpaSqlClient(pool, 3210);
 
   assert.deepEqual(
     await client.queryRows<{ marker: string }>("SELECT ? AS marker LIMIT ?", ["ok", 1]),
@@ -286,6 +306,32 @@ test("只读查询使用参数化文本协议以兼容不支持 LIMIT 预编译�
   );
   assert.equal(queryCalls, 1);
   assert.equal(executeCalls, 0);
+  assert.equal(releaseCalls, 1);
+});
+
+test("连接池取连接超时，迟到的连接会立即归还", async () => {
+  let resolveConnection!: (connection: unknown) => void;
+  let releaseCalls = 0;
+  const connection = {
+    release() {
+      releaseCalls += 1;
+    }
+  };
+  const pool = {
+    getConnection() {
+      return new Promise((resolve) => {
+        resolveConnection = resolve;
+      });
+    }
+  } as unknown as Pick<Pool, "getConnection">;
+
+  await assert.rejects(
+    () => acquireRpaPoolConnection(pool, 10),
+    (error: unknown) => (error as { code?: string }).code === "RPA_DB_ACQUIRE_TIMEOUT"
+  );
+  resolveConnection(connection);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(releaseCalls, 1);
 });
 
 test("查询与领取写本地审计 JSONL，但不记录 keyword", async () => {

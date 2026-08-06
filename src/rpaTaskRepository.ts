@@ -6,10 +6,15 @@
  */
 import {
   type Pool,
+  type PoolConnection,
   type ResultSetHeader,
   type RowDataPacket
 } from "mysql2/promise";
-import { getRpaDatabasePool } from "./rpaDatabase.js";
+import {
+  acquireRpaPoolConnection,
+  getRpaDatabasePool,
+  readRpaDatabaseTimeoutConfig
+} from "./rpaDatabase.js";
 import type { RpaTaskAuditSink } from "./rpaTaskAudit.js";
 import {
   businessTypeForWorker,
@@ -72,19 +77,51 @@ interface RpaTaskStateCountRow {
 }
 
 export class MysqlRpaSqlClient implements RpaSqlClient {
-  constructor(private readonly pool: Pool = getRpaDatabasePool()) {}
+  constructor(
+    private readonly pool: Pool = getRpaDatabasePool(),
+    private readonly queryTimeoutMs = readRpaDatabaseTimeoutConfig().queryTimeoutMs,
+    private readonly acquireTimeoutMs = readRpaDatabaseTimeoutConfig().acquireTimeoutMs
+  ) {}
 
   async queryRows<T>(sql: string, parameters: readonly RpaSqlParameter[]): Promise<T[]> {
     // 部分生产 MySQL/代理不支持 LIMIT ? 的 prepared statement，会返回
     // ER_WRONG_ARGUMENTS。query 仍由 mysql2 对参数进行转义，但不走服务端预编译；
     // 写入和原子领取继续使用 execute。
-    const [rows] = await this.pool.query<RowDataPacket[]>(sql, [...parameters]);
-    return rows as unknown as T[];
+    return this.withConnection(async (connection) => {
+      const [rows] = await connection.query<RowDataPacket[]>({
+        sql,
+        values: [...parameters],
+        timeout: this.queryTimeoutMs
+      });
+      return rows as unknown as T[];
+    });
   }
 
   async executeUpdate(sql: string, parameters: readonly RpaSqlParameter[]): Promise<number> {
-    const [result] = await this.pool.execute<ResultSetHeader>(sql, [...parameters]);
-    return result.affectedRows;
+    return this.withConnection(async (connection) => {
+      const [result] = await connection.execute<ResultSetHeader>({
+        sql,
+        values: [...parameters],
+        timeout: this.queryTimeoutMs
+      });
+      return result.affectedRows;
+    });
+  }
+
+  private async withConnection<T>(
+    operation: (connection: PoolConnection) => Promise<T>
+  ): Promise<T> {
+    const connection = await acquireRpaPoolConnection(this.pool, this.acquireTimeoutMs);
+    let healthy = true;
+    try {
+      return await operation(connection);
+    } catch (error) {
+      healthy = false;
+      connection.destroy();
+      throw error;
+    } finally {
+      if (healthy) connection.release();
+    }
   }
 }
 
@@ -268,6 +305,23 @@ WHERE e.status = 0
   AND e.task_status = 0
   AND e.deleted = 0
   AND d.business_type = ?
+  -- 同一业务任务/租户/平台仍有 processing 时，不允许跳过中断题领取后续题。
+  -- stale recovery 将中断题恢复为 pending 后，完整剩余批次才会重新进入候选集。
+  AND NOT EXISTS (
+    SELECT 1
+    FROM rpa_task_execution AS active_e
+    INNER JOIN brand_rpa_dispatch_task AS active_d
+      ON active_d.id = active_e.task_id
+      AND active_d.deleted = 0
+    WHERE active_e.status = 1
+      AND active_e.task_status = 1
+      AND active_e.answer_id IS NULL
+      AND active_e.deleted = 0
+      AND active_d.business_type = d.business_type
+      AND active_d.business_task_id = d.business_task_id
+      AND active_d.tenant_key = d.tenant_key
+      AND active_e.ai_model_id = e.ai_model_id
+  )
 ORDER BY e.priority ASC, e.create_time ASC, e.id ASC
 LIMIT ?`;
 

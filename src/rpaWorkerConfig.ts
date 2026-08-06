@@ -17,6 +17,7 @@ export interface RpaWorkerConfig {
   logDirectory: string;
   evidenceDirectory: string;
   outboxDirectory: string;
+  shutdownFile: string;
   outboxWriteRetryMs: number;
   metricsDirectory: string;
   metricsSnapshotIntervalMs: number;
@@ -45,6 +46,10 @@ export interface RpaWorkerConfig {
   candidateLimit: number;
   heartbeatIntervalMs: number;
   staleAfterMs: number;
+  watchdogStallMs: number;
+  platformRecheckIntervalMs: number;
+  platformReadyConfirmations: number;
+  platformProcessRestartMs: number;
   questionTimeoutMs: number;
   browserReconnectAttempts: number;
   browserReconnectBackoffMs: number;
@@ -82,7 +87,7 @@ export function parseRpaWorkerConfig(
     300_000
   );
   const staleAfterMs = integer(
-    configured("STALE_AFTER_MS") ?? "900000",
+    configured("STALE_AFTER_MS") ?? "300000",
     "stale-after-ms",
     60_000,
     86_400_000
@@ -128,6 +133,9 @@ export function parseRpaWorkerConfig(
     ),
     outboxDirectory: path.resolve(
       configured("OUTBOX_DIR") ?? path.join(runtimeRoot, "outbox")
+    ),
+    shutdownFile: path.resolve(
+      configured("SHUTDOWN_FILE") ?? path.join(runtimeRoot, "stop.request")
     ),
     outboxWriteRetryMs: integer(
       configured("OUTBOX_WRITE_RETRY_MS") ?? "5000",
@@ -217,6 +225,30 @@ export function parseRpaWorkerConfig(
     candidateLimit,
     heartbeatIntervalMs,
     staleAfterMs,
+    watchdogStallMs: integer(
+      configured("WATCHDOG_STALL_MS") ?? "300000",
+      "watchdog-stall-ms",
+      60_000,
+      3_600_000
+    ),
+    platformRecheckIntervalMs: integer(
+      configured("PLATFORM_RECHECK_INTERVAL_MS") ?? "60000",
+      "platform-recheck-interval-ms",
+      10_000,
+      3_600_000
+    ),
+    platformReadyConfirmations: integer(
+      configured("PLATFORM_READY_CONFIRMATIONS") ?? "2",
+      "platform-ready-confirmations",
+      1,
+      10
+    ),
+    platformProcessRestartMs: integer(
+      configured("PLATFORM_PROCESS_RESTART_MS") ?? "5000",
+      "platform-process-restart-ms",
+      1_000,
+      300_000
+    ),
     questionTimeoutMs: integer(
       configured("QUESTION_TIMEOUT_MS") ?? "180000",
       "question-timeout-ms",

@@ -1,7 +1,8 @@
 /** 最终 RPA Worker：任务领取、品牌批次、浏览器执行、结果事务和运行保护。 */
 import type { Page } from "playwright";
-import { inspectPlatformPage, runBrowserSelfCheck, classifyTechnicalError,
-  healthStatusForErrorCode, type BrowserSelfCheckResult, type WorkerErrorCode } from "./browserDiagnostics.js";
+import { findPlatformPage, inspectPlatformPage, runBrowserSelfCheck, classifyTechnicalError,
+  healthStatusForErrorCode, type BrowserSelfCheckResult, type PlatformSelfCheckResult,
+  type WorkerErrorCode } from "./browserDiagnostics.js";
 import {
   conversationPageOperations,
   createPageConversationManager,
@@ -104,6 +105,7 @@ export interface RpaWorkerRunSummary {
 export interface RpaWorkerRunOptions {
   shouldStop?: () => boolean;
   session?: RpaWorkerSession;
+  onProgress?: (stage: string) => void;
 }
 
 /** Service 跨轮询复用的数据库、日志、CDP 页面与平台健康状态。 */
@@ -120,13 +122,17 @@ export interface RpaWorkerSession {
   metricsPublisher: MetricsSnapshotPublisher;
   browserRuntime?: BrowserSelfCheckResult;
   platformHealth: Map<PlatformId, PlatformHealthState>;
+  platformRecoveryChecks: Map<PlatformId, { lastCheckedAt: number; consecutiveReady: number }>;
   lastTaskStateMetricsAt?: number;
   filesystemDegraded: boolean;
   lockStateTrusted: boolean;
 }
 
 export function createRpaWorkerSession(config: RpaWorkerConfig): RpaWorkerSession {
-  const audit = new JsonlRpaTaskAuditLogger({ logDirectory: config.logDirectory });
+  const audit = new JsonlRpaTaskAuditLogger({
+    logDirectory: config.logDirectory,
+    fileName: `${safeRuntimeFileStem(config.workerId)}-repository.jsonl`
+  });
   const metrics = new MetricsRegistry(config.workerType, config.platforms);
   const metricsPublisher = new MetricsSnapshotPublisher(
     metrics,
@@ -167,6 +173,7 @@ export function createRpaWorkerSession(config: RpaWorkerConfig): RpaWorkerSessio
     metrics,
     metricsPublisher,
     platformHealth: new Map(),
+    platformRecoveryChecks: new Map(),
     filesystemDegraded: false,
     lockStateTrusted: true
   };
@@ -285,9 +292,12 @@ export async function runRpaWorkerOnce(
     pausedPlatforms: {}
   };
   const shouldStop = options.shouldStop ?? (() => false);
+  const onProgress = options.onProgress ?? (() => undefined);
 
   try {
+    onProgress("cycle-start");
     await refreshWorkerMetrics(session, config);
+    onProgress("metrics-refreshed");
     if (config.healthCheckOnly) {
       await runRpaWorkerHealthCheck(config, taskRepository, evidenceStore);
       return summary;
@@ -304,6 +314,7 @@ export async function runRpaWorkerOnce(
     // 结果已在本地安全落盘时，数据库恢复必须先于浏览器自检和新任务领取。
     // 重放路径只调用 saveSuccess，不创建页面、不获取会话，也不再次发送问题。
     const replay = await replayResultOutbox(resultOutbox, resultRepository);
+    onProgress("outbox-replayed");
     summary.replayedOutboxCount = replay.replayedCount;
     summary.pendingOutboxCount = replay.failures.length;
     session.metrics.setOutboxPending(replay.failures.length);
@@ -387,6 +398,7 @@ export async function runRpaWorkerOnce(
         if (!restored) return summary;
         await leases.release(healthLock);
         session.lockStateTrusted = true;
+        onProgress("lease-health-restored");
       } catch (error) {
         rpaConsoleError({
           workerId: config.workerId,
@@ -398,8 +410,55 @@ export async function runRpaWorkerOnce(
       }
     }
 
+    // Recovery is database-only and must run even while a platform page is
+    // paused. Otherwise DOM/login state could postpone a stale row forever.
+    if (config.recoverStale) {
+      const staleBefore = new Date(Date.now() - config.staleAfterMs);
+      const recovered = await stateRepository.recoverStaleExecutions(
+        config.workerType,
+        staleBefore,
+        leases,
+        { limit: config.candidateLimit }
+      );
+      onProgress("stale-recovery-complete");
+      summary.recoveredZombieCount = recovered.recoveredExecutionIds.length;
+      if (recovered.recoveredExecutionIds.length > 0) {
+        session.lastTaskStateMetricsAt = undefined;
+        await refreshWorkerMetrics(session, config);
+      }
+      rpaConsoleInfo({
+        workerId: config.workerId,
+        event: "STALE_RECOVERY",
+        batchProgress:
+          `candidates=${recovered.candidates.length},recovered=${recovered.recoveredExecutionIds.length},locked=${recovered.skippedLockedExecutionIds.length}`
+      });
+    }
+    if (shouldStop()) return summary;
+
+    // A single-platform loop must not run another brand while an unanswered
+    // processing row is waiting for stale recovery. It polls independently and
+    // resumes within one poll interval after the five-minute threshold.
+    if (config.platforms.length === 1) {
+      const platformId = config.platforms[0]!;
+      const state = (await taskRepository.countTaskStates(config.workerType))
+        .find((item) => item.platformId === platformId);
+      onProgress("platform-processing-checked");
+      if ((state?.processing ?? 0) > 0) {
+        rpaConsoleInfo({
+          workerId: config.workerId,
+          event: "PLATFORM_WAITING_FOR_STALE_RECOVERY",
+          platformId,
+          batchProgress: `processing=${state!.processing},staleAfterMs=${config.staleAfterMs}`
+        });
+        return summary;
+      }
+    }
+
     const selfCheck = await ensureBrowserRuntime(session, config);
+    onProgress("browser-ready");
     if (!selfCheck.connected) throw new Error(`无法连接 CDP：${config.cdpEndpoint}`);
+    await recheckDomChangedPlatforms(session, config);
+    onProgress("platform-recheck-complete");
     const readyPlatforms = readySessionPlatforms(session, config);
     for (const platformId of config.platforms) {
       const state = session.platformHealth.get(platformId);
@@ -416,32 +475,11 @@ export async function runRpaWorkerOnce(
       return summary;
     }
 
-    if (config.recoverStale) {
-      const staleBefore = new Date(Date.now() - config.staleAfterMs);
-      const recovered = await stateRepository.recoverStaleExecutions(
-        config.workerType,
-        staleBefore,
-        leases,
-        { limit: config.candidateLimit }
-      );
-      summary.recoveredZombieCount = recovered.recoveredExecutionIds.length;
-      if (recovered.recoveredExecutionIds.length > 0) {
-        session.lastTaskStateMetricsAt = undefined;
-        await refreshWorkerMetrics(session, config);
-      }
-      rpaConsoleInfo({
-        workerId: config.workerId,
-        event: "STALE_RECOVERY",
-        batchProgress:
-          `candidates=${recovered.candidates.length},recovered=${recovered.recoveredExecutionIds.length},locked=${recovered.skippedLockedExecutionIds.length}`
-      });
-    }
-    if (shouldStop()) return summary;
-
     const runtimeConfig = { ...config, platforms: readyPlatforms };
     const planned = nextPlatformBatches(
       await planGreyRpaBatches(taskRepository, runtimeConfig)
     );
+    onProgress("tasks-planned");
     summary.selectedBatchCount = planned.length;
     summary.selectedTaskCount = countPlannedTasks(planned);
     if (planned.length === 0) {
@@ -459,7 +497,8 @@ export async function runRpaWorkerOnce(
       leases,
       planned,
       config.workerType,
-      shouldStop
+      shouldStop,
+      onProgress
     );
     summary.selectedBatchCount = claimed.length;
     summary.selectedTaskCount = countPlannedTasks(claimed);
@@ -515,7 +554,8 @@ export async function runRpaWorkerOnce(
         return result.page;
       },
       platformHealth: session.platformHealth,
-      shouldStop
+      shouldStop,
+      onProgress
     });
     return summary;
   } finally {
@@ -726,6 +766,93 @@ export async function runRpaWorkerHealthCheck(
   }
 }
 
+function safeRuntimeFileStem(value: string): string {
+  const normalized = value.trim().replace(/[^A-Za-z0-9_.-]+/g, "-").slice(0, 96);
+  return normalized || "rpa-worker";
+}
+
+export type PlatformRecoveryInspector = (
+  page: Page,
+  platformId: PlatformId
+) => Promise<PlatformSelfCheckResult>;
+
+/**
+ * DOM changes are probed periodically against the already-connected platform
+ * tab. A single transient success is not enough to resume claims.
+ */
+export async function recheckDomChangedPlatforms(
+  session: RpaWorkerSession,
+  config: Pick<
+    RpaWorkerConfig,
+    "platforms" | "platformRecheckIntervalMs" | "platformReadyConfirmations" | "workerId"
+  >,
+  now = Date.now(),
+  inspect: PlatformRecoveryInspector = (page, platformId) =>
+    inspectPlatformPage(page, PLATFORMS[platformId], 2_000)
+): Promise<PlatformId[]> {
+  const recovered: PlatformId[] = [];
+  for (const platformId of config.platforms) {
+    if (session.platformHealth.get(platformId)?.status !== "DOM_CHANGED") continue;
+    const previous = session.platformRecoveryChecks.get(platformId);
+    if (
+      previous &&
+      now - previous.lastCheckedAt < config.platformRecheckIntervalMs
+    ) continue;
+
+    const runtime = session.browserRuntime;
+    const page = runtime?.platforms[platformId]?.page ?? (
+      runtime?.browser
+        ? findPlatformPage(
+          runtime.browser.contexts().flatMap((context) => context.pages()),
+          PLATFORMS[platformId]
+        )
+        : undefined
+    );
+    if (!page || page.isClosed()) {
+      session.platformRecoveryChecks.set(platformId, {
+        lastCheckedAt: now,
+        consecutiveReady: 0
+      });
+      continue;
+    }
+
+    const result = await inspect(page, platformId).catch((error): PlatformSelfCheckResult => ({
+      platformId,
+      ready: false,
+      healthStatus: "DOM_CHANGED",
+      reason: safeErrorSummary(error)
+    }));
+    const consecutiveReady = result.ready ? (previous?.consecutiveReady ?? 0) + 1 : 0;
+    session.platformRecoveryChecks.set(platformId, { lastCheckedAt: now, consecutiveReady });
+    if (result.ready && consecutiveReady >= config.platformReadyConfirmations) {
+      session.platformHealth.set(platformId, {
+        platformId,
+        status: "READY",
+        updatedAt: now
+      });
+      session.metrics.setPlatformHealth(platformId, "READY");
+      session.browserRuntime!.platforms[platformId] = { ...result, page };
+      session.platformRecoveryChecks.delete(platformId);
+      recovered.push(platformId);
+      rpaConsoleInfo({
+        workerId: config.workerId,
+        event: "PLATFORM_AUTO_RECOVERED",
+        platformId,
+        batchProgress: `consecutiveReady=${consecutiveReady}`
+      });
+      continue;
+    }
+    session.platformHealth.set(platformId, {
+      platformId,
+      status: "DOM_CHANGED",
+      updatedAt: now,
+      ...(result.reason ? { reason: result.reason } : {})
+    });
+    session.metrics.setPlatformHealth(platformId, "DOM_CHANGED");
+  }
+  return recovered;
+}
+
 interface ExecuteClaimedInput {
   config: RpaWorkerConfig;
   batches: readonly PlannedRpaBatch[];
@@ -743,6 +870,7 @@ interface ExecuteClaimedInput {
   recoverPlatformPage: (platformId: PlatformId) => Promise<Page>;
   platformHealth: Map<PlatformId, PlatformHealthState>;
   shouldStop: () => boolean;
+  onProgress: (stage: string) => void;
 }
 
 /** 纯映射用于防止正式 Worker 再次遗漏数据库任务的 deepThinking。 */
@@ -792,6 +920,20 @@ export type RpaTaskLifecycleState =
   | "DATABASE_SAVED"
   | "POST_SUBMIT_UNCERTAIN";
 
+/**
+ * 诊断任务采用至少一次语义：数据库仍把本题作为待处理任务交给 Worker，但旧页面
+ * 归属仍匹配且 DOM 无法确认本题时，优先在新会话重新提问。重复回答可以由同一个
+ * executionId 的事务幂等约束吸收；漏掉回答则会使整个诊断永远无法结束。
+ * ARTICLE_PROBE 继续保持严格保护，避免监测曝光被重复提问污染。
+ */
+export function shouldRestartUncertainOwnedConversation(
+  businessType: CollectionTask["businessType"],
+  ownerMatches: boolean,
+  inspectionStatus: "answered" | "absent" | "retryable" | "uncertain"
+): boolean {
+  return businessType === "DIAGNOSIS" && ownerMatches && inspectionStatus === "uncertain";
+}
+
 /** 释放 DB claim 的唯一白名单；发送后的任何状态都必须保留结果恢复语义。 */
 export function releaseableExecutionIds(
   executionIds: readonly string[],
@@ -819,7 +961,8 @@ async function executeClaimedBatches(input: ExecuteClaimedInput): Promise<void> 
       event: "HEARTBEAT_FAILED",
       errorCode: "DATABASE_ERROR",
       error
-    })
+    }),
+    onSuccess: () => input.onProgress("execution-heartbeat")
   });
 
   for (const platformId of config.platforms) {
@@ -887,10 +1030,31 @@ async function executeClaimedBatches(input: ExecuteClaimedInput): Promise<void> 
           return;
         }
         if (ownerMatches && inspection.status === "uncertain") {
-          throw Object.assign(
-            new Error(`已有本批次页面，但无法证明当前问题尚未发送：${inspection.reason ?? "未知"}`),
-            { errorCode: "REFERENCE_UNKNOWN" }
-          );
+          if (!shouldRestartUncertainOwnedConversation(
+            task.businessType,
+            ownerMatches,
+            inspection.status
+          )) {
+            throw Object.assign(
+              new Error(`已有本批次页面，但无法证明当前问题尚未发送：${inspection.reason ?? "未知"}`),
+              { errorCode: "REFERENCE_UNKNOWN" }
+            );
+          }
+
+          // 此 task 来自 pending 查询并已重新领取，因此数据库仍无 answer_id。诊断业务
+          // 明确接受重复提问：创建干净会话后由 executeTask 正常发送并按 executionId
+          // 落库，避免旧 owner 标记造成“领取—冷却—释放”的无限循环。
+          rpaConsoleInfo({
+            workerId: config.workerId,
+            event: "BATCH_CONVERSATION_RESTARTED",
+            executionId: task.executionId,
+            brandId: task.brandId,
+            platformId: batch.platformId,
+            batchProgress: "pending-answer-unrecognized:new-conversation"
+          });
+          await manager.startBatch(context, lastQuestion.get(batch.platformId) ?? "");
+          await storeConversationOwner(page, context);
+          return;
         }
         await manager.startBatch(context, lastQuestion.get(batch.platformId) ?? "");
         await storeConversationOwner(page, context);
@@ -1057,6 +1221,7 @@ async function executeClaimedBatches(input: ExecuteClaimedInput): Promise<void> 
 
         heartbeat.remove(task.executionId);
         owned.delete(task.executionId);
+        input.onProgress(`task-persisted:${task.executionId}`);
         await input.leases.release(executionLeaseName(task.executionId)).catch((error) => {
           rpaConsoleError({
             workerId: config.workerId,
@@ -1439,6 +1604,7 @@ async function executeClaimedBatches(input: ExecuteClaimedInput): Promise<void> 
   try {
     while (owned.size > 0 && !input.shouldStop()) {
       const results = await layer.tick();
+      input.onProgress("execution-layer-tick");
       for (const [platformId, result] of Object.entries(results) as [
         PlatformId,
         NonNullable<(typeof results)[PlatformId]>
@@ -1483,43 +1649,78 @@ async function executeClaimedBatches(input: ExecuteClaimedInput): Promise<void> 
   }
 }
 
-async function claimCompleteBatches(
+export async function claimCompleteBatches(
   taskRepository: RpaTaskRepository,
   stateRepository: RpaWorkerStateRepository,
   leases: AdvisoryLeaseCoordinator,
   batches: readonly PlannedRpaBatch[],
   workerType: RpaWorkerConfig["workerType"],
-  shouldStop: () => boolean = () => false
+  shouldStop: () => boolean = () => false,
+  onProgress: (stage: string) => void = () => undefined
 ): Promise<PlannedRpaBatch[]> {
   const claimedBatches: PlannedRpaBatch[] = [];
   for (const batch of batches) {
     if (shouldStop()) break;
     const claimed: CollectionTask[] = [];
+    const acquiredLocks: string[] = [];
     let complete = true;
-    for (const task of batch.tasks) {
-      if (shouldStop()) {
-        complete = false;
-        break;
+    try {
+      for (const task of batch.tasks) {
+        if (shouldStop()) {
+          complete = false;
+          break;
+        }
+        // Lock first. A stalled/contended advisory-lock query must never leave a
+        // database row in processing without a lock and heartbeat owner.
+        const lockName = executionLeaseName(task.executionId);
+        if (!await leases.tryAcquire(lockName)) {
+          complete = false;
+          break;
+        }
+        acquiredLocks.push(lockName);
+        onProgress(`execution-lock-acquired:${task.executionId}`);
+        if (!await taskRepository.claimTask(workerType, task.executionId)) {
+          complete = false;
+          break;
+        }
+        claimed.push(task);
+        onProgress(`task-claimed:${task.executionId}`);
       }
-      if (!await taskRepository.claimTask(workerType, task.executionId)) {
-        complete = false;
-        break;
-      }
-      claimed.push(task);
-      const lockName = executionLeaseName(task.executionId);
-      if (!await leases.tryAcquire(lockName)) {
-        complete = false;
-        break;
-      }
+    } catch (error) {
+      await rollbackIncompleteClaim(stateRepository, leases, claimed, acquiredLocks);
+      throw error;
     }
     if (!complete) {
-      await stateRepository.releaseClaims(claimed.map(({ executionId }) => executionId));
-      for (const task of claimed) await leases.release(executionLeaseName(task.executionId));
+      await rollbackIncompleteClaim(stateRepository, leases, claimed, acquiredLocks);
       continue;
     }
     claimedBatches.push({ key: batch.key, tasks: claimed });
   }
   return claimedBatches;
+}
+
+async function rollbackIncompleteClaim(
+  stateRepository: RpaWorkerStateRepository,
+  leases: AdvisoryLeaseCoordinator,
+  claimed: readonly CollectionTask[],
+  acquiredLocks: readonly string[]
+): Promise<void> {
+  let releaseError: unknown;
+  try {
+    await stateRepository.releaseClaims(claimed.map(({ executionId }) => executionId));
+  } catch (error) {
+    releaseError = error;
+  }
+  for (const lockName of acquiredLocks) {
+    try {
+      await leases.release(lockName);
+    } catch (error) {
+      releaseError ??= error;
+    }
+  }
+  if (releaseError) {
+    throw releaseError;
+  }
 }
 
 async function releasePlatformLeaseAfterInterval(

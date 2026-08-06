@@ -18,6 +18,16 @@ export async function runRpaWorkerCli(argv = process.argv.slice(2)): Promise<voi
   };
   process.on("SIGINT", requestStop);
   process.on("SIGTERM", requestStop);
+  const requestStopFromParent = (message: unknown): void => {
+    if (
+      typeof message === "object" &&
+      message !== null &&
+      (message as { type?: unknown }).type === "RPA_DRAIN"
+    ) {
+      service.requestStop("FLEET");
+    }
+  };
+  process.on("message", requestStopFromParent);
   try {
     rpaConsoleInfo({
       workerId: config.workerId,
@@ -48,7 +58,9 @@ export async function runRpaWorkerCli(argv = process.argv.slice(2)): Promise<voi
   } finally {
     process.off("SIGINT", requestStop);
     process.off("SIGTERM", requestStop);
+    process.off("message", requestStopFromParent);
     await closeRpaDatabasePool();
+    if (process.connected) process.disconnect();
   }
 }
 

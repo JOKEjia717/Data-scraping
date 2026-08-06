@@ -5,7 +5,11 @@ import {
   type ResultSetHeader,
   type RowDataPacket
 } from "mysql2/promise";
-import { getRpaDatabasePool } from "./rpaDatabase.js";
+import {
+  acquireRpaPoolConnection,
+  getRpaDatabasePool,
+  readRpaDatabaseTimeoutConfig
+} from "./rpaDatabase.js";
 import {
   MysqlRpaSqlClient,
   type RpaSqlClient,
@@ -35,6 +39,8 @@ export interface AdvisoryLeaseCoordinator {
 export interface MysqlAdvisoryLeaseOptions {
   onInvalidated?: (error?: unknown) => void;
   onTrusted?: () => void;
+  acquireTimeoutMs?: number;
+  queryTimeoutMs?: number;
 }
 
 export class MysqlAdvisoryLeaseCoordinator implements AdvisoryLeaseCoordinator {
@@ -42,11 +48,17 @@ export class MysqlAdvisoryLeaseCoordinator implements AdvisoryLeaseCoordinator {
   private operationQueue = Promise.resolve();
   private readonly heldLocks = new Set<string>();
   private trusted = false;
+  private readonly acquireTimeoutMs: number;
+  private readonly queryTimeoutMs: number;
 
   constructor(
     private readonly pool: Pool = getRpaDatabasePool(),
     private readonly options: MysqlAdvisoryLeaseOptions = {}
-  ) {}
+  ) {
+    const defaults = readRpaDatabaseTimeoutConfig();
+    this.acquireTimeoutMs = options.acquireTimeoutMs ?? defaults.acquireTimeoutMs;
+    this.queryTimeoutMs = options.queryTimeoutMs ?? defaults.lockQueryTimeoutMs;
+  }
 
   isTrusted(): boolean {
     return this.trusted && this.connection !== undefined;
@@ -58,10 +70,11 @@ export class MysqlAdvisoryLeaseCoordinator implements AdvisoryLeaseCoordinator {
       const connection = await this.getConnection();
       if (this.heldLocks.has(name)) {
         try {
-          const [verification] = await connection.query<RowDataPacket[]>(
-            "SELECT IS_USED_LOCK(?) AS ownerId, CONNECTION_ID() AS connectionId",
-            [name]
-          );
+          const [verification] = await connection.query<RowDataPacket[]>({
+            sql: "SELECT IS_USED_LOCK(?) AS ownerId, CONNECTION_ID() AS connectionId",
+            values: [name],
+            timeout: this.queryTimeoutMs
+          });
           const row = verification[0];
           if (
             row?.ownerId !== null &&
@@ -71,14 +84,21 @@ export class MysqlAdvisoryLeaseCoordinator implements AdvisoryLeaseCoordinator {
           }
           this.heldLocks.delete(name);
         } catch (error) {
-          this.invalidateConnection(connection, error);
+          this.invalidateConnection(connection, error, true);
           throw error;
         }
       }
-      const [rows] = await connection.query<RowDataPacket[]>(
-        "SELECT GET_LOCK(?, 0) AS acquired",
-        [name]
-      );
+      let rows: RowDataPacket[];
+      try {
+        [rows] = await connection.query<RowDataPacket[]>({
+          sql: "SELECT GET_LOCK(?, 0) AS acquired",
+          values: [name],
+          timeout: this.queryTimeoutMs
+        });
+      } catch (error) {
+        this.invalidateConnection(connection, error, true);
+        throw error;
+      }
       const acquired = Number(rows[0]?.acquired) === 1;
       if (acquired) {
         this.heldLocks.add(name);
@@ -94,10 +114,14 @@ export class MysqlAdvisoryLeaseCoordinator implements AdvisoryLeaseCoordinator {
       if (!this.connection || !this.heldLocks.has(name)) return;
       const connection = this.connection;
       try {
-        await connection.query("SELECT RELEASE_LOCK(?)", [name]);
+        await connection.query({
+          sql: "SELECT RELEASE_LOCK(?)",
+          values: [name],
+          timeout: this.queryTimeoutMs
+        });
         this.heldLocks.delete(name);
       } catch (error) {
-        this.invalidateConnection(connection, error);
+        this.invalidateConnection(connection, error, true);
         throw error;
       }
     });
@@ -110,14 +134,21 @@ export class MysqlAdvisoryLeaseCoordinator implements AdvisoryLeaseCoordinator {
       this.connection = undefined;
       this.heldLocks.clear();
       this.trusted = false;
-      await connection.query("SELECT RELEASE_ALL_LOCKS()").catch(() => undefined);
-      connection.release();
+      try {
+        await connection.query({
+          sql: "SELECT RELEASE_ALL_LOCKS()",
+          timeout: this.queryTimeoutMs
+        });
+        connection.release();
+      } catch {
+        connection.destroy();
+      }
     });
   }
 
   private async getConnection(): Promise<PoolConnection> {
     if (!this.connection) {
-      const connection = await this.pool.getConnection();
+      const connection = await acquireRpaPoolConnection(this.pool, this.acquireTimeoutMs);
       this.connection = connection;
       this.attachConnectionListeners(connection);
       this.markTrusted();
@@ -132,12 +163,17 @@ export class MysqlAdvisoryLeaseCoordinator implements AdvisoryLeaseCoordinator {
     connection.on("close", invalidate);
   }
 
-  private invalidateConnection(connection: PoolConnection, error?: unknown): void {
+  private invalidateConnection(
+    connection: PoolConnection,
+    error?: unknown,
+    destroy = false
+  ): void {
     if (this.connection !== connection) return;
     this.connection = undefined;
     this.heldLocks.clear();
     this.trusted = false;
     this.options.onInvalidated?.(error);
+    if (destroy) connection.destroy();
   }
 
   private markTrusted(): void {
@@ -252,6 +288,7 @@ WHERE id IN (${ids.map(() => "?").join(", ")})
 export interface HeartbeatOptions {
   intervalMs: number;
   onError?: (error: unknown) => void;
+  onSuccess?: (affectedRows: number) => void;
 }
 
 export class ExecutionHeartbeat {
@@ -299,7 +336,8 @@ export class ExecutionHeartbeat {
   }
 
   private async tick(): Promise<void> {
-    await this.repository.heartbeat([...this.activeExecutionIds]);
+    const affectedRows = await this.repository.heartbeat([...this.activeExecutionIds]);
+    if (affectedRows > 0) this.options.onSuccess?.(affectedRows);
   }
 }
 

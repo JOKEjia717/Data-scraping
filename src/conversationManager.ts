@@ -325,20 +325,33 @@ export async function openNewConversation(
   const beforeBody = await page.locator("body").innerText({ timeout: 3_000 }).catch(() => "");
   const beforeQuestionCount = countTextOccurrences(beforeBody, previousQuestion);
   const startedAt = Date.now();
+  const viewport = await readViewportSize(page);
 
   for (const selector of config.newConversationButtonSelectors) {
     if (Date.now() - startedAt >= timeoutMs) break;
     const locators = await page.locator(selector).all().catch(() => []);
-    for (const locator of locators.slice().reverse()) {
+    for (const locator of locators) {
       if (Date.now() - startedAt >= timeoutMs) break;
       const [visible, enabled, box] = await Promise.all([
         locator.isVisible().catch(() => false),
         locator.isEnabled().catch(() => false),
         locator.boundingBox().catch(() => null)
       ]);
-      if (!visible || !enabled || !box || box.width > 500 || box.height > 180) continue;
+      // 千问会同时保留桌面端和移动端的“新建对话”按钮。移动端副本可能位于
+      // 视口左侧之外（例如 x=-244），但 Playwright 的 isVisible() 仍会返回 true。
+      // locator.click() 会在这种元素上等待 actionability 超时，随后让平台进入冷却。
+      if (
+        !visible ||
+        !enabled ||
+        !box ||
+        box.width > 500 ||
+        box.height > 180 ||
+        !doesBoxIntersectViewport(box, viewport)
+      ) continue;
 
-      const clicked = await locator.click({ timeout: 2_000 })
+      const remainingBeforeClickMs = timeoutMs - (Date.now() - startedAt);
+      if (remainingBeforeClickMs <= 0) return false;
+      const clicked = await locator.click({ timeout: Math.min(2_000, remainingBeforeClickMs) })
         .then(() => true)
         .catch(() => false);
       if (!clicked) continue;
@@ -358,6 +371,30 @@ export async function openNewConversation(
     }
   }
   return false;
+}
+
+interface ViewportSize {
+  width: number;
+  height: number;
+}
+
+async function readViewportSize(page: Page): Promise<ViewportSize | null> {
+  return page.evaluate(() => ({
+    width: window.innerWidth,
+    height: window.innerHeight
+  })).catch(() => page.viewportSize());
+}
+
+function doesBoxIntersectViewport(
+  box: { x: number; y: number; width: number; height: number },
+  viewport: ViewportSize | null
+): boolean {
+  if (box.width <= 0 || box.height <= 0) return false;
+  if (!viewport) return true;
+  return box.x < viewport.width &&
+    box.y < viewport.height &&
+    box.x + box.width > 0 &&
+    box.y + box.height > 0;
 }
 
 function normalizePolicy(policy: Partial<ConversationPolicy> = {}): ConversationPolicy {

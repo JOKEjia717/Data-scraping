@@ -1966,6 +1966,54 @@ test("一轮问题结束后点击新建对话并等待空白输入界面", async
   await page.close();
 });
 
+test("千问忽略视口外的移动端新建对话副本并点击桌面端入口", async () => {
+  assert.ok(browser);
+  const page = await browser.newPage({ viewport: { width: 1280, height: 720 } });
+  const previousQuestion = "千问上一批次最后一题";
+
+  await page.setContent(`
+    <aside>
+      <button
+        id="desktop-new-chat"
+        style="position:fixed;left:12px;top:60px;width:194px;height:36px"
+      >新建对话</button>
+      <button
+        id="mobile-new-chat"
+        style="position:fixed;left:-244px;top:60px;width:194px;height:36px"
+      >新建对话</button>
+    </aside>
+    <main id="conversation">
+      <div class="qk-markdown">${previousQuestion}</div>
+      <div class="qk-markdown">上一批次回答</div>
+    </main>
+    <textarea aria-label="给千问发送消息"></textarea>
+    <script>
+      document.querySelector("#desktop-new-chat").addEventListener("click", () => {
+        document.body.dataset.desktopNewChatClicked = "true";
+        document.querySelector("#conversation").innerHTML = "";
+      });
+      document.querySelector("#mobile-new-chat").addEventListener("click", () => {
+        document.body.dataset.mobileNewChatClicked = "true";
+      });
+    </script>
+  `);
+
+  assert.equal(await page.locator("#mobile-new-chat").isVisible(), true);
+  const startedAt = Date.now();
+  const opened = await openNewConversation(
+    page,
+    PLATFORMS.qianwen,
+    previousQuestion,
+    1_200
+  );
+
+  assert.equal(opened, true);
+  assert.equal(await page.locator("body").getAttribute("data-desktop-new-chat-clicked"), "true");
+  assert.equal(await page.locator("body").getAttribute("data-mobile-new-chat-clicked"), null);
+  assert.ok(Date.now() - startedAt < 1_000, "不应在视口外按钮上等待点击超时");
+  await page.close();
+});
+
 test("豆包品牌完成后点击新版 sidebar_nav_item 新对话入口", async () => {
   assert.ok(browser);
   const page = await browser.newPage();

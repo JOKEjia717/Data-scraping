@@ -1,4 +1,5 @@
 /** 正式 RPA Worker 常驻服务生命周期。单轮业务继续由 runRpaWorkerOnce 承担。 */
+import fs from "node:fs";
 import {
   closeRpaWorkerSession,
   createRpaWorkerSession,
@@ -17,7 +18,11 @@ import { classifyRuntimeError } from "./runtimeSafety.js";
 import type { WorkerErrorCode } from "./browserDiagnostics.js";
 
 export interface RpaWorkerCycleRunner {
-  runOnce(shouldStop: () => boolean): Promise<RpaWorkerRunSummary>;
+  runOnce(
+    shouldStop: () => boolean,
+    onProgress?: (stage: string) => void
+  ): Promise<RpaWorkerRunSummary>;
+  abort?(reason: Error): Promise<void>;
   close(): Promise<void>;
 }
 
@@ -34,6 +39,8 @@ export interface RpaWorkerServiceOptions {
   onWarn?: (message: string) => void;
   onError?: (message: string, errorCode?: WorkerErrorCode) => void;
   maxDatabaseBackoffMs?: number;
+  watchdogStallMs?: number;
+  externalStopRequested?: () => boolean;
 }
 
 export interface RpaWorkerServiceSummary {
@@ -48,7 +55,8 @@ export interface DefaultCycleRunnerOptions {
   runOnce?: (
     config: RpaWorkerConfig,
     session: RpaWorkerSession,
-    shouldStop: () => boolean
+    shouldStop: () => boolean,
+    onProgress?: (stage: string) => void
   ) => Promise<RpaWorkerRunSummary>;
   closeSession?: (session: RpaWorkerSession) => Promise<void>;
 }
@@ -58,6 +66,7 @@ export class DefaultRpaWorkerCycleRunner implements RpaWorkerCycleRunner {
   private readonly executeOnce: NonNullable<DefaultCycleRunnerOptions["runOnce"]>;
   private readonly closeSession: NonNullable<DefaultCycleRunnerOptions["closeSession"]>;
   private closed = false;
+  private closePromise?: Promise<void>;
 
   constructor(
     private readonly config: RpaWorkerConfig,
@@ -65,20 +74,28 @@ export class DefaultRpaWorkerCycleRunner implements RpaWorkerCycleRunner {
   ) {
     // 整个 Service 只创建一次 Session，因此 CDP、页面、仓储和平台健康状态跨轮询复用。
     this.session = (options.createSession ?? createRpaWorkerSession)(config);
-    this.executeOnce = options.runOnce ?? ((workerConfig, session, shouldStop) =>
-      runRpaWorkerOnce(workerConfig, { shouldStop, session }));
+    this.executeOnce = options.runOnce ?? ((workerConfig, session, shouldStop, onProgress) =>
+      runRpaWorkerOnce(workerConfig, { shouldStop, session, onProgress }));
     this.closeSession = options.closeSession ?? closeRpaWorkerSession;
   }
 
-  runOnce(shouldStop: () => boolean): Promise<RpaWorkerRunSummary> {
+  runOnce(
+    shouldStop: () => boolean,
+    onProgress?: (stage: string) => void
+  ): Promise<RpaWorkerRunSummary> {
     if (this.closed) throw new Error("RPA Worker CycleRunner 已关闭。");
-    return this.executeOnce(this.config, this.session, shouldStop);
+    return this.executeOnce(this.config, this.session, shouldStop, onProgress);
+  }
+
+  abort(_reason: Error): Promise<void> {
+    return this.close();
   }
 
   async close(): Promise<void> {
-    if (this.closed) return;
+    if (this.closePromise) return this.closePromise;
     this.closed = true;
-    await this.closeSession(this.session);
+    this.closePromise = this.closeSession(this.session);
+    await this.closePromise;
   }
 }
 
@@ -90,6 +107,8 @@ export class RpaWorkerService {
   private readonly onWarn: (message: string) => void;
   private readonly onError: (message: string, errorCode?: WorkerErrorCode) => void;
   private readonly maxDatabaseBackoffMs: number;
+  private readonly watchdogStallMs: number;
+  private readonly externalStopRequested: () => boolean;
   private stopRequested = false;
   private signalCount = 0;
   private running = false;
@@ -118,6 +137,12 @@ export class RpaWorkerService {
       error: message
     }));
     this.maxDatabaseBackoffMs = options.maxDatabaseBackoffMs ?? 300_000;
+    this.watchdogStallMs = options.watchdogStallMs ?? config.watchdogStallMs;
+    if (!Number.isFinite(this.watchdogStallMs) || this.watchdogStallMs <= 0) {
+      throw new Error("watchdogStallMs must be greater than zero");
+    }
+    this.externalStopRequested = options.externalStopRequested ??
+      (() => fs.existsSync(config.shutdownFile));
   }
 
   get isStopRequested(): boolean {
@@ -125,13 +150,15 @@ export class RpaWorkerService {
   }
 
   /** 第一次进入安全停止；后续信号只告警，绝不调用 process.exit 或破坏页面。 */
-  requestStop(signal: NodeJS.Signals | "TEST" = "TEST"): void {
+  requestStop(
+    signal: NodeJS.Signals | "TEST" | "DRAIN_FILE" | "FLEET" = "TEST"
+  ): void {
     this.signalCount++;
     if (this.signalCount === 1) {
       this.stopRequested = true;
       this.waiter.wake();
       this.onInfo(
-        `收到 ${signal}：停止领取新批次，等待已开始品牌批次安全完成。`
+        `收到 ${signal}：停止领取新批次，等待正在执行的题安全结束并释放尚未提交的任务。`
       );
       return;
     }
@@ -153,9 +180,10 @@ export class RpaWorkerService {
 
     try {
       do {
+        this.syncExternalStopRequest();
         if (this.stopRequested) break;
         try {
-          const result = await this.runner.runOnce(() => this.stopRequested);
+          const result = await this.runCycleWithWatchdog();
           summary.cycleCount++;
           summary.lastRun = result;
           consecutiveErrors = 0;
@@ -173,6 +201,7 @@ export class RpaWorkerService {
             `Worker 轮询失败：${boundedError(error)}`,
             classifyRuntimeError(error)
           );
+          if (error instanceof WorkerStalledError) throw error;
           if (oneShot || this.stopRequested) {
             if (oneShot) throw error;
             break;
@@ -192,11 +221,73 @@ export class RpaWorkerService {
     return this.config.pollIntervalMs + jitter(this.config.pollJitterMs, this.random);
   }
 
+  private runCycleWithWatchdog(): Promise<RpaWorkerRunSummary> {
+    return new Promise<RpaWorkerRunSummary>((resolve, reject) => {
+      let timer: NodeJS.Timeout | undefined;
+      let settled = false;
+      let lastStage = "cycle-start";
+      const resetTimer = (): void => {
+        if (settled) return;
+        if (timer) clearTimeout(timer);
+        timer = setTimeout(() => {
+          if (settled) return;
+          settled = true;
+          const error = new WorkerStalledError(this.watchdogStallMs, lastStage);
+          this.stopRequested = true;
+          this.waiter.wake();
+          const abort = this.runner.abort?.(error);
+          if (!abort) {
+            reject(error);
+            return;
+          }
+          void abort.then(() => reject(error), () => reject(error));
+        }, this.watchdogStallMs);
+      };
+      const cycle = this.runner.runOnce(
+        () => {
+          this.syncExternalStopRequest();
+          return this.stopRequested;
+        },
+        (stage) => {
+          lastStage = stage;
+          resetTimer();
+        }
+      );
+      resetTimer();
+      void cycle.then((result) => {
+        if (settled) return;
+        settled = true;
+        if (timer) clearTimeout(timer);
+        resolve(result);
+      }, (error) => {
+        if (settled) return;
+        settled = true;
+        if (timer) clearTimeout(timer);
+        reject(error);
+      });
+    });
+  }
+
+  private syncExternalStopRequest(): void {
+    if (!this.stopRequested && this.externalStopRequested()) {
+      this.requestStop("DRAIN_FILE");
+    }
+  }
+
   private databaseBackoffMs(consecutiveErrors: number): number {
     const exponent = Math.min(8, Math.max(0, consecutiveErrors - 1));
     const base = Math.max(1_000, this.config.pollIntervalMs);
     return Math.min(this.maxDatabaseBackoffMs, base * (2 ** exponent)) +
       jitter(this.config.pollJitterMs, this.random);
+  }
+}
+
+export class WorkerStalledError extends Error {
+  readonly code = "RPA_WORKER_STALLED";
+
+  constructor(readonly stallMs: number, readonly lastStage: string) {
+    super(`Worker made no task progress for ${stallMs}ms; last stage: ${lastStage}`);
+    this.name = "WorkerStalledError";
   }
 }
 

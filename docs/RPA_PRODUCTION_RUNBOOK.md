@@ -6,7 +6,7 @@
 - 引用状态改为 `EXTRACTED / CONFIRMED_EMPTY / UNKNOWN`。`UNKNOWN` 使用 `REFERENCE_UNKNOWN`，禁止写成空引用成功，ARTICLE_PROBE 同样适用。
 - Outbox v2 增加 `schemaVersion=2` 和 SHA-256 `payloadChecksum`。损坏文件移动到 `outbox/quarantine` 并保留 metadata，正常文件继续回放；同 execution 冲突内容不会覆盖原始结果。
 - MySQL advisory lock 的本地缓存随 `error/end/close` 立即失效；重新连接后通过 `IS_USED_LOCK + CONNECTION_ID` 验证或重新 `GET_LOCK`，不能只相信内存集合。
-- Browser/CDP/标签页关闭或跳转支持有限次数重新连接和页面重新发现；若题目已经提交，重连路径只读检查原问题锚点、回答和引用，不再次点击发送，并把页面操作句柄重新绑定到原批次会话。登录、验证码、限流、DOM_CHANGED 不进行无限刷新。
+- Browser/CDP/标签页关闭或跳转支持有限次数重新连接和页面重新发现；若题目已经提交，重连路径只读检查原问题锚点、回答和引用，不再次点击发送，并把页面操作句柄重新绑定到原批次会话。登录、验证码和限流不进行无限刷新；DOM_CHANGED 仅按固定间隔只读复检，连续确认 READY 后才恢复。
 - 可选数据库调度通过 `next_retry_at`、`last_error_code`、`last_error_at` 释放失败任务的平台执行权；退避采用有上限指数算法和随机抖动。
 - 增加磁盘停止领取阈值、JSONL 日志滚动、日志/证据保留期、错误分类和指标输出；Outbox/quarantine 不属于清理范围。
 
@@ -51,6 +51,11 @@ Java DO 只增加同名属性，回答表和引用表字段、事务顺序、状
 - `OUTBOX_WRITE_RETRY_MS=5000`
 - `BROWSER_RECONNECT_ATTEMPTS=3`
 - `BROWSER_RECONNECT_BACKOFF_MS=2000`
+- `WATCHDOG_STALL_MS=300000`
+- `STALE_AFTER_MS=300000`
+- `PLATFORM_RECHECK_INTERVAL_MS=60000`
+- `PLATFORM_READY_CONFIRMATIONS=2`
+- `PLATFORM_PROCESS_RESTART_MS=5000`
 - `RETRY_JITTER_MS=5000`
 - `DISK_WARNING_FREE_MB=5120`
 - `DISK_STOP_FREE_MB=1024`
@@ -117,7 +122,7 @@ npm run rpa:gray:validate -- --worker=diagnosis --platforms=doubao \
 - `OUTBOX_CORRUPTED`：查看 quarantine metadata 和原文件；校验 executionId、schemaVersion、checksum，禁止直接复制回主目录。
 - `DATABASE_ERROR`：确认连接池和 advisory lock 连接；连接恢复后必须看到重新 GET_LOCK，不能手工假定旧锁仍在。
 - `BROWSER_DISCONNECTED`：检查 CDP 端口、Chrome 进程、Profile 和标签页；达到重连上限后人工恢复。
-- `LOGIN_REQUIRED/CAPTCHA_REQUIRED/RATE_LIMITED/DOM_CHANGED`：只处理对应平台，其他平台继续；不得自动绕过或无限刷新。
+- `LOGIN_REQUIRED/CAPTCHA_REQUIRED/RATE_LIMITED`：只处理对应平台，其他平台继续；不得自动绕过或无限刷新。`DOM_CHANGED` 默认每分钟只读复检，连续两次 READY 后自动恢复；连续确认前不得领取该平台任务。
 - `REFERENCE_UNKNOWN`：检查引用入口、页面完整性和 DOM fixture；在确认前不得补写空引用。
 - 磁盘停止领取：指标 `diskFreeBytes` 低于停止阈值。清理只能针对滚动日志和过期 evidence，不能清理 Outbox/quarantine。
 - 僵尸任务：同时检查双状态、answer_id、modify_time 和 `IS_USED_LOCK`；有锁任务不能恢复。

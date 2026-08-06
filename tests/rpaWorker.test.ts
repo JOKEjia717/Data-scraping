@@ -11,13 +11,16 @@ import type {
 import {
   deepThinkingRuntimeForTask,
   browserRuntimeNeedsReconnect,
+  claimCompleteBatches,
   executionErrorFor,
   nextPlatformBatches,
   planGreyRpaBatches,
   readySessionPlatforms,
+  recheckDomChangedPlatforms,
   referenceRecoveryRuntimeForTask,
   releaseableExecutionIds,
   routePlatformTaskFailure,
+  shouldRestartUncertainOwnedConversation,
   taskInGrayScope,
   webSearchRuntimeForTask,
   type RpaWorkerSession
@@ -56,6 +59,29 @@ test("批次失败只释放明确尚未发送的任务", () => {
     ["not-sent"]
   );
 });
+
+test("诊断待处理题在旧会话无法识别时新建会话重发", () => {
+  assert.equal(
+    shouldRestartUncertainOwnedConversation("DIAGNOSIS", true, "uncertain"),
+    true,
+    "诊断业务宁可重复提问，也不能让无 answer_id 的题永久遗漏"
+  );
+  assert.equal(
+    shouldRestartUncertainOwnedConversation("ARTICLE_PROBE", true, "uncertain"),
+    false,
+    "监测业务仍保留严格的去重保护"
+  );
+  assert.equal(
+    shouldRestartUncertainOwnedConversation("DIAGNOSIS", false, "uncertain"),
+    false,
+    "页面不属于旧批次时走正常的新会话启动路径"
+  );
+  assert.equal(
+    shouldRestartUncertainOwnedConversation("DIAGNOSIS", true, "answered"),
+    false,
+    "已经确认回答时必须恢复结果，不能重新提问"
+  );
+});
 import type { BrowserSelfCheckResult } from "../src/browserDiagnostics.js";
 import { parseRpaWorkerConfig } from "../src/rpaWorkerConfig.js";
 import {
@@ -75,7 +101,14 @@ class FakeMysqlLockServer {
   connection(): PoolConnection {
     const id = this.nextConnectionId++;
     const emitter = new EventEmitter();
-    const query = async (sql: string, parameters: readonly unknown[] = []) => {
+    const query = async (
+      queryInput: string | { sql: string; values?: readonly unknown[] },
+      legacyParameters: readonly unknown[] = []
+    ) => {
+      const sql = typeof queryInput === "string" ? queryInput : queryInput.sql;
+      const parameters = typeof queryInput === "string"
+        ? legacyParameters
+        : queryInput.values ?? [];
       const name = String(parameters[0] ?? "");
       if (/GET_LOCK/.test(sql)) {
         const owner = this.owners.get(name);
@@ -203,6 +236,8 @@ test("diagnosis 与 monitor 默认使用独立 endpoint、workerId、目录和 P
   assert.equal(diagnosis.maxAttempts, 3);
   assert.equal(diagnosis.retryBackoffMs, 30_000);
   assert.equal(diagnosis.pollIntervalMs, 10_000);
+  assert.equal(diagnosis.staleAfterMs, 300_000);
+  assert.equal(diagnosis.watchdogStallMs, 300_000);
   assert.equal(diagnosis.metricsSnapshotIntervalMs, 15_000);
   assert.equal(diagnosis.runOnce, false);
   assert.equal(diagnosis.deepThinkingUnsupportedPolicy, "fail");
@@ -515,6 +550,101 @@ test("僵尸恢复跳过仍持有 execution 锁的其他 Worker", async () => {
   assert.match(client.updates[0]!.sql, /UTC_TIMESTAMP\(\)/);
   assert.match(client.updates[0]!.sql, /CURRENT_TIMESTAMP\(\)/);
   assert.deepEqual(leases.releases, [executionLeaseName("21")]);
+});
+
+test("DOM_CHANGED 连续两次健康检查 READY 后才自动恢复", async () => {
+  const workerConfig = parseRpaWorkerConfig("diagnosis", [], {}, "/workspace");
+  const page = { isClosed: () => false };
+  const healthUpdates: string[] = [];
+  const session = {
+    platformHealth: new Map([
+      ["qianwen", { platformId: "qianwen", status: "DOM_CHANGED", updatedAt: 1 }]
+    ]),
+    platformRecoveryChecks: new Map(),
+    browserRuntime: {
+      connected: true,
+      platforms: {
+        qianwen: {
+          platformId: "qianwen",
+          ready: false,
+          healthStatus: "DOM_CHANGED",
+          page
+        }
+      }
+    },
+    metrics: {
+      setPlatformHealth(_platformId: string, status: string) {
+        healthUpdates.push(status);
+      }
+    }
+  } as unknown as RpaWorkerSession;
+  const inspect = async () => ({
+    platformId: "qianwen" as const,
+    ready: true,
+    healthStatus: "READY" as const,
+    page: page as never
+  });
+
+  assert.deepEqual(
+    await recheckDomChangedPlatforms(session, workerConfig, 100, inspect),
+    []
+  );
+  assert.equal(session.platformHealth.get("qianwen")?.status, "DOM_CHANGED");
+  assert.deepEqual(
+    await recheckDomChangedPlatforms(
+      session,
+      workerConfig,
+      100 + workerConfig.platformRecheckIntervalMs,
+      inspect
+    ),
+    ["qianwen"]
+  );
+  assert.equal(session.platformHealth.get("qianwen")?.status, "READY");
+  assert.deepEqual(healthUpdates, ["DOM_CHANGED", "READY"]);
+});
+
+test("完整批次先拿 execution lock，再改 processing；锁竞争时回滚整批", async () => {
+  const events: string[] = [];
+  const repository = {
+    async claimTask(_workerType: string, executionId: string) {
+      events.push(`claim:${executionId}`);
+      return true;
+    }
+  } as unknown as RpaTaskRepository;
+  const stateRepository = {
+    async releaseClaims(executionIds: readonly string[]) {
+      events.push(`rollback:${executionIds.join(",")}`);
+      return executionIds.length;
+    }
+  } as unknown as RpaWorkerStateRepository;
+  const leases = new FakeLeases();
+  leases.responses = [true, false];
+  const originalTryAcquire = leases.tryAcquire.bind(leases);
+  leases.tryAcquire = async (lockName) => {
+    events.push(`lock:${lockName}`);
+    return originalTryAcquire(lockName);
+  };
+  const originalRelease = leases.release.bind(leases);
+  leases.release = async (lockName) => {
+    events.push(`unlock:${lockName}`);
+    await originalRelease(lockName);
+  };
+
+  const claimed = await claimCompleteBatches(
+    repository,
+    stateRepository,
+    leases,
+    [{ key: "batch", tasks: [task("1", "a"), task("2", "a")] }],
+    "diagnosis"
+  );
+  assert.deepEqual(claimed, []);
+  assert.deepEqual(events, [
+    `lock:${executionLeaseName("1")}`,
+    "claim:1",
+    `lock:${executionLeaseName("2")}`,
+    "rollback:1",
+    `unlock:${executionLeaseName("1")}`
+  ]);
 });
 
 test("跨进程平台租约使用两个 Worker 共享的稳定名称并有限等待", async () => {

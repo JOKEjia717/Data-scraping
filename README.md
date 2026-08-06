@@ -132,7 +132,7 @@ npm run rpa:monitor -- \
 ```
 
 两个命令需要在两个独立终端或进程管理器中长期运行。按一次 `Ctrl+C` 会停止领取新批次，
-等待当前品牌批次完成后安全退出。运行日志、Outbox、证据和指标默认位于
+等待正在执行的题安全结束并释放尚未提交的任务后退出。运行日志、Outbox、证据和指标默认位于
 `rpa-runtime/diagnosis` 与 `rpa-runtime/monitor`。更完整的上线与回滚步骤见
 [`docs/RPA_PRODUCTION_RUNBOOK.md`](docs/RPA_PRODUCTION_RUNBOOK.md)。
 
@@ -546,8 +546,13 @@ execution、dispatch ID、原始 keyword、处理状态和既有回答。通过�
 - `npm run rpa:diagnosis`：只读取和领取 `DIAGNOSIS`；默认 CDP 为 9222；
 - `npm run rpa:monitor`：只读取和领取 `ARTICLE_PROBE`；默认 CDP 为 9223。
 
-两个进程默认使用不同的 workerId、日志目录、失败证据目录和 Chrome Profile。每个 Worker
-内部仍有豆包、DeepSeek、千问、元宝四条独立队列，单个平台并发固定为 1。跨进程使用
+Windows 长期运行、异常自动拉起和排空重启见
+[`docs/WINDOWS_WORKER_SUPERVISION.md`](docs/WINDOWS_WORKER_SUPERVISION.md)。Worker 不需要每天重启；
+计划维护应写入停止文件等待安全收尾，不能直接强杀进程。
+
+两个角色进程默认使用不同的 workerId、日志目录、失败证据目录和 Chrome Profile。每个角色
+内部为豆包、DeepSeek、千问、元宝分别启动独立 Worker 子进程；四个平台各自轮询和执行
+stale recovery，单个平台并发固定为 1，某个平台恢复不再等待其他平台批次结束。跨进程使用
 MySQL `GET_LOCK` advisory lease：同一个平台同一时刻只能被一个 Worker 操作，批次结束后
 还会保持配置的最小间隔。两个 Worker 必须连接同一个 MySQL 实例，该保护才会生效。
 
@@ -600,7 +605,9 @@ RPA_MONITOR_MAX_TASKS=1
 RPA_MONITOR_WEB_SEARCH_POLICY=REQUIRED
 
 RPA_WORKER_HEARTBEAT_MS=30000
-RPA_WORKER_STALE_AFTER_MS=900000
+RPA_WORKER_STALE_AFTER_MS=300000
+RPA_WORKER_WATCHDOG_STALL_MS=300000
+RPA_WORKER_PLATFORM_PROCESS_RESTART_MS=5000
 RPA_WORKER_RUN_ONCE=false
 RPA_WORKER_POLL_INTERVAL_MS=10000
 RPA_WORKER_POLL_JITTER_MS=1000
@@ -621,7 +628,7 @@ execution 仍保持处理态并持有 advisory lock，避免另一 Worker 立即
 基础上指数退避，最高 5 分钟，不会形成报错忙循环。
 
 运行指标默认每 15 秒原子更新到各 Worker 独立的
-`metrics/worker-metrics.json`。快照按 `workerType` 和固定四个平台组织，包含待处理、
+`metrics/<platform>/worker-metrics.json`。每个平台快照独立更新，包含待处理、
 处理中、成功、最终失败、Outbox 待回写、Worker 心跳、平均任务等待/回答耗时、零引用、
 平台暂停状态、验证码/登录/限流次数以及品牌批次完成或失败耗时。数据库状态聚合按同一
 间隔限频；聚合查询或快照写盘失败不会影响任务领取和执行。指标结构不会接收或输出
@@ -629,8 +636,8 @@ executionId、brandId、完整问题、回答、租户凭据或 URL，不能把�
 监控标签。可用以下命令检查快照：
 
 ```bash
-cat rpa-runtime/diagnosis/metrics/worker-metrics.json
-cat rpa-runtime/monitor/metrics/worker-metrics.json
+cat rpa-runtime/diagnosis/metrics/doubao/worker-metrics.json
+cat rpa-runtime/monitor/metrics/doubao/worker-metrics.json
 ```
 
 正式 Worker 会把数据库任务的 `deep_thinking` 原值传到单题页面执行层。每题发送前，
@@ -673,10 +680,10 @@ npm run rpa:diagnosis
 npm run rpa:monitor
 ```
 
-dry-run 和健康检查始终只运行一次。显式关闭 dry-run 后，diagnosis 与 monitor 默认进入
-常驻轮询服务；每轮依次执行 Outbox 重放、僵尸恢复、待办查询，并且每个平台只领取一个
-完整品牌批次。该批次结束后，下个轮询周期才能领取同平台下一个品牌批次。CDP 连接、页面、
-数据库仓储和平台健康状态在整个进程内复用，不会每轮重新连接 Chrome。
+dry-run 和健康检查始终只运行一次。显式关闭 dry-run 后，diagnosis 与 monitor 各自启动
+四个常驻平台子进程；每个平台独立执行 Outbox 重放、僵尸恢复和待办查询，并且每轮只领取
+一个完整品牌批次。该批次结束后，下个轮询周期才能领取同平台下一个品牌批次，但不等待
+其他平台。CDP 连接、页面、数据库仓储和平台健康状态在各平台子进程内跨轮询复用。
 
 首次灰度建议只启用一个平台，并明确关闭 dry-run：
 
@@ -716,6 +723,11 @@ BROWSER_DISCONNECTED）等错误在退避后通过条件 UPDATE 将 `fail_num` �
 `POST_SUBMIT_UNCERTAIN`，再按退避和最大次数保守重试。数据库错误仍只由 Result Outbox
 重放，不增加 `fail_num`；只有联网执行条件已满足的零引用才是正常成功。
 
+`DOM_CHANGED` 会按 `RPA_WORKER_PLATFORM_RECHECK_INTERVAL_MS` 周期只读复检，连续
+`RPA_WORKER_PLATFORM_READY_CONFIRMATIONS` 次 READY 后自动恢复；登录和验证码仍需人工处理。
+SQL、连接池取连接和 advisory lock 均有硬超时。任务级进展超过
+`RPA_WORKER_WATCHDOG_STALL_MS` 未更新时，Worker 会关闭会话并以非零状态退出，供进程守护器拉起。
+
 #### 4. 心跳、僵尸恢复和安全停止
 
 领取后的 execution 会持续更新 `modify_time`，同时持有以 executionId 命名的 MySQL
@@ -723,8 +735,8 @@ advisory lock。僵尸恢复必须同时满足：双状态仍为 1、没有 answ
 阈值，并且恢复进程能取得同一个 execution lock。仍在运行的其他 Worker 持有锁时只会被
 记录为“仍锁定”，不会被抢占。
 
-按一次 `Ctrl+C` 或发送 `SIGTERM` 会进入安全停止：唤醒空闲轮询、不再领取新批次，已开始
-的品牌批次继续完整结束，尚未执行的已领取任务恢复为 0，任务心跳和 advisory lock 随后
+按一次 `Ctrl+C`、发送 `SIGTERM` 或创建配置的 `stop.request` 文件会进入安全停止：唤醒空闲轮询、
+不再领取新批次，正在执行的题先安全结束，尚未提交的已领取任务恢复为 0，任务心跳和 advisory lock 随后
 停止并释放。第二次停止信号只记录警告，不会调用破坏性的强制退出。不要直接 `kill -9`；如果进程异常退出，等
 待 stale 阈值后重新启动同类型 Worker，它会在领取新任务前安全恢复无锁僵尸任务。
 
@@ -735,12 +747,12 @@ advisory lock。僵尸恢复必须同时满足：双状态仍为 1、没有 answ
 ```text
 rpa-runtime/diagnosis/logs/
 rpa-runtime/diagnosis/evidence/
-rpa-runtime/diagnosis/outbox/
-rpa-runtime/diagnosis/metrics/worker-metrics.json
+rpa-runtime/diagnosis/outbox/<platform>/
+rpa-runtime/diagnosis/metrics/<platform>/worker-metrics.json
 rpa-runtime/monitor/logs/
 rpa-runtime/monitor/evidence/
-rpa-runtime/monitor/outbox/
-rpa-runtime/monitor/metrics/worker-metrics.json
+rpa-runtime/monitor/outbox/<platform>/
+rpa-runtime/monitor/metrics/<platform>/worker-metrics.json
 ```
 
 普通 JSONL 日志只保存受限问题、错误码和证据路径；截图和页面诊断在 evidence 目录，不会

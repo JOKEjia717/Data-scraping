@@ -6,6 +6,7 @@ import {
   DefaultRpaWorkerCycleRunner,
   InterruptibleWaiter,
   RpaWorkerService,
+  WorkerStalledError,
   type RpaWorkerCycleRunner,
   type RpaWorkerWaiter
 } from "../src/rpaWorkerService.js";
@@ -56,12 +57,24 @@ class FakeWaiter implements RpaWorkerWaiter {
 class FakeRunner implements RpaWorkerCycleRunner {
   calls = 0;
   closeCalls = 0;
-  execute: (call: number, shouldStop: () => boolean) => Promise<RpaWorkerRunSummary> =
+  abortCalls = 0;
+  execute: (
+    call: number,
+    shouldStop: () => boolean,
+    onProgress?: (stage: string) => void
+  ) => Promise<RpaWorkerRunSummary> =
     async () => runSummary();
 
-  runOnce(shouldStop: () => boolean): Promise<RpaWorkerRunSummary> {
+  runOnce(
+    shouldStop: () => boolean,
+    onProgress?: (stage: string) => void
+  ): Promise<RpaWorkerRunSummary> {
     this.calls++;
-    return this.execute(this.calls, shouldStop);
+    return this.execute(this.calls, shouldStop, onProgress);
+  }
+
+  async abort(): Promise<void> {
+    this.abortCalls++;
   }
 
   async close(): Promise<void> {
@@ -232,6 +245,40 @@ test("单次运行模式下异常会被抛出且仍会关闭 CycleRunner", async
   await assert.rejects(() => service.run(), /boom/);
   assert.equal(runner.closeCalls, 1);
   assert.deepEqual(waiter.waits, []);
+});
+
+test("任务长期无进展时看门狗安全中止会话并以错误退出", async () => {
+  const runner = new FakeRunner();
+  runner.execute = async () => new Promise<RpaWorkerRunSummary>(() => undefined);
+  const service = new RpaWorkerService(config(), {
+    runner,
+    waiter: new FakeWaiter(),
+    watchdogStallMs: 20,
+    onError: () => undefined
+  });
+
+  await assert.rejects(
+    () => service.run(),
+    (error: unknown) => error instanceof WorkerStalledError && error.lastStage === "cycle-start"
+  );
+  assert.equal(runner.abortCalls, 1);
+  assert.equal(runner.closeCalls, 1);
+});
+
+test("排空文件存在时不领取新批次并正常关闭", async () => {
+  const runner = new FakeRunner();
+  const waiter = new FakeWaiter();
+  const service = new RpaWorkerService(config(), {
+    runner,
+    waiter,
+    externalStopRequested: () => true
+  });
+
+  const summary = await service.run();
+  assert.equal(runner.calls, 0);
+  assert.equal(runner.closeCalls, 1);
+  assert.equal(summary.stopped, true);
+  assert.equal(waiter.wakeCount, 1);
 });
 
 test("中断等待器对非法等待时长会立即报错", async () => {
