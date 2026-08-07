@@ -93,7 +93,7 @@ export function toCollectionTask(task: RpaTask): CollectionTask {
       task.tenantId,
       task.businessType,
       task.projectId,
-      platformId,
+      task.aiModelId,
       task.monitorDate
     ])
     : JSON.stringify([

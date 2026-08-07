@@ -5,7 +5,7 @@ import type { RpaBusinessType, RpaWorkerType } from "./rpaTask.js";
 
 export interface RpaTaskAuditEvent {
   timestamp: string;
-  event: "PENDING_QUERY" | "CLAIM_ATTEMPT";
+  event: "PENDING_QUERY" | "CLAIM_ATTEMPT" | "INVALID_EXECUTION_CONTEXT";
   workerType: RpaWorkerType;
   businessType: RpaBusinessType;
   candidateCount?: number;

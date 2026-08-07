@@ -94,7 +94,7 @@ import {
   serializeEntryMonitorConversationKey
 } from "./entryMonitor.js";
 import {
-  JsonEntryMonitorConversationRepository,
+  MysqlEntryMonitorConversationRepository,
   type EntryMonitorConversationRepository
 } from "./entryMonitorConversationRepository.js";
 
@@ -201,9 +201,7 @@ export function createRpaWorkerSession(config: RpaWorkerConfig): RpaWorkerSessio
     lockStateTrusted: true
   };
   if (config.workerType === "monitor" && config.entryMonitorEnabled) {
-    session.entryMonitorConversations = new JsonEntryMonitorConversationRepository(
-      config.entryMonitorConversationFile
-    );
+    session.entryMonitorConversations = new MysqlEntryMonitorConversationRepository();
   }
   sessionReference = session;
   metricsPublisher.start();
@@ -610,7 +608,7 @@ export async function runRpaWorkerOnce(
         rpaConsoleError({
           workerId: config.workerId,
           event: "ENTRY_MONITOR_CONVERSATION_EXPIRY_FAILED",
-          errorCode: "FILESYSTEM_ERROR",
+          errorCode: "DATABASE_ERROR",
           error
         });
       });
@@ -1211,6 +1209,7 @@ async function executeClaimedBatches(input: ExecuteClaimedInput): Promise<void> 
                 entryMonitorConversationKeyFor({
                   tenantId: task.tenantId!,
                   projectId: task.projectId!,
+                  aiModelId: task.aiModelId,
                   platformId: batch.platformId,
                   monitorDate: task.monitorDate!
                 })
@@ -1231,12 +1230,19 @@ async function executeClaimedBatches(input: ExecuteClaimedInput): Promise<void> 
           const key = entryMonitorConversationKeyFor({
             tenantId: task.tenantId,
             projectId: task.projectId,
+            aiModelId: task.aiModelId,
             platformId: batch.platformId,
             monitorDate: task.monitorDate
           });
           const record = await repository.find(key);
           if (record?.status === "ACTIVE") {
-            if (!isConversationUrlForPlatform(record.conversationUrl, batch.platformId)) {
+            const expiredByPolicy = record.questionCount >=
+                config.entryMonitorConversationMaxQuestions ||
+              Date.now() - Date.parse(record.createdAt) >=
+                config.entryMonitorConversationMaxDurationMs;
+            if (expiredByPolicy) {
+              await repository.markUnavailable(key, "conversation rotation limit reached");
+            } else if (!isConversationUrlForPlatform(record.conversationUrl, batch.platformId)) {
               await repository.markUnavailable(key, "conversation URL 不属于目标平台");
             } else {
               const restored = await page.goto(record.conversationUrl, {
@@ -1265,21 +1271,46 @@ async function executeClaimedBatches(input: ExecuteClaimedInput): Promise<void> 
                     "business"
                   ).catch(() => ({ status: "uncertain" as const, reason: "页面检查异常" }))
                   : { status: "absent" as const };
+                if (
+                  !executionOwnerMatches &&
+                  record.lastExecutionId === task.executionId
+                ) {
+                  throw Object.assign(
+                    new Error("ENTRY_MONITOR database owner matches execution but page owner is missing"),
+                    { errorCode: "AMBIGUOUS_RECOVERY" }
+                  );
+                }
                 manager.resumeVerifiedBatch(context);
                 await repository.touch(key, new Date());
-                if (
-                  inspection.status === "answered" &&
-                  storedOwner &&
-                  currentBaseline &&
-                  currentBaseline.baselineUserMessageCount >
-                    (storedOwner.baselineUserMessageCount ?? -1) &&
-                  currentBaseline.baselineAssistantMessageCount >
-                    (storedOwner.baselineAssistantMessageCount ?? -1)
-                ) {
+                const userMessageAdvanced = Boolean(storedOwner && currentBaseline) &&
+                  currentBaseline!.baselineUserMessageCount >
+                    (storedOwner!.baselineUserMessageCount ?? -1);
+                const assistantMessageAdvanced = Boolean(storedOwner && currentBaseline) &&
+                  currentBaseline!.baselineAssistantMessageCount >
+                    (storedOwner!.baselineAssistantMessageCount ?? -1);
+                const ownerSubmissionState = storedOwner?.submissionState ?? "PREPARED";
+                if (executionOwnerMatches && ownerSubmissionState === "PERSISTED") {
+                  throw Object.assign(
+                    new Error("ENTRY_MONITOR page owner is already PERSISTED; refusing to execute again"),
+                    { errorCode: "AMBIGUOUS_RECOVERY" }
+                  );
+                }
+                const answerBelongsToExecution = inspection.status === "answered" &&
+                  assistantMessageAdvanced &&
+                  (userMessageAdvanced || batch.platformId === "doubao");
+                const submittedExecutionNeedsRecovery = executionOwnerMatches && (
+                  ownerSubmissionState === "SUBMITTING" ||
+                  ownerSubmissionState === "SUBMITTED" ||
+                  ownerSubmissionState === "ANSWER_READY"
+                ) && (userMessageAdvanced || assistantMessageAdvanced);
+                if (answerBelongsToExecution || submittedExecutionNeedsRecovery) {
                   heartbeat.remove(task.executionId);
                   lifecycleStates.set(task.executionId, "ANSWER_VISIBLE");
                   resumedCurrentAnswerBatches.add(batch.id);
-                } else if (executionOwnerMatches && inspection.status !== "absent") {
+                } else if (
+                  executionOwnerMatches &&
+                  (ownerSubmissionState !== "PREPARED" || inspection.status !== "absent")
+                ) {
                   throw Object.assign(
                     new Error("ENTRY_MONITOR 页面属于当前 execution，但无法明确恢复提交结果。"),
                     { errorCode: "AMBIGUOUS_RECOVERY" }
@@ -1316,6 +1347,8 @@ async function executeClaimedBatches(input: ExecuteClaimedInput): Promise<void> 
             conversationKey: serializeEntryMonitorConversationKey(key),
             conversationUrl,
             status: "ACTIVE",
+            questionCount: 0,
+            ownerWorkerId: config.workerId,
             createdAt: now,
             lastUsedAt: now
           });
@@ -1432,6 +1465,7 @@ async function executeClaimedBatches(input: ExecuteClaimedInput): Promise<void> 
           const key = entryMonitorConversationKeyFor({
             tenantId: task.tenantId,
             projectId: task.projectId,
+            aiModelId: task.aiModelId,
             platformId: batch.platformId,
             monitorDate: task.monitorDate
           });
@@ -1538,6 +1572,7 @@ async function executeClaimedBatches(input: ExecuteClaimedInput): Promise<void> 
         const key = entryMonitorConversationKeyFor({
           tenantId: task.tenantId,
           projectId: task.projectId,
+          aiModelId: task.aiModelId,
           platformId: context.platformId,
           monitorDate: task.monitorDate
         });
@@ -1673,6 +1708,30 @@ async function executeClaimedBatches(input: ExecuteClaimedInput): Promise<void> 
         const persistenceError = persistence.error;
         const databasePersistenceError = persistence.status === "pending";
 
+        if (task.businessType === "ENTRY_MONITOR" && input.entryMonitorConversations) {
+          assertEntryMonitorCollectionContext(task);
+          const key = entryMonitorConversationKeyFor({
+            tenantId: task.tenantId,
+            projectId: task.projectId,
+            aiModelId: task.aiModelId,
+            platformId: context.platformId,
+            monitorDate: task.monitorDate
+          });
+          await input.entryMonitorConversations.incrementQuestionCount(key, {
+            executionId: task.executionId,
+            workerId: config.workerId
+          }, completedAt).catch((conversationError) => {
+            rpaConsoleError({
+              workerId: config.workerId,
+              event: "ENTRY_MONITOR_CONVERSATION_UPDATE_FAILED",
+              executionId: task.executionId,
+              platformId: context.platformId,
+              errorCode: "DATABASE_ERROR",
+              error: conversationError
+            });
+          });
+        }
+
         heartbeat.remove(task.executionId);
         owned.delete(task.executionId);
         input.onProgress(`task-persisted:${task.executionId}`);
@@ -1795,6 +1854,18 @@ async function executeClaimedBatches(input: ExecuteClaimedInput): Promise<void> 
           ...deepThinkingRuntimeForTask(task, config),
           ...taskWebSearchRuntime,
           allowUnverifiedZeroReferences,
+          ...(task.businessType === "ENTRY_MONITOR"
+            ? {
+              beforeSubmit: async () => {
+                assertEntryMonitorCollectionContext(task);
+                // This runs inside submitQuestion immediately before each actual click/Enter attempt.
+                assertEntryMonitorTaskEligibleToday(task);
+                submissionState = "uncertain";
+                queueEntryOwnerState("SUBMITTING");
+                await entryOwnerStateWrite;
+              }
+            }
+            : {}),
           onDeepThinkingStateResolved(_requested, actual) {
             actualDeepThinking = actual;
           },
@@ -1973,11 +2044,15 @@ async function executeClaimedBatches(input: ExecuteClaimedInput): Promise<void> 
         // 任务级重试闭环：先从心跳集合移除，退避期间继续持有 execution lock；
         // 条件 UPDATE 成功改变状态后再释放 lock，避免其他 Worker 同时重试。
         heartbeat.remove(task.executionId);
-        const backoffMs = taskRetryDelayMs(
-          config.retryBackoffMs,
-          task.failCount,
-          config.retryJitterMs
-        );
+        const terminalEntryMonitorFailure = task.businessType === "ENTRY_MONITOR" &&
+          (errorCode === "DATE_WINDOW_EXPIRED" || errorCode === "INVALID_EXECUTION_CONTEXT");
+        const backoffMs = terminalEntryMonitorFailure
+          ? 0
+          : taskRetryDelayMs(
+            config.retryBackoffMs,
+            task.failCount,
+            config.retryJitterMs
+          );
         // migration 开启后立即释放平台执行权，由 next_retry_at 阻止提前领取；
         // 兼容旧表时保留原睡眠语义，避免旧 RPA 立即抢回失败任务。
         if (!config.databaseRetryScheduleEnabled && backoffMs > 0) await delay(backoffMs);
@@ -1986,9 +2061,9 @@ async function executeClaimedBatches(input: ExecuteClaimedInput): Promise<void> 
           retryOutcome = await input.resultRepository.retryExecution({
             executionId: task.executionId,
             failCount: task.failCount,
-            maxAttempts: config.maxAttempts,
+            maxAttempts: terminalEntryMonitorFailure ? task.failCount + 1 : config.maxAttempts,
             errorCode,
-            ...(config.databaseRetryScheduleEnabled
+            ...(config.databaseRetryScheduleEnabled && !terminalEntryMonitorFailure
               ? { nextRetryAt: new Date(Date.now() + backoffMs) }
               : {})
           });
@@ -2511,16 +2586,32 @@ async function readEntryMonitorDomBaseline(
   baselineUserMessageCount: number;
   baselineAssistantMessageCount: number;
 }> {
-  const selectors: Record<PlatformId, string> = {
-    doubao: "[data-message-id], [data-testid*='message']",
-    deepseek: ".ds-message, .ds-markdown.ds-assistant-message-main-content",
-    qianwen: "[data-message-id], [data-chat-answers-wrap]",
-    yuanbao: "[data-conv-speaker], .agent-chat__speech-card__text"
+  const selectors: Record<PlatformId, { user: string; assistant: string }> = {
+    doubao: {
+      user: "[data-message-id].justify-end, [data-message-id][data-message-role='user']",
+      assistant: "[data-message-id]:not(.justify-end):not([data-message-role='user'])"
+    },
+    deepseek: {
+      user: "[data-virtual-list-item-key] > .ds-message:not(:has(.ds-assistant-message-main-content))",
+      assistant: "[data-virtual-list-item-key]:has(.ds-assistant-message-main-content)"
+    },
+    qianwen: {
+      user: "[data-chat-question-wrap]",
+      assistant: "[data-chat-answers-wrap]"
+    },
+    yuanbao: {
+      user: "[data-conv-speaker='human']",
+      assistant: "[data-conv-speaker='ai']"
+    }
   };
-  const count = await page.locator(selectors[platformId]).count().catch(() => 0);
+  const selected = selectors[platformId];
+  const [userMessageCount, assistantMessageCount] = await Promise.all([
+    page.locator(selected.user).count().catch(() => 0),
+    page.locator(selected.assistant).count().catch(() => 0)
+  ]);
   return {
-    baselineUserMessageCount: count,
-    baselineAssistantMessageCount: count
+    baselineUserMessageCount: userMessageCount,
+    baselineAssistantMessageCount: assistantMessageCount
   };
 }
 
@@ -2595,6 +2686,7 @@ function structuredTaskLogContext(
   const key = entryMonitorConversationKeyFor({
     tenantId: task.tenantId,
     projectId: task.projectId,
+    aiModelId: task.aiModelId,
     platformId,
     monitorDate: task.monitorDate
   });

@@ -1,0 +1,617 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="light">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>运营台 · 界面设计方案</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=IBM+Plex+Sans:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+<style>
+/* ============================================================
+   设计令牌 Design Tokens — 精密工业风 / Precision Industrial
+   中性调偏冷（墨蓝底），单一沉静 azure 主色，语义色克制
+   ============================================================ */
+:root {
+  color-scheme: light;
+
+  /* —— 中性色阶（偏冷墨蓝） —— */
+  --ink-50:  oklch(0.985 0.003 255);
+  --ink-100: oklch(0.965 0.006 255);
+  --ink-150: oklch(0.945 0.008 255);
+  --ink-200: oklch(0.905 0.010 255);
+  --ink-300: oklch(0.845 0.012 255);
+  --ink-400: oklch(0.700 0.018 260);
+  --ink-500: oklch(0.560 0.022 262);
+  --ink-600: oklch(0.440 0.024 262);
+  --ink-700: oklch(0.340 0.022 262);
+  --ink-800: oklch(0.265 0.018 262);
+  --ink-900: oklch(0.205 0.014 262);
+
+  /* —— 主色 azure —— */
+  --azure:        oklch(0.58 0.150 252);
+  --azure-strong: oklch(0.52 0.165 252);
+  --azure-soft:   oklch(0.955 0.030 252);
+  --azure-line:   oklch(0.88 0.055 252);
+
+  /* —— 语义状态色 —— */
+  --run:    oklch(0.60 0.130 240);  /* 运行中 */
+  --run-s:  oklch(0.95 0.040 240);
+  --wait:   oklch(0.74 0.135 72);    /* 待运行 */
+  --wait-s: oklch(0.96 0.055 72);
+  --done:   oklch(0.66 0.140 152);   /* 已完成 */
+  --done-s: oklch(0.95 0.045 152);
+  --fail:   oklch(0.60 0.200 22);    /* 失败 */
+  --fail-s: oklch(0.95 0.045 22);
+
+  /* —— 语义映射 —— */
+  --bg:        var(--ink-50);
+  --surface:   #ffffff;
+  --surface-2: var(--ink-100);
+  --surface-3: var(--ink-150);
+  --border:    var(--ink-200);
+  --border-2:  var(--ink-300);
+  --text:      var(--ink-800);
+  --text-2:    var(--ink-500);
+  --text-3:    var(--ink-400);
+  --accent:    var(--azure);
+  --accent-ink:var(--azure-strong);
+  --accent-soft:var(--azure-soft);
+
+  --radius-s: 8px;
+  --radius:   12px;
+  --radius-l: 18px;
+  --shadow-1: 0 1px 2px oklch(0.2 0.02 262 / 0.06), 0 1px 3px oklch(0.2 0.02 262 / 0.05);
+  --shadow-2: 0 4px 12px oklch(0.2 0.02 262 / 0.08), 0 2px 4px oklch(0.2 0.02 262 / 0.05);
+  --shadow-3: 0 12px 32px oklch(0.2 0.02 262 / 0.12);
+
+  --font-display: "Space Grotesk", "IBM Plex Sans", system-ui, sans-serif;
+  --font-body: "IBM Plex Sans", system-ui, -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, "SF Mono", monospace;
+
+  /* 间距韵律：4pt 基数，但刻意变化制造节奏 */
+  --s-1: 4px;  --s-2: 8px;  --s-3: 12px; --s-4: 16px;
+  --s-5: 20px; --s-6: 24px; --s-7: 32px; --s-8: 44px; --s-9: 60px;
+
+  --sidebar-w: 248px;
+  --topbar-h: 64px;
+  --ease: cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+[data-theme="dark"] {
+  color-scheme: dark;
+  --bg:        oklch(0.175 0.012 262);
+  --surface:   oklch(0.215 0.014 262);
+  --surface-2: oklch(0.255 0.015 262);
+  --surface-3: oklch(0.295 0.016 262);
+  --border:    oklch(0.33 0.014 262);
+  --border-2:  oklch(0.40 0.014 262);
+  --text:      oklch(0.94 0.006 262);
+  --text-2:    oklch(0.72 0.012 262);
+  --text-3:    oklch(0.55 0.012 262);
+  --accent:    oklch(0.72 0.140 252);
+  --accent-ink:oklch(0.78 0.130 252);
+  --accent-soft: oklch(0.30 0.050 252);
+  --shadow-1: 0 1px 2px oklch(0 0 0 / 0.3);
+  --shadow-2: 0 4px 14px oklch(0 0 0 / 0.4);
+  --shadow-3: 0 16px 40px oklch(0 0 0 / 0.5);
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html { -webkit-text-size-adjust: 100%; }
+body {
+  font-family: var(--font-body);
+  background: var(--bg);
+  color: var(--text);
+  line-height: 1.55;
+  -webkit-font-smoothing: antialiased;
+  transition: background .4s var(--ease), color .4s var(--ease);
+}
+.mono { font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
+a { color: var(--accent); text-decoration: none; }
+
+/* ============================================================
+   页面框架
+   ============================================================ */
+.page { max-width: 1180px; margin: 0 auto; padding: var(--s-8) var(--s-6) var(--s-9); }
+.kicker {
+  font-family: var(--font-mono); font-size: 12px; letter-spacing: .14em;
+  text-transform: uppercase; color: var(--accent); margin-bottom: var(--s-3);
+}
+h1.title {
+  font-family: var(--font-display); font-weight: 700;
+  font-size: clamp(28px, 4vw, 44px); letter-spacing: -0.02em; line-height: 1.1;
+  margin-bottom: var(--s-4);
+}
+.lead { color: var(--text-2); font-size: 16px; max-width: 64ch; margin-bottom: var(--s-7); }
+.section-tag {
+  display: inline-flex; align-items: center; gap: 8px;
+  font-family: var(--font-mono); font-size: 12px; letter-spacing: .12em;
+  text-transform: uppercase; color: var(--text-3);
+  padding: 6px 12px; border: 1px solid var(--border); border-radius: 999px;
+  margin: var(--s-9) 0 var(--s-5);
+}
+.section-tag::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: var(--accent); }
+
+/* ============================================================
+   应用外壳 Mock（运营台）
+   ============================================================ */
+.shell {
+  border: 1px solid var(--border); border-radius: var(--radius-l);
+  background: var(--surface); box-shadow: var(--shadow-3); overflow: hidden;
+  display: grid; grid-template-columns: var(--sidebar-w) 1fr;
+  min-height: 620px;
+}
+.sidebar {
+  background: var(--surface-2); border-right: 1px solid var(--border);
+  padding: var(--s-5) var(--s-3); display: flex; flex-direction: column; gap: var(--s-2);
+}
+.brand { display: flex; align-items: center; gap: 10px; padding: 4px 8px var(--s-5); }
+.brand-mark {
+  width: 30px; height: 30px; border-radius: 9px; flex-shrink: 0;
+  background: linear-gradient(140deg, var(--accent), var(--accent-ink));
+  display: grid; place-items: center; color: #fff; font-family: var(--font-display); font-weight: 700; font-size: 15px;
+  box-shadow: var(--shadow-2);
+}
+.brand-name { font-family: var(--font-display); font-weight: 600; font-size: 15px; letter-spacing: -.01em; }
+.brand-sub { font-size: 11px; color: var(--text-3); font-family: var(--font-mono); }
+.nav-label { font-size: 11px; color: var(--text-3); padding: 14px 12px 6px; font-family: var(--font-mono); letter-spacing: .1em; text-transform: uppercase; }
+.nav-item {
+  display: flex; align-items: center; gap: 11px; padding: 9px 12px; border-radius: var(--radius-s);
+  color: var(--text-2); font-size: 14px; font-weight: 500; cursor: pointer;
+  transition: background .18s var(--ease), color .18s var(--ease);
+}
+.nav-item svg { width: 18px; height: 18px; flex-shrink: 0; opacity: .8; }
+.nav-item:hover { background: var(--surface-3); color: var(--text); }
+.nav-item.active { background: var(--accent-soft); color: var(--accent-ink); font-weight: 600; }
+.nav-item.active svg { opacity: 1; }
+.nav-count { margin-left: auto; font-family: var(--font-mono); font-size: 11px; color: var(--text-3); background: var(--surface); border: 1px solid var(--border); padding: 1px 7px; border-radius: 999px; }
+.nav-item.active .nav-count { color: var(--accent-ink); border-color: transparent; background: var(--surface); }
+
+.main { display: flex; flex-direction: column; min-width: 0; }
+.topbar {
+  height: var(--topbar-h); border-bottom: 1px solid var(--border);
+  display: flex; align-items: center; gap: var(--s-4); padding: 0 var(--s-6);
+  background: color-mix(in oklch, var(--surface) 80%, transparent);
+  backdrop-filter: blur(8px);
+}
+.topbar h2 { font-family: var(--font-display); font-size: 18px; font-weight: 600; letter-spacing: -.01em; }
+.search {
+  margin-left: auto; display: flex; align-items: center; gap: 8px;
+  background: var(--surface-2); border: 1px solid var(--border); border-radius: 999px;
+  padding: 7px 14px; color: var(--text-3); font-size: 13px; min-width: 200px;
+}
+.search input { border: none; background: transparent; outline: none; color: var(--text); font-family: var(--font-body); font-size: 13px; width: 100%; }
+.icon-btn {
+  width: 38px; height: 38px; border-radius: 10px; border: 1px solid var(--border);
+  background: var(--surface); display: grid; place-items: center; cursor: pointer; color: var(--text-2);
+  transition: background .18s var(--ease), color .18s var(--ease), border-color .18s; position: relative;
+}
+.icon-btn:hover { background: var(--surface-2); color: var(--text); }
+.icon-btn svg { width: 18px; height: 18px; }
+.badge-dot { position: absolute; top: 8px; right: 9px; width: 8px; height: 8px; border-radius: 50%; background: var(--fail); border: 2px solid var(--surface); }
+
+.content { padding: var(--s-6); display: flex; flex-direction: column; gap: var(--s-6); overflow: auto; }
+
+/* KPI 行 */
+.kpi-row { display: grid; grid-template-columns: repeat(4, 1fr); gap: var(--s-4); }
+.kpi {
+  background: var(--surface-2); border: 1px solid var(--border); border-radius: var(--radius);
+  padding: var(--s-4) var(--s-5); display: flex; flex-direction: column; gap: 6px; position: relative; overflow: hidden;
+}
+.kpi::after { content: ""; position: absolute; left: 0; top: 0; bottom: 0; width: 3px; background: var(--accent); opacity: .0; transition: opacity .2s; }
+.kpi:hover::after { opacity: .9; }
+.kpi-label { font-size: 12.5px; color: var(--text-2); display: flex; align-items: center; gap: 7px; }
+.kpi-label .dot { width: 8px; height: 8px; border-radius: 50%; }
+.kpi-val { font-family: var(--font-display); font-weight: 700; font-size: 30px; letter-spacing: -.02em; line-height: 1; }
+.kpi-val .unit { font-size: 14px; color: var(--text-3); font-weight: 500; margin-left: 3px; }
+.kpi-trend { font-size: 12px; font-family: var(--font-mono); color: var(--text-3); }
+
+/* Tabs */
+.tabs { display: flex; gap: 6px; background: var(--surface-2); border: 1px solid var(--border); border-radius: 999px; padding: 4px; width: fit-content; }
+.tab {
+  display: inline-flex; align-items: center; gap: 7px; padding: 7px 15px; border-radius: 999px;
+  font-size: 13.5px; font-weight: 500; color: var(--text-2); cursor: pointer; border: none; background: transparent;
+  transition: all .2s var(--ease); font-family: var(--font-body);
+}
+.tab .pdot { width: 7px; height: 7px; border-radius: 50%; }
+.tab .tc { font-family: var(--font-mono); font-size: 11px; background: var(--surface); border: 1px solid var(--border); padding: 0 6px; border-radius: 999px; color: var(--text-3); }
+.tab.active { background: var(--surface); color: var(--text); box-shadow: var(--shadow-1); font-weight: 600; }
+.tab.active .tc { color: var(--text); border-color: transparent; }
+
+/* 分组列表 平台→品牌→问题 */
+.group { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; box-shadow: var(--shadow-1); }
+.group-head { display: flex; align-items: center; gap: 10px; padding: var(--s-4) var(--s-5); background: var(--surface-2); border-bottom: 1px solid var(--border); }
+.pf-dot { width: 10px; height: 10px; border-radius: 3px; }
+.group-title { font-family: var(--font-display); font-weight: 600; font-size: 15px; }
+.group-count { margin-left: auto; font-family: var(--font-mono); font-size: 12px; color: var(--text-3); }
+.brand-row { border-top: 1px solid var(--border); }
+.brand-row:first-of-type { border-top: none; }
+.brand-head {
+  display: flex; align-items: center; gap: 9px; padding: 11px var(--s-5); cursor: pointer;
+  user-select: none; transition: background .15s; border-radius: 6px; margin: 2px 6px 0;
+}
+.brand-head:hover { background: var(--surface-2); }
+.arrow { width: 16px; height: 16px; display: inline-grid; place-items: center; font-size: 10px; color: var(--text-3); transition: transform .22s var(--ease); flex-shrink: 0; }
+.arrow.open { transform: rotate(90deg); }
+.brand-name { font-weight: 600; font-size: 13.5px; color: var(--accent-ink); }
+.brand-count { font-size: 12px; color: var(--text-3); font-family: var(--font-mono); }
+.brand-items { display: grid; grid-template-rows: 0fr; transition: grid-template-rows .3s var(--ease); }
+.brand-items.open { grid-template-rows: 1fr; }
+.brand-items > div { overflow: hidden; }
+.items-inner { padding: 4px var(--s-5) var(--s-4); display: flex; flex-direction: column; gap: 8px; }
+.task {
+  display: flex; align-items: center; gap: 12px; padding: 10px 12px; background: var(--surface-2);
+  border: 1px solid var(--border); border-radius: var(--radius-s); transition: border-color .15s, transform .15s var(--ease);
+}
+.task:hover { border-color: var(--border-2); transform: translateX(2px); }
+.task-kw { font-size: 13px; color: var(--text); flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pill {
+  font-size: 11.5px; font-weight: 500; padding: 3px 9px; border-radius: 999px; font-family: var(--font-mono);
+  display: inline-flex; align-items: center; gap: 5px; white-space: nowrap;
+}
+.pill .d { width: 6px; height: 6px; border-radius: 50%; }
+.p-running { color: var(--run); background: var(--run-s); }
+.p-wait { color: var(--wait); background: var(--wait-s); }
+.p-done { color: var(--done); background: var(--done-s); }
+.p-fail { color: var(--fail); background: var(--fail-s); }
+.task-id { font-family: var(--font-mono); font-size: 11px; color: var(--text-3); }
+
+/* 数据表 */
+.table-wrap { border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; background: var(--surface); box-shadow: var(--shadow-1); }
+table { width: 100%; border-collapse: collapse; font-size: 13px; }
+thead th { text-align: left; padding: 11px var(--s-5); background: var(--surface-2); color: var(--text-2); font-weight: 600; font-size: 12px; border-bottom: 1px solid var(--border); }
+tbody td { padding: 12px var(--s-5); border-bottom: 1px solid var(--border); color: var(--text); }
+tbody tr:last-child td { border-bottom: none; }
+tbody tr { transition: background .14s; }
+tbody tr:hover { background: var(--surface-2); }
+td .mono { color: var(--text-2); }
+
+/* 空状态 */
+.empty {
+  border: 1.5px dashed var(--border-2); border-radius: var(--radius); padding: var(--s-8) var(--s-6);
+  text-align: center; color: var(--text-3); display: flex; flex-direction: column; align-items: center; gap: 10px;
+}
+.empty svg { width: 40px; height: 40px; color: var(--border-2); }
+.empty b { color: var(--text-2); font-weight: 600; }
+
+/* ============================================================
+   设计系统展示区
+   ============================================================ */
+.tokens { display: grid; gap: var(--s-6); }
+.panel { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-l); padding: var(--s-6); box-shadow: var(--shadow-1); }
+.panel h3 { font-family: var(--font-display); font-size: 17px; font-weight: 600; margin-bottom: var(--s-5); letter-spacing: -.01em; }
+
+/* 色板 */
+.swatches { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: var(--s-4); }
+.swatch { border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; background: var(--surface-2); }
+.swatch .chip { height: 64px; }
+.swatch .meta { padding: var(--s-3) var(--s-4); }
+.swatch .name { font-weight: 600; font-size: 13px; }
+.swatch .val { font-family: var(--font-mono); font-size: 11px; color: var(--text-3); }
+
+/* 字体 */
+.type-row { display: flex; flex-direction: column; gap: var(--s-4); }
+.type-item { display: grid; grid-template-columns: 120px 1fr; gap: var(--s-5); align-items: baseline; padding-bottom: var(--s-4); border-bottom: 1px solid var(--border); }
+.type-item:last-child { border-bottom: none; }
+.type-tag { font-family: var(--font-mono); font-size: 11px; color: var(--text-3); }
+.type-sample { font-family: var(--font-display); }
+.type-sample.body { font-family: var(--font-body); }
+
+/* 间距 */
+.space-row { display: flex; align-items: flex-end; gap: var(--s-4); flex-wrap: wrap; }
+.space-box { background: var(--accent-soft); border: 1px solid var(--accent-line); border-radius: 4px; }
+
+/* 组件预览 */
+.comp-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: var(--s-5); align-items: start; }
+.btn {
+  display: inline-flex; align-items: center; gap: 8px; font-family: var(--font-body); font-weight: 500;
+  font-size: 14px; padding: 10px 18px; border-radius: var(--radius-s); cursor: pointer; border: 1px solid transparent;
+  transition: transform .15s var(--ease), background .15s, box-shadow .15s;
+}
+.btn:active { transform: translateY(1px); }
+.btn-primary { background: var(--accent); color: #fff; box-shadow: var(--shadow-2); }
+.btn-primary:hover { background: var(--accent-ink); }
+.btn-ghost { background: var(--surface); border-color: var(--border-2); color: var(--text); }
+.btn-ghost:hover { background: var(--surface-2); }
+.btn-danger { background: var(--fail-s); color: var(--fail); }
+.input {
+  width: 100%; padding: 10px 14px; border: 1px solid var(--border-2); border-radius: var(--radius-s);
+  font-family: var(--font-body); font-size: 14px; background: var(--surface); color: var(--text); outline: none;
+  transition: border-color .15s, box-shadow .15s;
+}
+.input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+.comp-stack { display: flex; flex-direction: column; gap: var(--s-3); }
+.comp-label { font-size: 11px; color: var(--text-3); font-family: var(--font-mono); text-transform: uppercase; letter-spacing: .08em; margin-bottom: 2px; }
+
+footer.foot { margin-top: var(--s-9); padding-top: var(--s-6); border-top: 1px solid var(--border); color: var(--text-3); font-size: 13px; display: flex; justify-content: space-between; flex-wrap: wrap; gap: var(--s-3); }
+
+/* 响应式 */
+@media (max-width: 920px) {
+  .kpi-row { grid-template-columns: repeat(2, 1fr); }
+}
+@media (max-width: 760px) {
+  .shell { grid-template-columns: 1fr; }
+  .sidebar { display: none; }
+  .page { padding: var(--s-6) var(--s-4) var(--s-8); }
+  .kpi-row { grid-template-columns: 1fr 1fr; }
+  .type-item { grid-template-columns: 1fr; gap: 4px; }
+  .search { display: none; }
+}
+</style>
+</head>
+<body>
+<div class="page">
+
+  <div class="kicker">UI DESIGN PROPOSAL · 2026</div>
+  <h1 class="title">运营台 · 界面设计方案</h1>
+  <p class="lead">一套面向运营 / 数据分析同学的数据监控工作台。采用「精密工业风」：冷调墨色中性 + 单一沉静主色，语义状态克制清晰，信息层级分明。默认浅色，内置深色模式供监控大屏使用。下方为可交互草稿与设计系统规范。</p>
+
+  <div class="section-tag">01 — 界面草稿（可交互）</div>
+
+  <!-- ============ 应用外壳 ============ -->
+  <div class="shell">
+    <!-- 侧边栏 -->
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="brand-mark">运</div>
+        <div>
+          <div class="brand-name">运营台</div>
+          <div class="brand-sub">OPS CONSOLE</div>
+        </div>
+      </div>
+      <div class="nav-label">监控</div>
+      <div class="nav-item">
+        <svg viewBox="0 0 24 24" fill="none"><rect x="3" y="3" width="7" height="9" rx="1.5" stroke="currentColor" stroke-width="1.7"/><rect x="14" y="3" width="7" height="5" rx="1.5" stroke="currentColor" stroke-width="1.7"/><rect x="14" y="12" width="7" height="9" rx="1.5" stroke="currentColor" stroke-width="1.7"/><rect x="3" y="16" width="7" height="5" rx="1.5" stroke="currentColor" stroke-width="1.7"/></svg>
+        运行总览 <span class="nav-count">1,060</span>
+      </div>
+      <div class="nav-item active">
+        <svg viewBox="0 0 24 24" fill="none"><circle cx="11" cy="11" r="7" stroke="currentColor" stroke-width="1.7"/><path d="m20 20-3.5-3.5" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>
+        品牌诊断 <span class="nav-count">896</span>
+      </div>
+      <div class="nav-item">
+        <svg viewBox="0 0 24 24" fill="none"><path d="M3 12h4l2.5 6 4-13L16 12h5" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        数据监测 <span class="nav-count">142</span>
+      </div>
+      <div class="nav-item">
+        <svg viewBox="0 0 24 24" fill="none"><path d="M12 3a9 9 0 1 0 0 18c1.2 0 2-.9 2-2 0-.5-.2-.9-.5-1.2-.3-.3-.5-.7-.5-1.3 0-1 .8-1.8 1.8-1.8H16a5 5 0 0 0 5-5c0-3.9-4-6.7-9-6.7Z" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/></svg>
+        风格监测 <span class="nav-count">22</span>
+      </div>
+      <div class="nav-label">分析</div>
+      <div class="nav-item">
+        <svg viewBox="0 0 24 24" fill="none"><path d="M9 3h6M10 3v6l-4.5 8a2 2 0 0 0 1.8 3h9.4a2 2 0 0 0 1.8-3L14 9V3" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/><path d="M7.5 15h9" stroke="currentColor" stroke-width="1.6"/></svg>
+        研究爬取
+      </div>
+    </aside>
+
+    <!-- 主区 -->
+    <div class="main">
+      <div class="topbar">
+        <h2>品牌诊断</h2>
+        <div class="search">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none"><circle cx="11" cy="11" r="7" stroke="currentColor" stroke-width="1.8"/><path d="m20 20-3.5-3.5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
+          <input placeholder="搜索品牌 / 任务 ID…" />
+        </div>
+        <button class="icon-btn" id="themeBtn" title="切换深浅色">
+          <svg id="themeIcon" viewBox="0 0 24 24" fill="none"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8Z" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/></svg>
+        </button>
+        <button class="icon-btn" title="通知">
+          <svg viewBox="0 0 24 24" fill="none"><path d="M18 8A6 6 0 1 0 6 8c0 7-3 9-3 9h18s-3-2-3-9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/><path d="M13.7 21a2 2 0 0 1-3.4 0" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>
+          <span class="badge-dot"></span>
+        </button>
+      </div>
+
+      <div class="content">
+        <!-- KPI -->
+        <div class="kpi-row">
+          <div class="kpi">
+            <div class="kpi-label"><span class="dot" style="background:var(--ink-400)"></span>任务总数</div>
+            <div class="kpi-val">1,060</div>
+            <div class="kpi-trend">本周 +128</div>
+          </div>
+          <div class="kpi">
+            <div class="kpi-label"><span class="dot" style="background:var(--run)"></span>运行中</div>
+            <div class="kpi-val">12</div>
+            <div class="kpi-trend" style="color:var(--run)">↑ 稳定</div>
+          </div>
+          <div class="kpi">
+            <div class="kpi-label"><span class="dot" style="background:var(--done)"></span>已完成</div>
+            <div class="kpi-val">1,028</div>
+            <div class="kpi-trend">96.9%</div>
+          </div>
+          <div class="kpi">
+            <div class="kpi-label"><span class="dot" style="background:var(--fail)"></span>失败</div>
+            <div class="kpi-val">20</div>
+            <div class="kpi-trend" style="color:var(--fail)">需关注</div>
+          </div>
+        </div>
+
+        <!-- Tabs -->
+        <div class="tabs">
+          <button class="tab"><span class="pdot" style="background:var(--run)"></span>正在运行<span class="tc">12</span></button>
+          <button class="tab"><span class="pdot" style="background:var(--wait)"></span>待运行<span class="tc">0</span></button>
+          <button class="tab active"><span class="pdot" style="background:var(--done)"></span>已运行<span class="tc">1,028</span></button>
+          <button class="tab"><span class="pdot" style="background:var(--fail)"></span>失败<span class="tc">20</span></button>
+        </div>
+
+        <!-- 分组：平台 → 品牌 → 问题 -->
+        <div class="group">
+          <div class="group-head">
+            <span class="pf-dot" style="background:var(--azure)"></span>
+            <span class="group-title">豆包</span>
+            <span class="group-count">312 条</span>
+          </div>
+
+          <div class="brand-row">
+            <div class="brand-head" onclick="toggle(this)">
+              <span class="arrow">▸</span>
+              <span class="brand-name">阿里巴巴</span>
+              <span class="brand-count">28 个问题</span>
+            </div>
+            <div class="brand-items"><div><div class="items-inner">
+              <div class="task"><span class="task-kw">阿里云对象存储OSS 在云存储服务中的竞品分析</span><span class="pill p-done"><span class="d"></span>已完成</span><span class="task-id">#2068</span></div>
+              <div class="task"><span class="task-kw">淘宝直播带货转化率诊断</span><span class="pill p-done"><span class="d"></span>已完成</span><span class="task-id">#2071</span></div>
+              <div class="task"><span class="task-kw">优酷会员续费意愿调研</span><span class="pill p-running"><span class="d"></span>运行中</span><span class="task-id">#3390</span></div>
+            </div></div></div>
+          </div>
+
+          <div class="brand-row">
+            <div class="brand-head" onclick="toggle(this)">
+              <span class="arrow">▸</span>
+              <span class="brand-name">海底捞</span>
+              <span class="brand-count">19 个问题</span>
+            </div>
+            <div class="brand-items"><div><div class="items-inner">
+              <div class="task"><span class="task-kw">火锅品类品牌定位与口碑诊断</span><span class="pill p-done"><span class="d"></span>已完成</span><span class="task-id">#2088</span></div>
+              <div class="task"><span class="task-kw">服务体验舆情监测</span><span class="pill p-fail"><span class="d"></span>失败</span><span class="task-id">#2090</span></div>
+            </div></div></div>
+          </div>
+        </div>
+
+        <div class="group">
+          <div class="group-head">
+            <span class="pf-dot" style="background:var(--done)"></span>
+            <span class="group-title">DeepSeek</span>
+            <span class="group-count">268 条</span>
+          </div>
+          <div class="brand-row">
+            <div class="brand-head" onclick="toggle(this)">
+              <span class="arrow">▸</span>
+              <span class="brand-name">蔚来</span>
+              <span class="brand-count">15 个问题</span>
+            </div>
+            <div class="brand-items"><div><div class="items-inner">
+              <div class="task"><span class="task-kw">ET5 车型市场表现诊断</span><span class="pill p-done"><span class="d"></span>已完成</span><span class="task-id">#2112</span></div>
+              <div class="task"><span class="task-kw">充电桩网络覆盖分析</span><span class="pill p-wait"><span class="d"></span>待运行</span><span class="task-id">#3410</span></div>
+            </div></div></div>
+          </div>
+        </div>
+
+        <!-- 数据表 -->
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>任务 ID</th><th>品牌 / 问题</th><th>平台</th><th>状态</th><th>耗时</th></tr></thead>
+            <tbody>
+              <tr><td class="mono">#2068</td><td>阿里云对象存储OSS 竞品分析</td><td>豆包</td><td><span class="pill p-done"><span class="d"></span>已完成</span></td><td class="mono">18m</td></tr>
+              <tr><td class="mono">#3390</td><td>淘宝直播带货转化率诊断</td><td>豆包</td><td><span class="pill p-running"><span class="d"></span>运行中</span></td><td class="mono">04m</td></tr>
+              <tr><td class="mono">#2090</td><td>海底捞服务体验舆情监测</td><td>豆包</td><td><span class="pill p-fail"><span class="d"></span>失败</span></td><td class="mono">—</td></tr>
+              <tr><td class="mono">#2112</td><td>蔚来 ET5 市场表现诊断</td><td>DeepSeek</td><td><span class="pill p-done"><span class="d"></span>已完成</span></td><td class="mono">22m</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <!-- 空状态示例 -->
+        <div class="empty">
+          <svg viewBox="0 0 24 24" fill="none"><rect x="3" y="4" width="18" height="16" rx="2" stroke="currentColor" stroke-width="1.6"/><path d="M3 9h18M8 14h8" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
+          <div><b>待运行队列为空</b></div>
+          <div>当前没有排队等待的任务，新增任务后将在此显示。</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ============ 设计系统 ============ -->
+  <div class="section-tag">02 — 设计系统规范</div>
+  <div class="tokens">
+
+    <div class="panel">
+      <h3>色彩令牌 Color Tokens</h3>
+      <div class="swatches">
+        <div class="swatch"><div class="chip" style="background:var(--azure)"></div><div class="meta"><div class="name">Primary / Azure</div><div class="val">oklch(.58 .15 252)</div></div></div>
+        <div class="swatch"><div class="chip" style="background:var(--run)"></div><div class="meta"><div class="name">运行中 Run</div><div class="val">oklch(.60 .13 240)</div></div></div>
+        <div class="swatch"><div class="chip" style="background:var(--wait)"></div><div class="meta"><div class="name">待运行 Wait</div><div class="val">oklch(.74 .13 72)</div></div></div>
+        <div class="swatch"><div class="chip" style="background:var(--done)"></div><div class="meta"><div class="name">已完成 Done</div><div class="val">oklch(.66 .14 152)</div></div></div>
+        <div class="swatch"><div class="chip" style="background:var(--fail)"></div><div class="meta"><div class="name">失败 Fail</div><div class="val">oklch(.60 .20 22)</div></div></div>
+        <div class="swatch"><div class="chip" style="background:var(--ink-800)"></div><div class="meta"><div class="name">墨色 Ink-800</div><div class="val">oklch(.26 .02 262)</div></div></div>
+        <div class="swatch"><div class="chip" style="background:var(--ink-200)"></div><div class="meta"><div class="name">描边 Border</div><div class="val">oklch(.90 .01 255)</div></div></div>
+        <div class="swatch"><div class="chip" style="background:var(--surface)"></div><div class="meta"><div class="name">表面 Surface</div><div class="val">#ffffff</div></div></div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h3>字体排印 Typography</h3>
+      <div class="type-row">
+        <div class="type-item"><span class="type-tag">Display / 标题</span><span class="type-sample" style="font-size:30px;font-weight:700;letter-spacing:-.02em">运营台 OPS Console</span></div>
+        <div class="type-item"><span class="type-tag">Body / 正文</span><span class="type-sample body" style="font-size:15px">数据监测任务按平台、品牌、问题三级钻取，异常实时提醒。</span></div>
+        <div class="type-item"><span class="type-tag">Mono / 数据</span><span class="type-sample mono" style="font-size:14px">#2068 · 18m · 96.9%</span></div>
+      </div>
+      <p style="color:var(--text-3);font-size:13px;margin-top:var(--s-4)">标题用 <b>Space Grotesk</b>（几何感、辨识度高）；正文用 <b>IBM Plex Sans</b>（中性、易读）；数字 / ID 用 <b>JetBrains Mono</b> 保证对齐。</p>
+    </div>
+
+    <div class="panel">
+      <h3>间距韵律 Spacing</h3>
+      <div class="space-row">
+        <div style="text-align:center"><div class="space-box" style="width:8px;height:8px"></div><div class="type-tag" style="margin-top:6px">8</div></div>
+        <div style="text-align:center"><div class="space-box" style="width:16px;height:16px"></div><div class="type-tag" style="margin-top:6px">16</div></div>
+        <div style="text-align:center"><div class="space-box" style="width:24px;height:24px"></div><div class="type-tag" style="margin-top:6px">24</div></div>
+        <div style="text-align:center"><div class="space-box" style="width:32px;height:32px"></div><div class="type-tag" style="margin-top:6px">32</div></div>
+        <div style="text-align:center"><div class="space-box" style="width:44px;height:44px"></div><div class="type-tag" style="margin-top:6px">44</div></div>
+      </div>
+      <p style="color:var(--text-3);font-size:13px;margin-top:var(--s-4)">4pt 基数（8/16/24/32/44），刻意变化间距制造视觉节奏，避免「万物皆卡片」的均质感。</p>
+    </div>
+
+    <div class="panel">
+      <h3>核心组件 Components</h3>
+      <div class="comp-grid">
+        <div class="comp-stack">
+          <div class="comp-label">Buttons</div>
+          <button class="btn btn-primary">主要操作</button>
+          <button class="btn btn-ghost">次要操作</button>
+          <button class="btn btn-danger">危险操作</button>
+        </div>
+        <div class="comp-stack">
+          <div class="comp-label">Input</div>
+          <input class="input" placeholder="输入品牌名称…" />
+          <div class="comp-label" style="margin-top:6px">Status Pills</div>
+          <div style="display:flex;gap:8px;flex-wrap:wrap">
+            <span class="pill p-running"><span class="d"></span>运行中</span>
+            <span class="pill p-wait"><span class="d"></span>待运行</span>
+            <span class="pill p-done"><span class="d"></span>已完成</span>
+            <span class="pill p-fail"><span class="d"></span>失败</span>
+          </div>
+        </div>
+        <div class="comp-stack">
+          <div class="comp-label">Tabs</div>
+          <div class="tabs">
+            <button class="tab"><span class="pdot" style="background:var(--run)"></span>运行中<span class="tc">12</span></button>
+            <button class="tab active"><span class="pdot" style="background:var(--done)"></span>已完成<span class="tc">128</span></button>
+          </div>
+          <div class="comp-label" style="margin-top:6px">Empty State</div>
+          <div class="empty" style="padding:var(--s-5)"><b>暂无数据</b><div style="font-size:12px">该分类下暂无任务</div></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <footer class="foot">
+    <span>运营台 UI 设计方案 · 精密工业风 / Precision Industrial</span>
+    <span>WCAG AA · 响应式 Web · 浅色 + 深色</span>
+  </footer>
+</div>
+
+<script>
+  // 主题切换
+  const root = document.documentElement;
+  const themeBtn = document.getElementById('themeBtn');
+  const themeIcon = document.getElementById('themeIcon');
+  const sunPath = '<circle cx="12" cy="12" r="4.2" stroke="currentColor" stroke-width="1.7"/><path d="M12 2v2M12 20v2M2 12h2M20 12h2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/>';
+  const moonPath = '<path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8Z" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/>';
+  function applyTheme(t){
+    root.setAttribute('data-theme', t);
+    themeIcon.innerHTML = t === 'dark' ? sunPath : moonPath;
+  }
+  themeBtn.addEventListener('click', () => {
+    applyTheme(root.getAttribute('data-theme') === 'dark' ? 'light' : 'dark');
+  });
+  applyTheme('light');
+
+  // 品牌组折叠
+  function toggle(head){
+    const arrow = head.querySelector('.arrow');
+    const items = head.nextElementSibling;
+    const open = items.classList.toggle('open');
+    arrow.classList.toggle('open', open);
+  }
+</script>
+</body>
+</html>

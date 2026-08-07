@@ -1,7 +1,4 @@
 import assert from "node:assert/strict";
-import { promises as fs } from "node:fs";
-import os from "node:os";
-import path from "node:path";
 import test from "node:test";
 import {
   assertEntryMonitorCollectionContext,
@@ -13,7 +10,7 @@ import {
   serializeEntryMonitorConversationKey,
   transitionEntryMonitorPageOwner
 } from "../src/entryMonitor.js";
-import { JsonEntryMonitorConversationRepository } from
+import { MysqlEntryMonitorConversationRepository } from
   "../src/entryMonitorConversationRepository.js";
 import {
   businessTypesForWorker,
@@ -22,6 +19,10 @@ import {
   type CollectionTask,
   type EntryMonitorRpaTask
 } from "../src/rpaTask.js";
+import type {
+  RpaSqlClient,
+  RpaSqlParameter
+} from "../src/rpaTaskRepository.js";
 
 function entryTask(overrides: Partial<EntryMonitorRpaTask> = {}): EntryMonitorRpaTask {
   return {
@@ -29,8 +30,8 @@ function entryTask(overrides: Partial<EntryMonitorRpaTask> = {}): EntryMonitorRp
     dispatchTaskId: "2080238709516197889",
     businessType: "ENTRY_MONITOR",
     businessTaskId: "3001",
-    tenantKey: "tenant-a",
-    tenantId: "tenant-a",
+    tenantKey: "1001",
+    tenantId: "1001",
     projectId: "7001",
     intentEntryId: "8001",
     monitorDate: "2026-08-06",
@@ -55,7 +56,7 @@ test("上海自然日不受 UTC 日期边界影响，且只允许当日 ENTRY_MO
   assert.equal(isEntryMonitorTaskEligibleToday(entryTask(), beforeShanghaiMidnight), false);
 });
 
-test("Worker 到业务类型保持 diagnosis 单类型、monitor 兼容新旧两类型", () => {
+test("diagnosis 保持单类型，monitor 同时兼容 ARTICLE_PROBE 和 ENTRY_MONITOR", () => {
   assert.deepEqual(businessTypesForWorker("diagnosis"), ["DIAGNOSIS"]);
   assert.deepEqual(businessTypesForWorker("monitor"), ["ARTICLE_PROBE", "ENTRY_MONITOR"]);
   assert.equal(isBusinessTypeAllowedForWorker("diagnosis", "ENTRY_MONITOR"), false);
@@ -63,11 +64,11 @@ test("Worker 到业务类型保持 diagnosis 单类型、monitor 兼容新旧两
   const collection = toCollectionTask(entryTask());
   assert.equal(collection.brandId, "7001");
   assert.equal(collection.businessGroupId, JSON.stringify([
-    "tenant-a", "ENTRY_MONITOR", "7001", "doubao", "2026-08-06"
+    "1001", "ENTRY_MONITOR", "7001", "1", "2026-08-06"
   ]));
 });
 
-test("项目、平台、自然日决定对话键，同项目多个词条复用且跨日隔离", () => {
+test("项目、AI 模型和上海自然日决定会话键，同项目多词条复用且跨日隔离", () => {
   const first = entryMonitorConversationKeyFor({
     ...entryTask({ intentEntryId: "8001" }),
     platformId: "doubao"
@@ -88,9 +89,12 @@ test("项目、平台、自然日决定对话键，同项目多个词条复用�
     serializeEntryMonitorConversationKey(first),
     serializeEntryMonitorConversationKey(nextDay)
   );
+  assert.deepEqual(JSON.parse(serializeEntryMonitorConversationKey(first)), [
+    "1001", "ENTRY_MONITOR", "7001", "1", "2026-08-06"
+  ]);
 });
 
-test("相同 keyword 的恢复身份使用 executionId、词条 ID、次数和顺序状态机", () => {
+test("相同 keyword 恢复身份使用 executionId、词条 ID、次数和顺序状态机", () => {
   const key = serializeEntryMonitorConversationKey(entryMonitorConversationKeyFor({
     ...entryTask(),
     platformId: "doubao"
@@ -111,9 +115,36 @@ test("相同 keyword 的恢复身份使用 executionId、词条 ID、次数和�
     () => transitionEntryMonitorPageOwner(prepared, "ANSWER_READY"),
     /非法 ENTRY_MONITOR 提交状态迁移/
   );
+
+  const repeatedExecutions = Array.from({ length: 30 }, (_, index) =>
+    entryTask({
+      executionId: String(1_000 + index),
+      intentEntryId: String(8_000 + index),
+      repetitionNo: index + 1,
+      keyword: "完全相同的关键词"
+    })
+  );
+  const owners = repeatedExecutions.map((task) =>
+    createEntryMonitorPageOwner(task, key, {
+      userMessageCount: task.repetitionNo - 1,
+      assistantMessageCount: task.repetitionNo - 1
+    })
+  );
+  for (let index = 0; index < repeatedExecutions.length; index += 1) {
+    assert.equal(entryMonitorOwnerMatchesExecution(
+      owners[index]!,
+      repeatedExecutions[index]!,
+      key
+    ), true);
+    assert.equal(entryMonitorOwnerMatchesExecution(
+      owners[index]!,
+      repeatedExecutions[(index + 1) % repeatedExecutions.length]!,
+      key
+    ), false);
+  }
 });
 
-test("ENTRY_MONITOR CollectionTask 上下文缺字段时严格拒绝", () => {
+test("ENTRY_MONITOR CollectionTask 缺少上下文字段时严格拒绝", () => {
   const collection = {
     ...entryTask(),
     id: "90071992547409931",
@@ -131,42 +162,91 @@ test("ENTRY_MONITOR CollectionTask 上下文缺字段时严格拒绝", () => {
   );
 });
 
-test("单机灰度会话仓储支持 A→B→A 恢复、更新 URL 与跨日关闭", async () => {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), "entry-monitor-conversations-"));
-  try {
-    const repository = new JsonEntryMonitorConversationRepository(
-      path.join(root, "conversations.json")
-    );
-    const keyA = entryMonitorConversationKeyFor({ ...entryTask(), platformId: "doubao" });
-    const keyB = entryMonitorConversationKeyFor({
-      ...entryTask({ projectId: "7002" }),
-      platformId: "doubao"
-    });
-    const now = "2026-08-06T01:00:00.000Z";
-    for (const [key, url] of [
-      [keyA, "https://www.doubao.com/chat/a"],
-      [keyB, "https://www.doubao.com/chat/b"]
-    ] as const) {
-      await repository.upsertActive({
-        ...key,
-        conversationKey: serializeEntryMonitorConversationKey(key),
-        conversationUrl: url,
-        status: "ACTIVE",
-        createdAt: now,
-        lastUsedAt: now
-      });
-    }
-    assert.equal((await repository.find(keyA))?.conversationUrl, "https://www.doubao.com/chat/a");
-    assert.equal((await repository.find(keyB))?.conversationUrl, "https://www.doubao.com/chat/b");
-    await repository.updateUrl(keyA, "https://www.doubao.com/chat/a-restored");
-    await repository.touch(keyA, new Date("2026-08-06T02:00:00.000Z"));
-    assert.equal(
-      (await repository.find(keyA))?.conversationUrl,
-      "https://www.doubao.com/chat/a-restored"
-    );
-    assert.equal(await repository.closeExpired("2026-08-07"), 2);
-    assert.equal((await repository.find(keyA))?.status, "EXPIRED");
-  } finally {
-    await fs.rm(root, { recursive: true, force: true });
+class ConversationSqlClient implements RpaSqlClient {
+  readonly queries: Array<{ sql: string; parameters: readonly RpaSqlParameter[] }> = [];
+  readonly updates: Array<{ sql: string; parameters: readonly RpaSqlParameter[] }> = [];
+
+  constructor(
+    private readonly queryResults: unknown[][] = [],
+    private readonly updateResults: number[] = []
+  ) {}
+
+  async queryRows<T>(sql: string, parameters: readonly RpaSqlParameter[]): Promise<T[]> {
+    this.queries.push({ sql, parameters });
+    return (this.queryResults.shift() ?? []) as T[];
   }
+
+  async executeUpdate(sql: string, parameters: readonly RpaSqlParameter[]): Promise<number> {
+    this.updates.push({ sql, parameters });
+    return this.updateResults.shift() ?? 1;
+  }
+}
+
+test("数据库会话仓储使用完整唯一键支持 A→B→A，并幂等累计 execution", async () => {
+  const rowFor = (projectId: string, conversationUrl: string) => ({
+    tenantId: "1001",
+    projectId,
+    aiModelId: "1",
+    conversationDate: "2026-08-06",
+    conversationUrl,
+    status: "ACTIVE",
+    questionCount: 3,
+    lastExecutionId: "101",
+    ownerWorkerId: "monitor-doubao",
+    lastUsedAt: "2026-08-06 02:00:00",
+    failureReason: null,
+    createdAt: "2026-08-06 00:00:00"
+  });
+  const client = new ConversationSqlClient([
+    [rowFor("7001", "https://www.doubao.com/chat/a")],
+    [rowFor("7002", "https://www.doubao.com/chat/b")],
+    [rowFor("7001", "https://www.doubao.com/chat/a")]
+  ], [1, 1, 1, 1, 2]);
+  const repository = new MysqlEntryMonitorConversationRepository(client);
+  const keyA = entryMonitorConversationKeyFor({ ...entryTask(), platformId: "doubao" });
+  const keyB = entryMonitorConversationKeyFor({
+    ...entryTask({ projectId: "7002" }),
+    platformId: "doubao"
+  });
+
+  assert.equal((await repository.find(keyA))?.conversationUrl, "https://www.doubao.com/chat/a");
+  assert.equal((await repository.find(keyB))?.conversationUrl, "https://www.doubao.com/chat/b");
+  assert.equal((await repository.find(keyA))?.conversationUrl, "https://www.doubao.com/chat/a");
+  assert.deepEqual(client.queries.map(({ parameters }) => parameters), [
+    ["1001", "7001", "1", "2026-08-06"],
+    ["1001", "7002", "1", "2026-08-06"],
+    ["1001", "7001", "1", "2026-08-06"]
+  ]);
+  assert.match(client.queries[0]!.sql, /business_type = 'ENTRY_MONITOR'/);
+  assert.match(client.queries[0]!.sql, /deleted = 0/);
+
+  const now = new Date("2026-08-06T02:00:00.000Z");
+  await repository.upsertActive({
+    ...keyA,
+    conversationKey: serializeEntryMonitorConversationKey(keyA),
+    conversationUrl: "https://www.doubao.com/chat/a",
+    status: "ACTIVE",
+    questionCount: 0,
+    ownerWorkerId: "monitor-doubao",
+    createdAt: now.toISOString(),
+    lastUsedAt: now.toISOString()
+  });
+  assert.match(client.updates[0]!.sql, /INSERT INTO rpa_conversation_session/);
+  assert.match(client.updates[0]!.sql, /ON DUPLICATE KEY UPDATE/);
+  assert.deepEqual(client.updates[0]!.parameters.slice(0, 4), [
+    "7001", "1", "2026-08-06", "https://www.doubao.com/chat/a"
+  ]);
+  await repository.updateUrl(keyA, "https://www.doubao.com/chat/a-restored");
+  await repository.touch(keyA, now, { executionId: "102", workerId: "monitor-doubao" });
+  await repository.incrementQuestionCount(
+    keyA,
+    { executionId: "102", workerId: "monitor-doubao" },
+    now
+  );
+  assert.match(client.updates[3]!.sql, /IF\(last_execution_id = \?, 0, 1\)/);
+  assert.deepEqual(client.updates[3]!.parameters.slice(0, 3), [
+    "102", "102", "monitor-doubao"
+  ]);
+  assert.equal(await repository.closeExpired("2026-08-07"), 2);
+  assert.match(client.updates[4]!.sql, /status = 'CLOSED'/);
 });

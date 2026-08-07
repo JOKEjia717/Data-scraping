@@ -746,8 +746,8 @@ research 不显式传 `--web-search-policy` 时继续保持历史宽松尝试行
 
 对话键固定为租户 × 项目 × 平台 × 上海自然日，同项目当天的多个词条共用会话；不同项目
 按 `ENTRY_MONITOR_PROJECT_CHUNK_SIZE` 分片后可交叉执行。单机灰度使用 monitor runtime 下
-的原子 JSON 会话仓储保存 URL，以支持 A→B→A 恢复。多 Worker 生产部署必须由 Java 提供
-集中式等价会话仓储，不能把本地 JSON 当作分布式一致性的最终方案。平台 advisory lock
+的 `rpa_conversation_session` 数据库会话仓储保存 URL、题数和最后 execution，以支持
+A→B→A 恢复。平台 advisory lock
 使用 `geno-rpa-platform:${workerType}:${platformId}`，因此 diagnosis 与 monitor 的两个
 Chrome 可以并行，而同一 workerType 内同平台仍互斥。
 
@@ -1192,7 +1192,7 @@ npm test
 | `src/rpaRetryPolicy.ts` | 技术错误、平台暂停、Outbox 与零引用成功的纯重试策略 |
 | `src/rpaWorkerService.ts` | 正式 Worker 常驻轮询、退避、信号停止和跨轮询运行时复用 |
 | `src/entryMonitor.ts` | 词条监测任务的自然日校验、项目分片与会话复用编排 |
-| `src/entryMonitorConversationRepository.ts` | 单机灰度下词条监测会话 URL 的原子 JSON 仓储 |
+| `src/entryMonitorConversationRepository.ts` | 词条监测会话 URL、题数和 execution 归属的数据库仓储 |
 | `src/extractReferences.ts` | 提取各平台最终回答，并展开、解析引用列表 |
 | `src/platforms.ts` | 平台地址与页面选择器配置 |
 | `src/questions.ts` | 默认问题列表 |

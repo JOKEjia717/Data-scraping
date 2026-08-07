@@ -75,7 +75,6 @@ export interface RpaWorkerConfig {
   entryMonitorConversationMaxDurationMs: number;
   entryMonitorConversationMaxQuestions: number;
   entryMonitorTimezone: "Asia/Shanghai";
-  entryMonitorConversationFile: string;
 }
 
 export function parseRpaWorkerConfig(
@@ -381,13 +380,7 @@ export function parseRpaWorkerConfig(
       : 10_000,
     entryMonitorTimezone: workerType === "monitor"
       ? entryMonitorTimezone(entryConfigured("TIMEZONE") ?? "Asia/Shanghai")
-      : "Asia/Shanghai",
-    entryMonitorConversationFile: path.resolve(
-      workerType === "monitor"
-        ? entryConfigured("CONVERSATION_FILE") ??
-          path.join(runtimeRoot, "entry-monitor-conversations.json")
-        : path.join(runtimeRoot, "entry-monitor-unused.json")
-    )
+      : "Asia/Shanghai"
   };
   if (config.diskWarningFreeMb < config.diskStopFreeMb) {
     throw new Error("disk-warning-free-mb 不能小于 disk-stop-free-mb。");

@@ -163,6 +163,8 @@ test("ARTICLE_PROBE 强制 REQUIRED，未联网时不能生成普通零引用成
   } as const;
 
   assert.equal(policy, "REQUIRED");
+  assert.equal(webSearchPolicyForBusinessType("ENTRY_MONITOR", "DISABLED"), "REQUIRED");
+  assert.equal(webSearchPolicyForBusinessType("DIAGNOSIS", "DISABLED"), "DISABLED");
   assert.throws(
     () => assertVerifiedWebSearchForZeroReferences(unverified),
     (error: unknown) => error instanceof WebSearchTechnicalError &&

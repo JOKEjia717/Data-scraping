@@ -476,6 +476,10 @@ test("monitor 开关启用后同时读取 ARTICLE_PROBE 与 ENTRY_MONITOR execut
   const entryQuery = client.queries[1]!;
   assert.match(entryQuery.sql, /FROM rpa_task_execution AS e/);
   assert.match(entryQuery.sql, /INNER JOIN rpa_task_execution_context AS ctx/);
+  assert.match(entryQuery.sql, /ctx\.deleted = 0/);
+  assert.match(entryQuery.sql, /ctx\.business_type = 'ENTRY_MONITOR'/);
+  assert.match(entryQuery.sql, /ctx\.business_task_id = d\.business_task_id/);
+  assert.match(entryQuery.sql, /ctx\.ai_model_id = e\.ai_model_id/);
   assert.match(entryQuery.sql, /ctx\.monitor_date = \?/);
   assert.match(entryQuery.sql, /ctx\.project_id IN \(\?\)/);
   assert.doesNotMatch(
@@ -596,4 +600,49 @@ test("monitor 指标可按 ARTICLE_PROBE 与 ENTRY_MONITOR 分开聚合", async 
   assert.deepEqual(client.queries[0]!.parameters, [
     "ARTICLE_PROBE", "ENTRY_MONITOR", "NEW_RPA"
   ]);
+});
+
+test("单条 ENTRY_MONITOR 上下文无效时记录审计并继续返回其他正常任务", async () => {
+  const invalid = row({
+    executionId: "9001",
+    businessType: "ENTRY_MONITOR",
+    brandId: undefined,
+    projectId: undefined,
+    intentEntryId: "8001",
+    monitorDate: "2026-08-06",
+    repetitionNo: 1,
+    aiModelId: "1",
+    aiModelName: "豆包"
+  });
+  const valid = row({
+    executionId: "9002",
+    businessType: "ENTRY_MONITOR",
+    brandId: undefined,
+    projectId: "7001",
+    intentEntryId: "8002",
+    monitorDate: "2026-08-06",
+    repetitionNo: 2,
+    aiModelId: "1",
+    aiModelName: "豆包"
+  });
+  const auditEvents: Array<{ event: string; executionId?: string }> = [];
+  const client = new RecordingSqlClient([[], [invalid, valid]]);
+  const repository = new RpaTaskRepository(client, {
+    async write(event) {
+      auditEvents.push({
+        event: event.event,
+        ...(event.executionId ? { executionId: event.executionId } : {})
+      });
+    }
+  }, {
+    entryMonitorEnabled: true,
+    workerProvider: "NEW_RPA",
+    now: () => new Date("2026-08-05T16:00:00.000Z")
+  });
+  const tasks = await repository.findPendingTasks("monitor", { limit: 10 });
+  assert.deepEqual(tasks.map(({ executionId }) => executionId), ["9002"]);
+  assert.deepEqual(
+    auditEvents.filter(({ event }) => event === "INVALID_EXECUTION_CONTEXT"),
+    [{ event: "INVALID_EXECUTION_CONTEXT", executionId: "9001" }]
+  );
 });

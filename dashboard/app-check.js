@@ -168,8 +168,7 @@ const App = {
       trendByTask: {},               // executionId -> [elapsedSeconds...]
       doneOpen: {},                  // executionId -> true
       doneDetail: {},               // executionId -> { answer, refCount, refs }
-      brandCollapse: { __default__: true },  // 默认第一个品牌展开
-      pfCollapse: {}                        // 平台折叠状态：key = "品牌|平台" → bool
+      brandCollapse: { __default__: true }  // 默认第一个品牌展开（isBrandOpen 中按 brank 未交互判定）
     };
   },
 
@@ -593,15 +592,6 @@ const App = {
       // 用户开始与品牌组交互后，删除占位 __default__，让 isBrandOpen 走明确分支
       if ("__default__" in this.brandCollapse) delete this.brandCollapse.__default__;
     },
-    pfKey(brand, pf) { return brand + "|" + pf; },
-    isPfOpen(brand, pf) {
-      const k = this.pfKey(brand, pf);
-      return !!this.pfCollapse[k];
-    },
-    togglePf(brand, pf) {
-      const k = this.pfKey(brand, pf);
-      this.pfCollapse[k] = !this.isPfOpen(brand, pf);
-    },
 
     async toggleDone(t) {
       const key = t.executionId;
@@ -843,15 +833,12 @@ const App = {
     '              <div class="bc-collapse-inner">',
     '                <div class="bc-body">',
     '                  <section v-for="(tasks, pf) in g.platforms" :key="pf" class="bc-pf-section">',
-    '                    <div class="bc-pf-section-head" @click.stop="togglePf(g.brand, pf)">',
-    '                      <span class="pf-arrow" :class="{ open: isPfOpen(g.brand, pf) }">▸</span>',
+    '                    <div class="bc-pf-section-head">',
     '                      <span class="pf-dot" :style="{ background: PLATFORM_COLORS[pf] || \'#888\' }"></span>',
     '                      <span class="bc-pf-section-name">{{ PLATFORM_NAMES[pf] || pf }}</span>',
     '                      <span class="bc-pf-section-count">{{ tasks.length }} 条</span>',
     '                    </div>',
-    '                    <div class="bc-pf-collapse" :class="{ open: isPfOpen(g.brand, pf) }">',
-    '                      <div class="bc-pf-collapse-inner">',
-    '                        <div class="bc-tasks">',
+    '                    <div class="bc-tasks">',
     '                      <!-- 已运行：可展开查看详情 -->',
     '                      <template v-if="selectedTab === 2">',
     '                        <div v-for="t in tasks.filter(x=>x)" :key="t.executionId"',
@@ -898,8 +885,6 @@ const App = {
     '                        </div>',
     '                      </template>',
     '                    </div>',
-    '                      </div>',   /* bc-pf-collapse-inner */
-    '                    </div>',     /* bc-pf-collapse */
     '                  </section>',
     '                </div>',
     '              </div>',

@@ -13,6 +13,7 @@ export type EntryMonitorErrorCode =
 export interface EntryMonitorConversationKey {
   tenantId: string;
   projectId: string;
+  aiModelId: string;
   platformId: PlatformId;
   monitorDate: string;
 }
@@ -116,13 +117,14 @@ export function assertEntryMonitorCollectionContext(
 }
 
 export function entryMonitorConversationKeyFor(
-  task: Pick<EntryMonitorRpaTask, "tenantId" | "projectId" | "monitorDate"> & {
+  task: Pick<EntryMonitorRpaTask, "tenantId" | "projectId" | "aiModelId" | "monitorDate"> & {
     platformId: PlatformId;
   }
 ): EntryMonitorConversationKey {
   return {
     tenantId: requireNonEmpty(task.tenantId, "tenantId"),
     projectId: requireDatabaseId(task.projectId, "projectId"),
+    aiModelId: requireDatabaseId(task.aiModelId, "aiModelId"),
     platformId: task.platformId,
     monitorDate: requireMonitorDate(task.monitorDate)
   };
@@ -133,8 +135,9 @@ export function serializeEntryMonitorConversationKey(
 ): string {
   return JSON.stringify([
     requireNonEmpty(key.tenantId, "tenantId"),
+    "ENTRY_MONITOR",
     requireDatabaseId(key.projectId, "projectId"),
-    key.platformId,
+    requireDatabaseId(key.aiModelId, "aiModelId"),
     requireMonitorDate(key.monitorDate)
   ]);
 }

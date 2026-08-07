@@ -155,6 +155,8 @@ export interface ExecuteQuestionRuntime {
     state: "submitted" | "uncertain",
     submittedQuestion: string
   ) => void;
+  /** ENTRY_MONITOR uses this hook for its final date check and SUBMITTING state. */
+  beforeSubmit?: () => void | Promise<void>;
   /** 测试或受控部署可收紧；生产默认在原始发送后最多再提问 3 次。 */
   qianwenSystemTimeoutResubmissionAttempts?: number;
 }
@@ -495,9 +497,12 @@ export async function executeQuestion(
   if (config.id === "doubao") await markDoubaoSearchResultBaseline(page);
   console.log(`[${config.name}] 实际发送问题：${JSON.stringify(submittedQuestion)}`);
   try {
-    await submitQuestion(page, config, submittedQuestion);
+    await submitQuestion(page, config, submittedQuestion, 20_000, runtime.beforeSubmit);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
+    if ((error as { errorCode?: unknown })?.errorCode === "DATE_WINDOW_EXPIRED") {
+      throw error;
+    }
     if (!/没有在.+页面找到聊天输入框|input.*not found/i.test(message)) {
       runtime.onSubmissionStateChange?.("uncertain", submittedQuestion);
     }
@@ -2243,7 +2248,8 @@ export async function submitQuestion(
   page: Page,
   config: PlatformConfig,
   question: string,
-  confirmationTimeoutMs = 20_000
+  confirmationTimeoutMs = 20_000,
+  beforeSubmit?: () => void | Promise<void>
 ): Promise<void> {
   const inputBox = await findInput(page, config.inputSelectors, 30_000);
   if (!inputBox) throw new Error(`没有在 ${config.name} 页面找到聊天输入框。`);
@@ -2268,8 +2274,9 @@ export async function submitQuestion(
     await page.keyboard.insertText(question);
   }
 
-  const clickedSend = await clickSendButton(page, config.sendButtonSelectors);
+  const clickedSend = await clickSendButton(page, config.sendButtonSelectors, beforeSubmit);
   if (!clickedSend) {
+    await beforeSubmit?.();
     await pressEnterToSend(page, inputBox);
   } else {
     // click() 成功只表示浏览器完成了点击，不代表站点接收了问题。给页面一个短暂的
@@ -2286,6 +2293,7 @@ export async function submitQuestion(
     );
     if (clickConfirmation.confirmed) return;
     if (!clickConfirmation.inputCleared && !clickConfirmation.questionAccepted) {
+      await beforeSubmit?.();
       await pressEnterToSend(page, inputBox);
     }
   }
@@ -2312,6 +2320,7 @@ export async function submitQuestion(
     !finalConfirmation.questionAccepted &&
     await hasExactUnsubmittedComposerDraft(page, config, question)
   ) {
+    await beforeSubmit?.();
     const domClicked = await clickSendButtonViaDom(page, config.sendButtonSelectors);
     if (domClicked) {
       console.log("[DeepSeek] 常规点击与 Enter 均无提交状态变化，执行一次精确 DOM click 兜底。");
@@ -2695,7 +2704,11 @@ async function pressEnterToSend(page: Page, inputBox: Locator): Promise<void> {
 }
 
 /** 从后向前寻找最新且可点击的发送控件。 */
-async function clickSendButton(page: Page, selectors: string[]): Promise<boolean> {
+async function clickSendButton(
+  page: Page,
+  selectors: string[],
+  beforeClick?: () => void | Promise<void>
+): Promise<boolean> {
   // React 更新输入状态后，Windows 页面上的发送按钮可能延迟数百毫秒才启用。
   // 在退回 Enter 之前短暂轮询，避免把 Enter 当成富文本输入框里的换行。
   const deadline = Date.now() + 3_000;
@@ -2706,6 +2719,7 @@ async function clickSendButton(page: Page, selectors: string[]): Promise<boolean
         const visible = await locator.isVisible().catch(() => false);
         const enabled = await locator.isEnabled().catch(() => false);
         if (!visible || !enabled) continue;
+        await beforeClick?.();
         const clicked = await locator.click({ timeout: 1000 })
           .then(() => true)
           .catch(() => false);

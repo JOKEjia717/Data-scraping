@@ -383,6 +383,39 @@ test("DeepSeek 常规点击和 Enter 均失效时仅对明确未提交草稿补�
   await page.close();
 });
 
+test("ENTRY_MONITOR 发送前钩子在真实点击之前阻断跨日问题", async () => {
+  assert.ok(browser);
+  const page = await browser.newPage();
+  await page.setContent(`
+    <textarea></textarea>
+    <button aria-label="发送" type="button">发送</button>
+    <script>
+      window.__sendClicks = 0;
+      document.querySelector("button").addEventListener("click", () => {
+        window.__sendClicks += 1;
+      });
+    </script>
+  `);
+  let checks = 0;
+  await assert.rejects(
+    () => submitQuestion(page, PLATFORMS.deepseek, "跨日问题", 500, () => {
+      checks += 1;
+      throw Object.assign(new Error("date expired"), {
+        errorCode: "DATE_WINDOW_EXPIRED"
+      });
+    }),
+    (error: unknown) => (error as { errorCode?: string }).errorCode ===
+      "DATE_WINDOW_EXPIRED"
+  );
+  assert.equal(checks, 1);
+  assert.equal(
+    await page.evaluate(() => (window as unknown as { __sendClicks: number }).__sendClicks),
+    0
+  );
+  assert.equal(await page.locator("textarea").inputValue(), "跨日问题");
+  await page.close();
+});
+
 test("DeepSeek 仅在精确草稿存在且没有同题问题消息时允许安全重试", async () => {
   assert.ok(browser);
   const page = await browser.newPage();

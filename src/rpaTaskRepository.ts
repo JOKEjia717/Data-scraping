@@ -244,7 +244,25 @@ export class RpaTaskRepository {
         limit
       ]
     );
-    const entryTasks = entryRows.map((row) => mapRpaTaskRow(row, "ENTRY_MONITOR"));
+    const entryTasks: RpaTask[] = [];
+    for (const row of entryRows) {
+      try {
+        entryTasks.push(mapRpaTaskRow(row, "ENTRY_MONITOR"));
+      } catch (error) {
+        if ((error as { errorCode?: unknown })?.errorCode !== "INVALID_EXECUTION_CONTEXT") {
+          throw error;
+        }
+        await this.safeAudit({
+          timestamp: new Date().toISOString(),
+          event: "INVALID_EXECUTION_CONTEXT",
+          workerType,
+          businessType: "ENTRY_MONITOR",
+          ...(optionalDatabaseId(row.executionId) === undefined
+            ? {}
+            : { executionId: optionalDatabaseId(row.executionId) })
+        });
+      }
+    }
     await this.safeAudit({
       timestamp: new Date().toISOString(),
       event: "PENDING_QUERY",
@@ -585,6 +603,10 @@ INNER JOIN brand_rpa_dispatch_task AS d
   AND d.status = 'DISPATCHED'
 INNER JOIN rpa_task_execution_context AS ctx
   ON ctx.execution_id = e.id
+  AND ctx.deleted = 0
+  AND ctx.business_type = 'ENTRY_MONITOR'
+  AND ctx.business_task_id = d.business_task_id
+  AND ctx.ai_model_id = e.ai_model_id
 WHERE e.status = 0
   AND e.task_status = 0
   AND e.deleted = 0
@@ -598,6 +620,10 @@ WHERE e.status = 0
       AND active_d.deleted = 0
     INNER JOIN rpa_task_execution_context AS active_ctx
       ON active_ctx.execution_id = active_e.id
+      AND active_ctx.deleted = 0
+      AND active_ctx.business_type = 'ENTRY_MONITOR'
+      AND active_ctx.business_task_id = active_d.business_task_id
+      AND active_ctx.ai_model_id = active_e.ai_model_id
     WHERE active_e.status = 1
       AND active_e.task_status = 1
       AND active_e.answer_id IS NULL
@@ -1034,6 +1060,14 @@ function nonNegativeInteger(value: unknown, field: string): number {
     throw new Error(`${field} 必须是非负整数。`);
   }
   return parsed;
+}
+
+function optionalDatabaseId(value: unknown): string | undefined {
+  try {
+    return databaseId(value, "executionId");
+  } catch {
+    return undefined;
+  }
 }
 
 function positiveInteger(value: unknown, field: string): number {

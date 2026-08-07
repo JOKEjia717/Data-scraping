@@ -1,11 +1,12 @@
+var vm = arguments[0];
 /* =====================================================================
  * AI 爬取运营台 — Vue 前端（buildless，依赖本地 vendor/vue.global.prod.js）
  * 结构：左侧导航（总览 / 品牌诊断 / 数据监测 / 风格监测 / 研究爬取）
  *       板块视图 = 三栏看板（正在运行 / 待运行 / 已运行）
  * 后端 API 契约不变，本文件仅重写视图层与交互层。
  * ===================================================================== */
-/* global Vue */
-const { createApp } = Vue;
+
+const { createApp } = vm;
 
 /* ----------------------------- 常量 ----------------------------- */
 const PLATFORM_NAMES = { doubao: "豆包", deepseek: "DeepSeek", qianwen: "千问", yuanbao: "元宝" };
@@ -168,8 +169,7 @@ const App = {
       trendByTask: {},               // executionId -> [elapsedSeconds...]
       doneOpen: {},                  // executionId -> true
       doneDetail: {},               // executionId -> { answer, refCount, refs }
-      brandCollapse: { __default__: true },  // 默认第一个品牌展开
-      pfCollapse: {}                        // 平台折叠状态：key = "品牌|平台" → bool
+      brandCollapse: { __default__: true }  // 默认第一个品牌展开（isBrandOpen 中按 brank 未交互判定）
     };
   },
 
@@ -442,30 +442,7 @@ const App = {
       return r.json();
     },
 
-    async poll() {
-      try {
-        // 总览 + 板块汇总始终刷新（驱动侧栏徽标与告警）
-        const [ov, sec] = await Promise.all([
-          this.getJSON("/api/overview"),
-          this.getJSON("/api/rpa/sections")
-        ]);
-        this.overview = ov;
-        this.sectionsData = sec;
-        if (this.activeNav === "overview") {
-          // 仅总览，无需额外
-        } else if (this.isSection) {
-          await this.loadSection(this.activeNav);
-        } else if (this.activeNav === "research") {
-          await this.loadResearch();
-        }
-        this.connected = true;
-        this.lastUpdated = "更新于 " + fmtTime(new Date().toISOString());
-      } catch (e) {
-        this.connected = false;
-        this.overview = { rpa: { enabled: false }, research: { enabled: false }, metrics: {}, __error: e.message };
-      } finally {
-        this.firstLoad = false;
-      }
+    async poll(){}
     },
 
     async loadSection(bt) {
@@ -592,15 +569,6 @@ const App = {
       this.brandCollapse[brand] = !this.isBrandOpen(brand);
       // 用户开始与品牌组交互后，删除占位 __default__，让 isBrandOpen 走明确分支
       if ("__default__" in this.brandCollapse) delete this.brandCollapse.__default__;
-    },
-    pfKey(brand, pf) { return brand + "|" + pf; },
-    isPfOpen(brand, pf) {
-      const k = this.pfKey(brand, pf);
-      return !!this.pfCollapse[k];
-    },
-    togglePf(brand, pf) {
-      const k = this.pfKey(brand, pf);
-      this.pfCollapse[k] = !this.isPfOpen(brand, pf);
     },
 
     async toggleDone(t) {
@@ -843,15 +811,12 @@ const App = {
     '              <div class="bc-collapse-inner">',
     '                <div class="bc-body">',
     '                  <section v-for="(tasks, pf) in g.platforms" :key="pf" class="bc-pf-section">',
-    '                    <div class="bc-pf-section-head" @click.stop="togglePf(g.brand, pf)">',
-    '                      <span class="pf-arrow" :class="{ open: isPfOpen(g.brand, pf) }">▸</span>',
+    '                    <div class="bc-pf-section-head">',
     '                      <span class="pf-dot" :style="{ background: PLATFORM_COLORS[pf] || \'#888\' }"></span>',
     '                      <span class="bc-pf-section-name">{{ PLATFORM_NAMES[pf] || pf }}</span>',
     '                      <span class="bc-pf-section-count">{{ tasks.length }} 条</span>',
     '                    </div>',
-    '                    <div class="bc-pf-collapse" :class="{ open: isPfOpen(g.brand, pf) }">',
-    '                      <div class="bc-pf-collapse-inner">',
-    '                        <div class="bc-tasks">',
+    '                    <div class="bc-tasks">',
     '                      <!-- 已运行：可展开查看详情 -->',
     '                      <template v-if="selectedTab === 2">',
     '                        <div v-for="t in tasks.filter(x=>x)" :key="t.executionId"',
@@ -898,8 +863,6 @@ const App = {
     '                        </div>',
     '                      </template>',
     '                    </div>',
-    '                      </div>',   /* bc-pf-collapse-inner */
-    '                    </div>',     /* bc-pf-collapse */
     '                  </section>',
     '                </div>',
     '              </div>',
@@ -973,5 +936,6 @@ app.config.globalProperties.extractBrand = function(kw) {
 };
 app.component("status-badge", StatusBadge)
   .component("health-badge", HealthBadge)
-  .component("sparkline", Sparkline)
-  .mount("#app");
+  .component("sparkline", Sparkline).mount(document.querySelector("#app"));
+
+;window.__vueApp=app;
