@@ -41,6 +41,8 @@ export interface RpaWorkerConfig {
   grayBrandIds: string[];
   grayBusinessTaskIds: string[];
   grayPercentage: number;
+  brandWindowSize: number;
+  brandBarrierPlatforms: PlatformId[];
   pollIntervalMs: number;
   pollJitterMs: number;
   candidateLimit: number;
@@ -66,6 +68,14 @@ export interface RpaWorkerConfig {
   webSearchPolicy: WebSearchPolicy;
   maxConversationDurationMs: number;
   maxConversationQuestions: number;
+  /** 新业务默认关闭；这些配置只由 monitor 读取，diagnosis 不依赖。 */
+  entryMonitorEnabled: boolean;
+  entryMonitorGrayProjectIds: string[];
+  entryMonitorProjectChunkSize: number;
+  entryMonitorConversationMaxDurationMs: number;
+  entryMonitorConversationMaxQuestions: number;
+  entryMonitorTimezone: "Asia/Shanghai";
+  entryMonitorConversationFile: string;
 }
 
 export function parseRpaWorkerConfig(
@@ -80,6 +90,8 @@ export function parseRpaWorkerConfig(
   const configured = (suffix: string): string | undefined =>
     args.get(toCliName(suffix)) ?? environment[`${prefix}_${suffix}`] ??
     environment[`RPA_WORKER_${suffix}`];
+  const entryConfigured = (suffix: string): string | undefined =>
+    args.get(`entry-monitor-${toCliName(suffix)}`) ?? environment[`ENTRY_MONITOR_${suffix}`];
   const heartbeatIntervalMs = integer(
     configured("HEARTBEAT_MS") ?? "30000",
     "heartbeat-ms",
@@ -215,6 +227,15 @@ export function parseRpaWorkerConfig(
       0,
       100
     ),
+    brandWindowSize: integer(
+      configured("BRAND_WINDOW_SIZE") ?? (workerType === "diagnosis" ? "2" : "0"),
+      "brand-window-size",
+      0,
+      10
+    ),
+    brandBarrierPlatforms: parsePlatforms(
+      configured("BRAND_BARRIER_PLATFORMS") ?? PLATFORM_IDS.join(",")
+    ),
     pollIntervalMs,
     pollJitterMs: integer(
       configured("POLL_JITTER_MS") ?? String(Math.min(1_000, Math.floor(pollIntervalMs / 5))),
@@ -327,10 +348,57 @@ export function parseRpaWorkerConfig(
       "max-conversation-questions",
       2,
       10_000
+    ),
+    entryMonitorEnabled: workerType === "monitor"
+      ? booleanValue(entryConfigured("ENABLED") ?? "false", "entry-monitor-enabled")
+      : false,
+    entryMonitorGrayProjectIds: workerType === "monitor"
+      ? csvIds(entryConfigured("GRAY_PROJECT_IDS"))
+      : [],
+    entryMonitorProjectChunkSize: workerType === "monitor"
+      ? integer(
+        entryConfigured("PROJECT_CHUNK_SIZE") ?? "5",
+        "entry-monitor-project-chunk-size",
+        1,
+        1_000
+      )
+      : 5,
+    entryMonitorConversationMaxDurationMs: workerType === "monitor"
+      ? integer(
+        entryConfigured("CONVERSATION_MAX_DURATION_MS") ?? "86400000",
+        "entry-monitor-conversation-max-duration-ms",
+        60_000,
+        86_400_000
+      )
+      : 86_400_000,
+    entryMonitorConversationMaxQuestions: workerType === "monitor"
+      ? integer(
+        entryConfigured("CONVERSATION_MAX_QUESTIONS") ?? "10000",
+        "entry-monitor-conversation-max-questions",
+        2,
+        10_000
+      )
+      : 10_000,
+    entryMonitorTimezone: workerType === "monitor"
+      ? entryMonitorTimezone(entryConfigured("TIMEZONE") ?? "Asia/Shanghai")
+      : "Asia/Shanghai",
+    entryMonitorConversationFile: path.resolve(
+      workerType === "monitor"
+        ? entryConfigured("CONVERSATION_FILE") ??
+          path.join(runtimeRoot, "entry-monitor-conversations.json")
+        : path.join(runtimeRoot, "entry-monitor-unused.json")
     )
   };
   if (config.diskWarningFreeMb < config.diskStopFreeMb) {
     throw new Error("disk-warning-free-mb 不能小于 disk-stop-free-mb。");
+  }
+  if (config.entryMonitorEnabled) {
+    if (!config.providerRoutingEnabled) {
+      throw new Error("启用 ENTRY_MONITOR 前必须开启 provider-routing-enabled。");
+    }
+    if (config.entryMonitorGrayProjectIds.length === 0) {
+      throw new Error("启用 ENTRY_MONITOR 时必须配置灰度项目白名单。");
+    }
   }
   if (
     config.deploymentEnvironment === "production" &&
@@ -380,6 +448,11 @@ function webSearchPolicy(value: string): WebSearchPolicy {
     return normalized;
   }
   throw new Error("web-search-policy 只能是 REQUIRED、PREFERRED 或 DISABLED。");
+}
+
+function entryMonitorTimezone(value: string): "Asia/Shanghai" {
+  if (value === "Asia/Shanghai") return value;
+  throw new Error("entry-monitor-timezone 目前只允许 Asia/Shanghai。");
 }
 
 function validateDistinctWorkerResources(

@@ -15,7 +15,12 @@ import {
   type RpaSqlClient,
   type RpaSqlParameter
 } from "./rpaTaskRepository.js";
-import { businessTypeForWorker, type RpaWorkerType } from "./rpaTask.js";
+import {
+  businessTypeForWorker,
+  businessTypesForWorker,
+  type RpaBusinessType,
+  type RpaWorkerType
+} from "./rpaTask.js";
 import type { PlatformId } from "./types.js";
 
 export interface StaleExecution {
@@ -190,7 +195,10 @@ export class MysqlAdvisoryLeaseCoordinator implements AdvisoryLeaseCoordinator {
 }
 
 export class RpaWorkerStateRepository {
-  constructor(private readonly client: RpaSqlClient = new MysqlRpaSqlClient()) {}
+  constructor(
+    private readonly client: RpaSqlClient = new MysqlRpaSqlClient(),
+    private readonly options: { entryMonitorEnabled?: boolean } = {}
+  ) {}
 
   async heartbeat(executionIds: readonly string[]): Promise<number> {
     const ids = normalizeIds(executionIds);
@@ -234,11 +242,12 @@ WHERE id IN (${ids.map(() => "?").join(", ")})
     if (!Number.isSafeInteger(limit) || limit <= 0 || limit > 1_000) {
       throw new Error("僵尸任务查询 limit 必须为 1 到 1000。");
     }
+    const businessTypes = this.businessTypes(workerType);
     const rows = await this.client.queryRows<{
       executionId: unknown;
       modifiedAt: unknown;
-    }>(STALE_EXECUTIONS_SQL, [
-      businessTypeForWorker(workerType),
+    }>(staleExecutionsQueryFor(businessTypes), [
+      ...businessTypes,
       staleBefore,
       limit
     ]);
@@ -271,17 +280,26 @@ WHERE id IN (${ids.map(() => "?").join(", ")})
         continue;
       }
       try {
-        const affectedRows = await this.client.executeUpdate(RECOVER_STALE_EXECUTION_SQL, [
+        const affectedRows = await this.client.executeUpdate(
+          recoverStaleExecutionQueryFor(this.businessTypes(workerType)),
+          [
           candidate.executionId,
           staleBefore,
-          businessTypeForWorker(workerType)
-        ]);
+          ...this.businessTypes(workerType)
+          ]
+        );
         if (affectedRows === 1) recoveredExecutionIds.push(candidate.executionId);
       } finally {
         await leases.release(lockName);
       }
     }
     return { candidates, recoveredExecutionIds, skippedLockedExecutionIds };
+  }
+
+  private businessTypes(workerType: RpaWorkerType): readonly RpaBusinessType[] {
+    return workerType === "monitor" && this.options.entryMonitorEnabled === true
+      ? businessTypesForWorker(workerType)
+      : [businessTypeForWorker(workerType)];
   }
 }
 
@@ -371,8 +389,16 @@ export function executionLeaseName(executionId: string): string {
   return validateLockName(`geno-rpa-exec:${databaseId(executionId)}`);
 }
 
-export function platformLeaseName(platformId: PlatformId): string {
-  return validateLockName(`geno-rpa-platform:${platformId}`);
+export function platformLeaseName(platformId: PlatformId): string;
+export function platformLeaseName(workerType: RpaWorkerType, platformId: PlatformId): string;
+export function platformLeaseName(
+  workerTypeOrPlatform: RpaWorkerType | PlatformId,
+  maybePlatform?: PlatformId
+): string {
+  if (maybePlatform === undefined) {
+    return validateLockName(`geno-rpa-platform:${workerTypeOrPlatform}`);
+  }
+  return validateLockName(`geno-rpa-platform:${workerTypeOrPlatform}:${maybePlatform}`);
 }
 
 export const STALE_EXECUTIONS_SQL = `
@@ -420,6 +446,26 @@ WHERE e.id = ?
     ?
   )
   AND d.business_type = ?`;
+
+export const MONITOR_STALE_EXECUTIONS_SQL = STALE_EXECUTIONS_SQL.replace(
+  "d.business_type = ?",
+  "d.business_type IN (?, ?)"
+);
+
+export const RECOVER_MONITOR_STALE_EXECUTION_SQL = RECOVER_STALE_EXECUTION_SQL.replace(
+  "d.business_type = ?",
+  "d.business_type IN (?, ?)"
+);
+
+function staleExecutionsQueryFor(businessTypes: readonly RpaBusinessType[]): string {
+  return businessTypes.length === 1 ? STALE_EXECUTIONS_SQL : MONITOR_STALE_EXECUTIONS_SQL;
+}
+
+function recoverStaleExecutionQueryFor(businessTypes: readonly RpaBusinessType[]): string {
+  return businessTypes.length === 1
+    ? RECOVER_STALE_EXECUTION_SQL
+    : RECOVER_MONITOR_STALE_EXECUTION_SQL;
+}
 
 function normalizeIds(values: readonly string[]): string[] {
   const ids = [...new Set(values.map(databaseId))];

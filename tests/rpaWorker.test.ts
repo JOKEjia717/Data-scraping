@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import test from "node:test";
 import type { Pool, PoolConnection } from "mysql2/promise";
-import type { CollectionTask } from "../src/rpaTask.js";
+import type { CollectionTask, DiagnosisRpaTask } from "../src/rpaTask.js";
 import type {
   RpaSqlClient,
   RpaSqlParameter,
@@ -19,6 +19,7 @@ import {
   recheckDomChangedPlatforms,
   referenceRecoveryRuntimeForTask,
   releaseableExecutionIds,
+  resolveBrandWindow,
   routePlatformTaskFailure,
   shouldRestartUncertainOwnedConversation,
   taskInGrayScope,
@@ -195,7 +196,7 @@ class FakeLeases implements AdvisoryLeaseCoordinator {
 function task(
   executionId: string,
   businessTaskId: string,
-  overrides: Partial<CollectionTask> = {}
+  overrides: Partial<DiagnosisRpaTask & CollectionTask> = {}
 ): CollectionTask {
   return {
     executionId,
@@ -225,6 +226,7 @@ test("diagnosis 与 monitor 默认使用独立 endpoint、workerId、目录和 P
   const monitor = parseRpaWorkerConfig("monitor", [], {}, "/workspace");
   assert.equal(diagnosis.cdpEndpoint, "http://127.0.0.1:9222");
   assert.equal(monitor.cdpEndpoint, "http://127.0.0.1:9223");
+  assert.equal(monitor.entryMonitorEnabled, false);
   assert.notEqual(diagnosis.workerId, monitor.workerId);
   assert.notEqual(diagnosis.logDirectory, monitor.logDirectory);
   assert.notEqual(diagnosis.evidenceDirectory, monitor.evidenceDirectory);
@@ -238,6 +240,11 @@ test("diagnosis 与 monitor 默认使用独立 endpoint、workerId、目录和 P
   assert.equal(diagnosis.pollIntervalMs, 10_000);
   assert.equal(diagnosis.staleAfterMs, 300_000);
   assert.equal(diagnosis.watchdogStallMs, 300_000);
+  assert.equal(diagnosis.brandWindowSize, 2);
+  assert.deepEqual(diagnosis.brandBarrierPlatforms, [
+    "doubao", "deepseek", "qianwen", "yuanbao"
+  ]);
+  assert.equal(monitor.brandWindowSize, 0);
   assert.equal(diagnosis.metricsSnapshotIntervalMs, 15_000);
   assert.equal(diagnosis.runOnce, false);
   assert.equal(diagnosis.deepThinkingUnsupportedPolicy, "fail");
@@ -337,7 +344,7 @@ test("正式 Worker 将任务 deepThinking 原样映射到单题运行时", () =
   );
 });
 
-test("正式 Worker 强制 ARTICLE_PROBE 联网并允许配置 DIAGNOSIS 策略", () => {
+test("正式 Worker 强制两类 monitor 联网并允许配置 DIAGNOSIS 策略", () => {
   const workerConfig = parseRpaWorkerConfig("diagnosis", [
     "--web-search-policy=DISABLED"
   ], {}, "/workspace");
@@ -356,6 +363,10 @@ test("正式 Worker 强制 ARTICLE_PROBE 联网并允许配置 DIAGNOSIS 策略"
   );
   assert.deepEqual(
     webSearchRuntimeForTask({ businessType: "ARTICLE_PROBE" }, workerConfig),
+    { webSearchPolicy: "REQUIRED" }
+  );
+  assert.deepEqual(
+    webSearchRuntimeForTask({ businessType: "ENTRY_MONITOR" }, workerConfig),
     { webSearchPolicy: "REQUIRED" }
   );
 });
@@ -552,6 +563,119 @@ test("僵尸恢复跳过仍持有 execution 锁的其他 Worker", async () => {
   assert.deepEqual(leases.releases, [executionLeaseName("21")]);
 });
 
+test("monitor 开启新业务后僵尸查询与恢复同时覆盖新旧 monitor 类型", async () => {
+  const client = new RecordingClient();
+  client.queryResults = [[{
+    executionId: "31",
+    modifiedAt: "2026-08-03T00:00:00.000Z"
+  }]];
+  client.updateResults = [1];
+  const repository = new RpaWorkerStateRepository(client, {
+    entryMonitorEnabled: true
+  });
+  const cutoff = new Date("2026-08-03T01:00:00.000Z");
+  const result = await repository.recoverStaleExecutions(
+    "monitor",
+    cutoff,
+    new FakeLeases()
+  );
+  assert.deepEqual(result.recoveredExecutionIds, ["31"]);
+  assert.match(client.queries[0]!.sql, /d\.business_type IN \(\?, \?\)/);
+  assert.deepEqual(client.queries[0]!.parameters, [
+    "ARTICLE_PROBE", "ENTRY_MONITOR", cutoff, 100
+  ]);
+  assert.deepEqual(client.updates[0]!.parameters, [
+    "31", cutoff, "ARTICLE_PROBE", "ENTRY_MONITOR"
+  ]);
+});
+
+test("ENTRY_MONITOR 配置只由 monitor 解析，错误配置不阻止 diagnosis 启动", () => {
+  const monitor = parseRpaWorkerConfig("monitor", [], {
+    ENTRY_MONITOR_ENABLED: "true",
+    ENTRY_MONITOR_GRAY_PROJECT_IDS: "7001,7002",
+    ENTRY_MONITOR_PROJECT_CHUNK_SIZE: "7",
+    ENTRY_MONITOR_CONVERSATION_MAX_QUESTIONS: "10000",
+    ENTRY_MONITOR_CONVERSATION_MAX_DURATION_MS: "86400000",
+    ENTRY_MONITOR_TIMEZONE: "Asia/Shanghai",
+    RPA_WORKER_PROVIDER_ROUTING_ENABLED: "true"
+  }, "/workspace");
+  assert.equal(monitor.entryMonitorEnabled, true);
+  assert.deepEqual(monitor.entryMonitorGrayProjectIds, ["7001", "7002"]);
+  assert.equal(monitor.entryMonitorProjectChunkSize, 7);
+  assert.equal(monitor.entryMonitorConversationMaxQuestions, 10_000);
+
+  assert.doesNotThrow(() => parseRpaWorkerConfig("diagnosis", [], {
+    ENTRY_MONITOR_ENABLED: "not-a-boolean",
+    ENTRY_MONITOR_TIMEZONE: "UTC"
+  }, "/workspace"));
+});
+
+test("品牌窗口默认限制为两个未完成品牌，并以四个平台作为完成屏障", async () => {
+  const calls: unknown[] = [];
+  const entries = [
+    {
+      tenantKey: "tenant-a",
+      businessTaskId: "3001",
+      brandId: "7001",
+      priority: 0,
+      createdAt: "2026-08-03T00:00:00.000Z",
+      totalTasks: 32,
+      platformCount: 4,
+      pending: 8,
+      processing: 0,
+      succeeded: 24,
+      finalFailed: 0
+    },
+    {
+      tenantKey: "tenant-a",
+      businessTaskId: "3002",
+      brandId: "7002",
+      priority: 1,
+      createdAt: "2026-08-03T01:00:00.000Z",
+      totalTasks: 32,
+      platformCount: 4,
+      pending: 32,
+      processing: 0,
+      succeeded: 0,
+      finalFailed: 0
+    }
+  ];
+  const repository = {
+    async findBrandWindow(workerType: string, options: unknown) {
+      calls.push({ workerType, options });
+      return entries;
+    }
+  };
+  const config = parseRpaWorkerConfig("diagnosis", [], {}, "/workspace");
+
+  const window = await resolveBrandWindow(repository, config);
+
+  assert.deepEqual(window, entries);
+  assert.deepEqual(calls, [{
+    workerType: "diagnosis",
+    options: {
+      size: 2,
+      expectedPlatforms: ["doubao", "deepseek", "qianwen", "yuanbao"]
+    }
+  }]);
+});
+
+test("品牌窗口可显式关闭，适合单次定向灰度任务", async () => {
+  let queried = false;
+  const repository = {
+    async findBrandWindow() {
+      queried = true;
+      return [];
+    }
+  };
+  const config = parseRpaWorkerConfig("diagnosis", [
+    "--brand-window-size=0"
+  ], {}, "/workspace");
+
+  assert.equal(await resolveBrandWindow(repository, config), undefined);
+  assert.equal(queried, false);
+});
+
 test("DOM_CHANGED 连续两次健康检查 READY 后才自动恢复", async () => {
   const workerConfig = parseRpaWorkerConfig("diagnosis", [], {}, "/workspace");
   const page = { isClosed: () => false };
@@ -606,7 +730,7 @@ test("DOM_CHANGED 连续两次健康检查 READY 后才自动恢复", async () =
 test("完整批次先拿 execution lock，再改 processing；锁竞争时回滚整批", async () => {
   const events: string[] = [];
   const repository = {
-    async claimTask(_workerType: string, executionId: string) {
+    async claimTask(_workerType: string, _businessType: string, executionId: string) {
       events.push(`claim:${executionId}`);
       return true;
     }
@@ -649,6 +773,14 @@ test("完整批次先拿 execution lock，再改 processing；锁竞争时回滚
 
 test("跨进程平台租约使用两个 Worker 共享的稳定名称并有限等待", async () => {
   assert.equal(platformLeaseName("doubao"), "geno-rpa-platform:doubao");
+  assert.equal(
+    platformLeaseName("diagnosis", "doubao"),
+    "geno-rpa-platform:diagnosis:doubao"
+  );
+  assert.equal(
+    platformLeaseName("monitor", "doubao"),
+    "geno-rpa-platform:monitor:doubao"
+  );
   const leases = new FakeLeases();
   leases.responses = [false, false, true];
   let now = 0;

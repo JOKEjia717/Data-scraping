@@ -35,6 +35,54 @@ const DOUBAO_ANSWER_BLOCK_SELECTOR = '[data-plugin-identifier*="block_type:10000
 const DOUBAO_BASELINE_ANSWERS_KEY = "__codexDoubaoBaselineAnswerContainers";
 const DEEPSEEK_ANSWER_SELECTOR = ".ds-markdown.ds-assistant-message-main-content";
 const DEEPSEEK_REFERENCE_CONTAINER_SELECTOR = '[class~="_223dd7b"]';
+// DeepSeek 的哈希 class 会变；右侧“搜索结果”面板及其“每个直接子项包含一个
+// 外部链接”的卡片列表是更稳定的语义结构。所有 DeepSeek 引用路径共用该解析器。
+const DEEPSEEK_REFERENCE_CONTAINER_RESOLVER_SCRIPT = `
+  const resolveDeepSeekReferenceContainer = () => {
+    const isVisibleReferenceNode = (element) => {
+      if (!(element instanceof HTMLElement)) return false;
+      const rect = element.getBoundingClientRect();
+      const style = window.getComputedStyle(element);
+      return rect.width > 0 && rect.height > 0 &&
+        style.display !== "none" && style.visibility !== "hidden";
+    };
+
+    const legacy = Array.from(document.querySelectorAll('${DEEPSEEK_REFERENCE_CONTAINER_SELECTOR}'))
+      .filter(isVisibleReferenceNode);
+    if (legacy.length > 0) return legacy[legacy.length - 1];
+
+    const rightPanelRoots = Array.from(document.querySelectorAll("body div"))
+      .filter((element) => {
+        if (!isVisibleReferenceNode(element)) return false;
+        const rect = element.getBoundingClientRect();
+        const text = (element instanceof HTMLElement ? element.innerText : element.textContent || "")
+          .replace(/\\s+/g, " ").trim();
+        const linkCount = element.querySelectorAll("a[href], [data-url], [data-href]").length;
+        return rect.left >= window.innerWidth * 0.55 && rect.width >= 240 && rect.width <= 650 &&
+          /^搜索结果(?:\\s|$)/u.test(text) && linkCount > 0;
+      })
+      .sort((left, right) => {
+        const leftRect = left.getBoundingClientRect();
+        const rightRect = right.getBoundingClientRect();
+        return leftRect.width * leftRect.height - rightRect.width * rightRect.height;
+      });
+    const panelRoot = rightPanelRoots[0];
+    if (!panelRoot) return null;
+
+    const listCandidates = [panelRoot, ...Array.from(panelRoot.querySelectorAll("div, ul, ol"))]
+      .filter(isVisibleReferenceNode)
+      .map((element) => ({
+        element,
+        linkedChildren: Array.from(element.children).filter((child) =>
+          child.matches("a[href], [data-url], [data-href]") ||
+          Boolean(child.querySelector("a[href], [data-url], [data-href]"))
+        ).length
+      }))
+      .filter((candidate) => candidate.linkedChildren > 0)
+      .sort((left, right) => right.linkedChildren - left.linkedChildren);
+    return listCandidates[0]?.element || panelRoot;
+  };
+`;
 const QIANWEN_ANSWER_SELECTOR = [
   // data-chat-answers-wrap 与问题消息使用同一稳定 ID，流式阶段也会提前挂载。
   // 必须优先于回答完成后才出现的 class，避免第八题仍在流式挂载时误取第七题。
@@ -44,7 +92,13 @@ const QIANWEN_ANSWER_SELECTOR = [
   ".chat-answers-card-wrap .answer-common-card .qk-markdown",
   ".chat-answers-card-wrap .qk-markdown.qk-markdown-complete"
 ].join(", ");
-const QIANWEN_REFERENCE_TRIGGER_SELECTOR = '[class~="link-title-igf0OC"]';
+// 2026-08 千问当前来源入口使用稳定的 reference-link-anchor-* id；
+// reference-wrap-* 与旧 link-title-* 仅作兼容兜底，避免依赖哈希后缀。
+const QIANWEN_REFERENCE_TRIGGER_SELECTOR = [
+  '[id^="reference-link-anchor-"]',
+  '[class*="reference-wrap-"]',
+  '[class~="link-title-igf0OC"]'
+].join(", ");
 const QIANWEN_REFERENCE_LIST_SELECTOR = '[class~="list-XPxyL2"]';
 const QIANWEN_ANSWER_ACTION_SELECTOR =
   '[class~="hover:bg-tag"][class~="flex"][class~="size-6"][class~="cursor-pointer"]' +
@@ -202,7 +256,7 @@ const EXTRACT_REFERENCES_SCRIPT = `
 })()
 `;
 
-/** DeepSeek：只解析最后一个可见 _223dd7b 容器的直接引用卡片。 */
+/** DeepSeek：只解析最后一个可见来源面板的直接引用卡片。 */
 const EXTRACT_DEEPSEEK_SEARCH_RESULTS_SCRIPT = `
 (() => {
   const clean = (text) => (text || "").replace(/\\s+/g, " ").trim();
@@ -224,8 +278,8 @@ const EXTRACT_DEEPSEEK_SEARCH_RESULTS_SCRIPT = `
     return "";
   };
 
-  const containers = Array.from(document.querySelectorAll('[class~="_223dd7b"]')).filter(isVisible);
-  const container = containers[containers.length - 1];
+  ${DEEPSEEK_REFERENCE_CONTAINER_RESOLVER_SCRIPT}
+  const container = resolveDeepSeekReferenceContainer();
   if (!container) return [];
 
   // DeepSeek 的每条来源是 _223dd7b 的一个直接子节点。当前页面版本使用 div，
@@ -1072,14 +1126,8 @@ export async function waitForDeepSeekReferenceListStable(
   while (Date.now() - startedAt < timeoutMs) {
     const signature = await page.evaluate<string>(`
 (() => {
-  const isVisible = (element) => {
-    if (!(element instanceof HTMLElement)) return false;
-    const rect = element.getBoundingClientRect();
-    const style = window.getComputedStyle(element);
-    return rect.width > 0 && rect.height > 0 && style.display !== "none" && style.visibility !== "hidden";
-  };
-  const containers = Array.from(document.querySelectorAll('[class~="_223dd7b"]')).filter(isVisible);
-  const container = containers[containers.length - 1];
+  ${DEEPSEEK_REFERENCE_CONTAINER_RESOLVER_SCRIPT}
+  const container = resolveDeepSeekReferenceContainer();
   if (!container) return "";
   const urls = Array.from(container.querySelectorAll("a[href], [data-url], [data-href]"))
     .map((element) => element instanceof HTMLAnchorElement
@@ -1291,7 +1339,7 @@ export async function waitForQianwenReferenceListStable(
   return false;
 }
 
-/** 点击页面位置最靠后的 DeepSeek“X个网页”按钮，并返回 X。 */
+/** 点击页面位置最靠后的 DeepSeek“X个网页”入口，并返回 X。 */
 export async function revealLatestDeepSeekReferenceList(
   page: Page,
   timeoutMs = 30_000
@@ -1299,7 +1347,7 @@ export async function revealLatestDeepSeekReferenceList(
   const startedAt = Date.now();
 
   while (Date.now() - startedAt < timeoutMs) {
-    const buttons = await page.locator('[class~="f93f59e4"]').all().catch(() => []);
+    const buttons = await page.getByText(/^\s*\d+\s*个网页\s*$/u).all().catch(() => []);
     const candidates: Array<{ locator: Locator; expectedCount: number; y: number; domIndex: number }> = [];
 
     for (const [domIndex, locator] of buttons.entries()) {
@@ -1322,28 +1370,51 @@ export async function revealLatestDeepSeekReferenceList(
       continue;
     }
 
+    const panelAlreadyOpen = await hasVisibleDeepSeekReferencePanel(page);
+    if (panelAlreadyOpen) return latest.expectedCount;
+
     await latest.locator.scrollIntoViewIfNeeded({ timeout: 5_000 }).catch(() => undefined);
-    const clicked = await latest.locator.click({ timeout: 5_000 }).then(() => true).catch(() => false);
+    let clicked = await latest.locator.click({ timeout: 5_000 }).then(() => true).catch(() => false);
+    if (!clicked) {
+      // 页脚“内容由 AI 生成”在滚动动画中偶尔覆盖按钮。只对已经严格验证为
+      // 当前“X 个网页”的同一节点执行 DOM click，不扩大到任意历史控件。
+      clicked = await latest.locator.evaluate((element, expectedText) => {
+        const text = (element.textContent || "").replace(/\s+/g, " ").trim();
+        const expectedCount = Number.parseInt(expectedText, 10);
+        const actualCount = Number.parseInt(text.match(/^(\d+)\s*个网页$/u)?.[1] || "", 10);
+        if (!Number.isFinite(actualCount) || actualCount !== expectedCount) return false;
+        (element as HTMLElement).click();
+        return true;
+      }, String(latest.expectedCount)).catch(() => false);
+    }
     if (!clicked) {
       await page.waitForTimeout(250);
       continue;
     }
 
-    console.log(`[DeepSeek] 已点击最新回答的 ${latest.expectedCount}个网页（class=f93f59e4），等待引用列表打开`);
+    console.log(`[DeepSeek] 已点击最新回答的 ${latest.expectedCount}个网页入口，等待引用列表打开`);
     await page.waitForTimeout(750);
     const remainingMs = Math.max(timeoutMs - (Date.now() - startedAt), 250);
-    const panelReady = await page
-      .locator(`${DEEPSEEK_REFERENCE_CONTAINER_SELECTOR}:visible`)
-      .last()
-      .locator("a[href], [data-url], [data-href]")
-      .first()
-      .waitFor({ state: "attached", timeout: Math.min(5_000, remainingMs) })
-      .then(() => true)
-      .catch(() => false);
+    const panelDeadline = Date.now() + Math.min(5_000, remainingMs);
+    let panelReady = false;
+    while (Date.now() < panelDeadline && !panelReady) {
+      panelReady = await hasVisibleDeepSeekReferencePanel(page);
+      if (!panelReady) await page.waitForTimeout(200);
+    }
     if (panelReady) return latest.expectedCount;
   }
 
   return 0;
+}
+
+async function hasVisibleDeepSeekReferencePanel(page: Page): Promise<boolean> {
+  return page.evaluate<boolean>(`
+(() => {
+  ${DEEPSEEK_REFERENCE_CONTAINER_RESOLVER_SCRIPT}
+  const container = resolveDeepSeekReferenceContainer();
+  return Boolean(container?.querySelector("a[href], [data-url], [data-href]"));
+})()
+`).catch(() => false);
 }
 
 // 通用/旧版引用面板可能使用虚拟滚动，先复位再分段扫描才能收集完整列表。
@@ -2123,6 +2194,88 @@ export async function extractLatestDoubaoAnswer(page: Page): Promise<string> {
 }
 
 /**
+ * 千问正文优先从与问题共享 message-id 的回答容器中读取。新版 class 变化时，
+ * 会清理来源入口和操作控件后从配对容器本身取正文，不再把 `.qk-markdown`
+ * 当作唯一入口；没有 message-id 的旧页面才退回历史选择器。
+ */
+export async function extractLatestQianwenAnswer(page: Page): Promise<string> {
+  const candidateGroups = await page.evaluate((legacySelector) => {
+    const pairedAnswers = Array.from(document.querySelectorAll<HTMLElement>(
+      "[data-chat-answers-wrap]"
+    ));
+    const roots = pairedAnswers.length > 0
+      ? pairedAnswers.reverse()
+      : Array.from(document.querySelectorAll<HTMLElement>(legacySelector)).reverse();
+    const groups: string[][] = [];
+
+    for (const root of roots) {
+      const semanticCandidates = Array.from(root.querySelectorAll<HTMLElement>([
+        ".qk-markdown",
+        "[data-testid*='answer-content' i]",
+        "[data-testid*='markdown' i]",
+        "[class*='answer-content' i]",
+        "[class*='markdown' i]",
+        "article",
+        ".answer-common-card"
+      ].join(", ")));
+      const candidates = semanticCandidates.length > 0 ? semanticCandidates : [root];
+      const texts: string[] = [];
+
+      for (const candidate of candidates) {
+        const clone = candidate.cloneNode(true) as HTMLElement;
+        for (const removable of clone.querySelectorAll([
+          '[id^="reference-link-anchor-"]',
+          '[class*="reference-wrap-"]',
+          '[class~="link-title-igf0OC"]',
+          "button",
+          "[role='button']",
+          "[data-copy-ignore]",
+          "[class*='options-item-']",
+          "[class~='qk-md-has-multi-modal']",
+          "script",
+          "style",
+          "noscript",
+          "[aria-hidden='true']",
+          "[contenteditable='true']"
+        ].join(", "))) removable.remove();
+
+        clone.removeAttribute("class");
+        for (const styledNode of clone.querySelectorAll("[class]")) {
+          styledNode.removeAttribute("class");
+        }
+        const wrapper = document.createElement("div");
+        wrapper.style.cssText =
+          "position:fixed;left:-100000px;top:0;width:1000px;opacity:0;" +
+          "pointer-events:none;z-index:-1;";
+        wrapper.appendChild(clone);
+        document.body.appendChild(wrapper);
+        texts.push(clone.innerText || clone.textContent || "");
+        wrapper.remove();
+      }
+      groups.push(texts);
+    }
+
+    return groups;
+  }, QIANWEN_ANSWER_SELECTOR).catch(() => [] as string[][]);
+
+  for (const group of candidateGroups) {
+    let bestAnswer = "";
+    for (const rawText of group) {
+      const answer = cleanAnswerText(rawText);
+      const compact = answer.replace(/\s+/g, "");
+      const sourceOrControlOnly = /^(?:(?:参考)?来源|\d+篇来源|复制|重新生成|赞|踩|分享|更多)+$/u
+        .test(compact);
+      if (!sourceOrControlOnly && answer.length >= 4 && answer.length > bestAnswer.length) {
+        bestAnswer = answer;
+      }
+    }
+    if (bestAnswer) return bestAnswer;
+  }
+
+  return "";
+}
+
+/**
  * 提取指定平台当前会话中最后一版回答正文。
  *
  * DeepSeek 会移除正文内只用于标注来源编号的链接；千问会移除引用编号和
@@ -2134,12 +2287,11 @@ export async function extractLatestPlatformAnswer(
   platformId: PlatformId
 ): Promise<string> {
   if (platformId === "doubao") return extractLatestDoubaoAnswer(page);
+  if (platformId === "qianwen") return extractLatestQianwenAnswer(page);
 
   const selector = platformId === "deepseek"
     ? DEEPSEEK_ANSWER_SELECTOR
-    : platformId === "qianwen"
-      ? QIANWEN_ANSWER_SELECTOR
-      : YUANBAO_ANSWER_SELECTOR;
+    : YUANBAO_ANSWER_SELECTOR;
   const candidates = page.locator(selector);
   const count = await candidates.count().catch(() => 0);
 
@@ -2159,12 +2311,6 @@ export async function extractLatestPlatformAnswer(
         "[contenteditable='true']"
       ];
 
-      if (currentPlatformId === "qianwen") {
-        removableSelectors.push(
-          "[class*='options-item-']",
-          "[class~='qk-md-has-multi-modal']"
-        );
-      }
       if (currentPlatformId === "yuanbao") {
         removableSelectors.push("[class~='hyc-common-markdown__replace']");
       }
@@ -2219,7 +2365,50 @@ function cleanAnswerText(value: string): string {
 
 /** 统计 DeepSeek 已挂载的引用容器数量。 */
 export async function countDeepSeekReferenceContainers(page: Page): Promise<number> {
-  return page.locator(DEEPSEEK_REFERENCE_CONTAINER_SELECTOR).count().catch(() => 0);
+  return page.evaluate<number>(`
+(() => {
+  ${DEEPSEEK_REFERENCE_CONTAINER_RESOLVER_SCRIPT}
+  return resolveDeepSeekReferenceContainer() ? 1 : 0;
+})()
+`).catch(() => 0);
+}
+
+/**
+ * 从与当前问题相邻的 DeepSeek 回答项读取“已阅读/共 N 个网页”证据。该数值只
+ * 用于确认本题确实声明了来源，不能替代实际引用卡片抽取。
+ */
+export async function countCurrentDeepSeekWebReferences(
+  page: Page,
+  currentQuestion: string
+): Promise<number> {
+  return page.evaluate(({ expectedQuestion }) => {
+    const expectedIdentity = expectedQuestion
+      .normalize("NFKC")
+      .toLocaleLowerCase()
+      .replace(/[\s\p{P}\p{S}]+/gu, "");
+    const items = Array.from(document.querySelectorAll<HTMLElement>(
+      "[data-virtual-list-item-key]"
+    ));
+    let questionIndex = -1;
+    for (let index = items.length - 1; index >= 0; index -= 1) {
+      const directMessage = items[index]?.querySelector<HTMLElement>(":scope > .ds-message");
+      const identity = (directMessage?.innerText || directMessage?.textContent || "")
+        .normalize("NFKC")
+        .toLocaleLowerCase()
+        .replace(/[\s\p{P}\p{S}]+/gu, "");
+      if (identity === expectedIdentity) {
+        questionIndex = index;
+        break;
+      }
+    }
+    const answer = questionIndex >= 0 ? items[questionIndex + 1] : undefined;
+    if (!answer) return 0;
+    const text = (answer.innerText || answer.textContent || "").replace(/\s+/g, " ");
+    const counts = Array.from(text.matchAll(/(?:已阅读\s*)?(\d+)\s*个网页/gu))
+      .map((match) => Number.parseInt(match[1] || "", 10))
+      .filter((value) => Number.isFinite(value) && value > 0);
+    return counts.length > 0 ? Math.max(...counts) : 0;
+  }, { expectedQuestion: currentQuestion }).catch(() => 0);
 }
 
 /**
@@ -2307,22 +2496,29 @@ async function extractDeepSeekReferenceList(
   question: string,
   crawlPlatform: string
 ): Promise<ReferenceRecord[]> {
-  const visibleContainers = page.locator(`${DEEPSEEK_REFERENCE_CONTAINER_SELECTOR}:visible`);
-  const containerCount = await visibleContainers.count().catch(() => 0);
-  if (containerCount === 0) {
-    console.log("[DeepSeek] 没有找到可见的 ._223dd7b 参考文献容器，不执行整页链接回退抽取。");
+  const containerSnapshot = await page.evaluate<{
+    className: string;
+    directChildCount: number;
+    linkCount: number;
+  } | null>(`
+(() => {
+  ${DEEPSEEK_REFERENCE_CONTAINER_RESOLVER_SCRIPT}
+  const container = resolveDeepSeekReferenceContainer();
+  if (!container) return null;
+  return {
+    className: typeof container.className === "string" ? container.className : "",
+    directChildCount: container.children.length,
+    linkCount: container.querySelectorAll("a[href], [data-url], [data-href]").length
+  };
+})()
+`).catch(() => null);
+  if (!containerSnapshot) {
+    console.log("[DeepSeek] 没有找到可见的当前回答搜索结果面板，不执行整页链接回退抽取。");
     return [];
   }
-
-  const container = visibleContainers.last();
-  const [containerClass, directChildCount, linkCount] = await Promise.all([
-    container.getAttribute("class").catch(() => ""),
-    container.locator(":scope > *").count().catch(() => 0),
-    container.locator("a[href], [data-url], [data-href]").count().catch(() => 0)
-  ]);
   console.log(
-    `[DeepSeek] 命中最新可见引用容器 class=${JSON.stringify(containerClass || "")}` +
-    `，直接子节点=${directChildCount}，候选链接=${linkCount}`
+    `[DeepSeek] 命中最新可见引用容器 class=${JSON.stringify(containerSnapshot.className)}` +
+    `，直接子节点=${containerSnapshot.directChildCount}，候选链接=${containerSnapshot.linkCount}`
   );
 
   const records = await extractStructuredSearchResults(

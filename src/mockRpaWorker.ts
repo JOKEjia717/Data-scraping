@@ -21,7 +21,7 @@ import { BrandBatchScheduler, type BrandBatch } from "./scheduler.js";
 import { classifyTechnicalError, type WorkerErrorCode } from "./browserDiagnostics.js";
 import type { PlatformId, ReferenceRecord } from "./types.js";
 
-export const MOCK_BUSINESS_TYPES = ["DIAGNOSIS", "ARTICLE_PROBE"] as const;
+export const MOCK_BUSINESS_TYPES = ["DIAGNOSIS", "ARTICLE_PROBE", "ENTRY_MONITOR"] as const;
 export type MockBusinessType = (typeof MOCK_BUSINESS_TYPES)[number];
 
 export interface MockRpaTask {
@@ -34,6 +34,10 @@ export interface MockRpaTask {
   aiModelId: string;
   aiModelName: string;
   deepThinking: boolean;
+  projectId?: string;
+  intentEntryId?: string;
+  monitorDate?: string;
+  repetitionNo?: number;
 }
 
 export type MockExecutionStatus = "PENDING" | "RUNNING" | "SUCCESS" | "FAILED";
@@ -495,8 +499,16 @@ export class MockRpaWorker {
 /** tenant + 业务类型 + 业务任务共同形成调度业务组，避免跨租户误合批。 */
 export function createMockBusinessGroupId(task: Pick<
   MockRpaTask,
-  "tenantKey" | "businessType" | "businessTaskId"
+  "tenantKey" | "businessType" | "businessTaskId" | "projectId" | "monitorDate"
 >): string {
+  if (task.businessType === "ENTRY_MONITOR") {
+    return JSON.stringify([
+      task.tenantKey,
+      task.businessType,
+      task.projectId,
+      task.monitorDate
+    ]);
+  }
   return JSON.stringify([task.tenantKey, task.businessType, task.businessTaskId]);
 }
 
@@ -524,7 +536,7 @@ export function normalizeMockRpaTasks(input: unknown): MockRpaTask[] {
       !(MOCK_BUSINESS_TYPES as readonly string[]).includes(businessType)
     ) {
       throw new Error(
-        `第 ${index + 1} 个 Mock 任务 businessType 只能是 DIAGNOSIS 或 ARTICLE_PROBE。`
+        `第 ${index + 1} 个 Mock 任务 businessType 只能是 DIAGNOSIS 或 ARTICLE_PROBE，或 ENTRY_MONITOR。`
       );
     }
     const aiModelId = requireString(rawTask.aiModelId, index, "aiModelId");
@@ -543,6 +555,24 @@ export function normalizeMockRpaTasks(input: unknown): MockRpaTask[] {
       aiModelName: requireString(rawTask.aiModelName, index, "aiModelName"),
       deepThinking: rawTask.deepThinking
     };
+    if (businessType === "ENTRY_MONITOR") {
+      const repetitionNo = Number(rawTask.repetitionNo);
+      if (!Number.isSafeInteger(repetitionNo) || repetitionNo <= 0) {
+        throw new Error(`第 ${index + 1} 个 Mock 任务 repetitionNo 必须是正整数。`);
+      }
+      const monitorDate = requireString(rawTask.monitorDate, index, "monitorDate");
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(monitorDate)) {
+        throw new Error(`第 ${index + 1} 个 Mock 任务 monitorDate 必须是 YYYY-MM-DD。`);
+      }
+      normalizedTask.projectId = requireString(rawTask.projectId, index, "projectId");
+      normalizedTask.intentEntryId = requireString(
+        rawTask.intentEntryId,
+        index,
+        "intentEntryId"
+      );
+      normalizedTask.monitorDate = monitorDate;
+      normalizedTask.repetitionNo = repetitionNo;
+    }
     resolveMockPlatformId(normalizedTask);
     return normalizedTask;
   });

@@ -3,6 +3,7 @@ import fs from "node:fs";
 import {
   closeRpaWorkerSession,
   createRpaWorkerSession,
+  RpaWorkerRestartRequiredError,
   runRpaWorkerOnce,
   type RpaWorkerRunSummary,
   type RpaWorkerSession
@@ -59,6 +60,7 @@ export interface DefaultCycleRunnerOptions {
     onProgress?: (stage: string) => void
   ) => Promise<RpaWorkerRunSummary>;
   closeSession?: (session: RpaWorkerSession) => Promise<void>;
+  abortCleanupMs?: number;
 }
 
 export class DefaultRpaWorkerCycleRunner implements RpaWorkerCycleRunner {
@@ -67,6 +69,8 @@ export class DefaultRpaWorkerCycleRunner implements RpaWorkerCycleRunner {
   private readonly closeSession: NonNullable<DefaultCycleRunnerOptions["closeSession"]>;
   private closed = false;
   private closePromise?: Promise<void>;
+  private activeRun?: Promise<RpaWorkerRunSummary>;
+  private readonly abortCleanupMs: number;
 
   constructor(
     private readonly config: RpaWorkerConfig,
@@ -77,6 +81,7 @@ export class DefaultRpaWorkerCycleRunner implements RpaWorkerCycleRunner {
     this.executeOnce = options.runOnce ?? ((workerConfig, session, shouldStop, onProgress) =>
       runRpaWorkerOnce(workerConfig, { shouldStop, session, onProgress }));
     this.closeSession = options.closeSession ?? closeRpaWorkerSession;
+    this.abortCleanupMs = options.abortCleanupMs ?? 30_000;
   }
 
   runOnce(
@@ -84,11 +89,30 @@ export class DefaultRpaWorkerCycleRunner implements RpaWorkerCycleRunner {
     onProgress?: (stage: string) => void
   ): Promise<RpaWorkerRunSummary> {
     if (this.closed) throw new Error("RPA Worker CycleRunner 已关闭。");
-    return this.executeOnce(this.config, this.session, shouldStop, onProgress);
+    if (this.activeRun) throw new Error("RPA Worker CycleRunner already has an active run.");
+    const running = this.executeOnce(this.config, this.session, shouldStop, onProgress);
+    const tracked = running.finally(() => {
+      if (this.activeRun === tracked) this.activeRun = undefined;
+    });
+    this.activeRun = tracked;
+    return tracked;
   }
 
-  abort(_reason: Error): Promise<void> {
-    return this.close();
+  async abort(reason: Error): Promise<void> {
+    // Disconnect CDP first so stuck DOM waits reject and the execution layer
+    // can roll back safe claims while database leases are still usable. This
+    // only closes Playwright's client connection, not the user's Chrome.
+    const browser = this.session.browserRuntime?.browser;
+    this.session.browserRuntime = undefined;
+    if (browser?.isConnected()) {
+      await browser.close({ reason: reason.message }).catch(() => undefined);
+    }
+
+    const activeRun = this.activeRun;
+    if (activeRun) {
+      await settleOrTimeout(activeRun, this.abortCleanupMs);
+    }
+    await this.close();
   }
 
   async close(): Promise<void> {
@@ -201,7 +225,10 @@ export class RpaWorkerService {
             `Worker 轮询失败：${boundedError(error)}`,
             classifyRuntimeError(error)
           );
-          if (error instanceof WorkerStalledError) throw error;
+          if (
+            error instanceof WorkerStalledError ||
+            error instanceof RpaWorkerRestartRequiredError
+          ) throw error;
           if (oneShot || this.stopRequested) {
             if (oneShot) throw error;
             break;
@@ -249,6 +276,9 @@ export class RpaWorkerService {
           return this.stopRequested;
         },
         (stage) => {
+          // A successful DB lease heartbeat only proves process liveness. It
+          // is not browser/task progress and must not mask a stuck question.
+          if (stage === "execution-heartbeat") return;
           lastStage = stage;
           resetTimer();
         }
@@ -333,4 +363,18 @@ function jitter(maximum: number, random: () => number): number {
 
 function boundedError(error: unknown): string {
   return safeErrorSummary(error);
+}
+
+function settleOrTimeout(promise: Promise<unknown>, timeoutMs: number): Promise<void> {
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve();
+    };
+    const timer = setTimeout(finish, timeoutMs);
+    void promise.then(finish, finish);
+  });
 }

@@ -32,6 +32,8 @@ export const PLATFORMS: Record<PlatformId, PlatformConfig> = {
       "[role='textbox']"
     ],
     sendButtonSelectors: [
+      "button[data-testid*='send' i]",
+      "[role='button'][data-testid*='send' i]",
       "button[aria-label*='发送']",
       "button[title*='发送']",
       "button:has-text('发送')",
@@ -92,6 +94,11 @@ export const PLATFORMS: Record<PlatformId, PlatformConfig> = {
       "[role='textbox']"
     ],
     sendButtonSelectors: [
+      // DeepSeek 当前发送控件是带 role=button 的 div。只匹配稳定的 ds-button token，
+      // 不依赖每次构建都会变化的哈希 class（例如 _52c986b）。
+      "[role='button'][class~='ds-button--primary'][class~='ds-button--filled'][class~='ds-button--circle']",
+      "button[data-testid*='send' i]",
+      "[role='button'][data-testid*='send' i]",
       "button[aria-label*='发送']",
       "button[title*='发送']",
       "button:has-text('发送')",
@@ -173,6 +180,8 @@ export const PLATFORMS: Record<PlatformId, PlatformConfig> = {
       // 黑色圆形发送按钮。class 使用 token 匹配，不依赖完整 class 或排列顺序。
       "button[class~='bg-black-button'][class~='rounded-full'][class~='cursor-pointer'][class~='size-8']",
       "[role='button'][class~='bg-black-button'][class~='rounded-full'][class~='cursor-pointer'][class~='size-8']",
+      "button[data-testid*='send' i]",
+      "[role='button'][data-testid*='send' i]",
       "button[aria-label*='发送']",
       "button[title*='发送']",
       "button:has-text('发送')",
@@ -220,11 +229,22 @@ export const PLATFORMS: Record<PlatformId, PlatformConfig> = {
         "[role='switch'][aria-label*='深度思考']",
         "[role='switch'][aria-label*='思考']",
         "[role='button']:has-text('深度思考')"
-      ]
+      ],
+      // 新版千问将关闭态显示为“快速”模式下拉菜单，不再展示旧版“思考”开关。
+      disabledStateSelectors: [
+        "button[aria-label='快速'][aria-haspopup='menu']",
+        "button[aria-label='快速'][aria-expanded]"
+      ],
+      // 默认任务要求关闭深度思考。若千问再次改版导致模式控件暂时不可见，
+      // 记录 actual=null/degraded=true 后继续，避免整个平台被 DOM_CHANGED 暂停。
+      allowMissingControlWhenDisabled: true
     },
     referenceRevealSelectors: [
+      "[id^='reference-link-anchor-']",
+      "[class*='reference-wrap-']",
       "[class~='link-title-igf0OC']",
       "text=/参考来源\\s*\\(\\d+\\)/",
+      "text=/\\d+\\s*篇来源/",
       "text=参考来源",
       "button:has-text('参考')",
       "button:has-text('参考来源')",
@@ -259,6 +279,10 @@ export const PLATFORMS: Record<PlatformId, PlatformConfig> = {
       "input[type='text']"
     ],
     sendButtonSelectors: [
+      "button[data-desc*='send' i]",
+      "[role='button'][data-desc*='send' i]",
+      "button[data-testid*='send' i]",
+      "[role='button'][data-testid*='send' i]",
       "button[aria-label*='发送']",
       "button[title*='发送']",
       "button:has-text('发送')",

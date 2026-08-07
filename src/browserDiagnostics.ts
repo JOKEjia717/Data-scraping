@@ -28,6 +28,11 @@ export const WORKER_ERROR_CODES = [
   "OUTBOX_CORRUPTED",
   "PLATFORM_BLOCKED",
   "REFERENCE_UNKNOWN",
+  "INVALID_EXECUTION_CONTEXT",
+  "WORKER_BUSINESS_MISMATCH",
+  "DATE_WINDOW_EXPIRED",
+  "CONVERSATION_RESTORE_FAILED",
+  "AMBIGUOUS_RECOVERY",
   "TECHNICAL_FAILURE"
 ] as const;
 
@@ -66,6 +71,8 @@ export interface BrowserSelfCheckOptions {
   cdpEndpoint: string;
   platforms: readonly PlatformConfig[];
   inputTimeoutMs?: number;
+  /** Worker recovery may open a fresh same-profile tab when CDP cannot enumerate the old one. */
+  openMissingTabs?: boolean;
   onPlatformFailure?: (
     result: PlatformSelfCheckResult,
     page?: Page
@@ -234,14 +241,33 @@ export async function runBrowserSelfCheck(
   const pages = browser.contexts().flatMap((context) => context.pages());
   const platforms = emptyPlatformResults();
   for (const config of options.platforms) {
-    const page = findPlatformPage(pages, config);
+    let page = findPlatformPage(pages, config);
+    let openError: unknown;
+    if (!page && options.openMissingTabs) {
+      try {
+        const context = browser.contexts()[0];
+        if (!context) throw new Error("CDP browser has no default context");
+        page = await context.newPage();
+        await page.goto(config.url, {
+          waitUntil: "domcontentloaded",
+          timeout: 30_000
+        });
+        pages.push(page);
+      } catch (error) {
+        openError = error;
+        if (page && !page.isClosed()) await page.close().catch(() => undefined);
+        page = undefined;
+      }
+    }
     if (!page) {
       const result: PlatformSelfCheckResult = {
         platformId: config.id,
         ready: false,
         errorCode: "PLATFORM_TAB_MISSING",
         healthStatus: "DISABLED",
-        reason: `没有找到已打开的 ${config.name} 标签页`
+        reason: openError
+          ? `没有找到已打开的 ${config.name} 标签页，自动打开失败：${boundedErrorMessage(openError)}`
+          : `没有找到已打开的 ${config.name} 标签页`
       };
       platforms[config.id] = result;
       await notifyPlatformFailure(options, result);

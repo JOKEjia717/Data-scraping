@@ -14,6 +14,7 @@ import {
   executeQuestion,
   inspectCurrentQuestionAnswer,
   inspectDeepSeekQuestionAttempt,
+  hasExactUnsubmittedComposerDraft,
   inspectQianwenQuestionAttempt,
   isAnswerGenerating,
   isAnswerGeneratingControlText,
@@ -28,6 +29,7 @@ import {
 import { openNewConversation } from "../src/conversationManager.js";
 import {
   clickLatestQianwenRegenerate,
+  countCurrentDeepSeekWebReferences,
   countDoubaoSearchResultBlocks,
   countQianwenReferenceTriggers,
   countYuanbaoReferenceTriggers,
@@ -322,6 +324,85 @@ test("千问 Apple 语义发送按钮与 Windows class 发送按钮都可定位"
   await page.close();
 });
 
+test("DeepSeek 发送按钮使用稳定 class token 且不依赖哈希 class", async () => {
+  assert.ok(browser);
+  const page = await browser.newPage();
+  await page.setContent(`
+    <div
+      id="deepseek-send"
+      role="button"
+      tabindex="0"
+      class="ds-button ds-button--primary ds-button--filled ds-button--circle ds-button--m _anotherBuildHash"
+    ></div>
+  `);
+
+  const matches = await Promise.all(
+    PLATFORMS.deepseek.sendButtonSelectors.map((selector) =>
+      page.locator(`${selector}#deepseek-send`).count().catch(() => 0)
+    )
+  );
+  assert.equal(matches.some((count) => count === 1), true);
+  assert.equal(
+    PLATFORMS.deepseek.sendButtonSelectors.some((selector) => selector.includes("_52c986b")),
+    false
+  );
+  await page.close();
+});
+
+test("DeepSeek 常规点击和 Enter 均失效时仅对明确未提交草稿补一次 DOM click", async () => {
+  assert.ok(browser);
+  const page = await browser.newPage();
+  const question = "DeepSeek DOM click 安全兜底测试";
+  await page.setContent(`
+    <main id="conversation"></main>
+    <textarea></textarea>
+    <div role="button" tabindex="0" style="width:34px;height:34px"
+      class="ds-button ds-button--primary ds-button--filled ds-button--circle"></div>
+    <script>
+      const input = document.querySelector("textarea");
+      document.querySelector('[role="button"]').addEventListener("click", (event) => {
+        // 真实鼠标点击 detail=1 被站点吞掉；HTMLElement.click() 的 detail=0 才进入提交。
+        if (event.detail !== 0) return;
+        const question = input.value;
+        input.value = "";
+        document.querySelector("#conversation").insertAdjacentHTML(
+          "beforeend",
+          '<div data-virtual-list-item-key="question-1"><div class="ds-message">' +
+            question +
+          '</div></div>'
+        );
+      });
+      input.addEventListener("keydown", (event) => {
+        if (event.key === "Enter") event.preventDefault();
+      });
+    </script>
+  `);
+
+  await submitQuestion(page, PLATFORMS.deepseek, question, 400);
+  assert.equal(await page.locator("textarea").inputValue(), "");
+  await page.close();
+});
+
+test("DeepSeek 仅在精确草稿存在且没有同题问题消息时允许安全重试", async () => {
+  assert.ok(browser);
+  const page = await browser.newPage();
+  const question = "仍未提交的问题";
+  await page.setContent(`<textarea>${question}</textarea><main></main>`);
+  assert.equal(
+    await hasExactUnsubmittedComposerDraft(page, PLATFORMS.deepseek, question),
+    true
+  );
+
+  await page.locator("main").evaluate((element, value) => {
+    element.innerHTML = `<div data-virtual-list-item-key="question-1"><div class="ds-message">${value}</div></div>`;
+  }, question);
+  assert.equal(
+    await hasExactUnsubmittedComposerDraft(page, PLATFORMS.deepseek, question),
+    false
+  );
+  await page.close();
+});
+
 test("并行新建对话时输入框持续动画也能直接填充并发送", async () => {
   assert.ok(browser);
   const page = await browser.newPage();
@@ -331,10 +412,25 @@ test("并行新建对话时输入框持续动画也能直接填充并发送", as
       textarea { animation: moving-input 300ms linear infinite alternate; }
     </style>
     <textarea placeholder="给 DeepSeek 发送消息"></textarea>
-    <button aria-label="发送" type="button">发送</button>
+    <main id="conversation"></main>
+    <div
+      role="button"
+      tabindex="0"
+      class="ds-button ds-button--primary ds-button--filled ds-button--circle ds-button--m _dynamicHash"
+      style="width:34px;height:34px"
+    ></div>
     <script>
-      document.querySelector("button").addEventListener("click", () => {
-        document.body.dataset.submitted = document.querySelector("textarea").value;
+      document.querySelector('[role="button"]').addEventListener("click", () => {
+        const input = document.querySelector("textarea");
+        const question = input.value;
+        document.body.dataset.submitted = question;
+        input.value = "";
+        document.querySelector("#conversation").insertAdjacentHTML(
+          "beforeend",
+          '<div data-virtual-list-item-key="question-1"><div class="ds-message">' +
+            question +
+          '</div></div>'
+        );
       });
     </script>
   `);
@@ -344,6 +440,75 @@ test("并行新建对话时输入框持续动画也能直接填充并发送", as
   assert.equal(
     await page.locator("body").getAttribute("data-submitted"),
     "四平台并行输入稳定性测试"
+  );
+  await page.close();
+});
+
+test("四个平台找不到发送按钮时都用 Enter 兜底并确认输入清空与问题气泡", async () => {
+  assert.ok(browser);
+  const question = "四平台 Enter 发送兜底测试";
+  const bubbles = {
+    doubao: `<div data-message-id="question-1" class="justify-end">${question}</div>`,
+    deepseek: `<div data-virtual-list-item-key="question-1"><div class="ds-message">${question}</div></div>`,
+    qianwen: `<div data-chat-question-wrap="question-1">${question}</div>`,
+    yuanbao: `<div data-conv-speaker="human" data-conv-idx="1">${question}</div>`
+  } as const;
+
+  for (const platformId of ["doubao", "deepseek", "qianwen", "yuanbao"] as const) {
+    const page = await browser.newPage();
+    await page.setContent(`
+      <main id="conversation"></main>
+      <textarea></textarea>
+      <script>
+        document.querySelector("textarea").addEventListener("keydown", (event) => {
+          if (event.key !== "Enter") return;
+          event.preventDefault();
+          const input = event.currentTarget;
+          input.value = "";
+          document.querySelector("#conversation").insertAdjacentHTML(
+            "beforeend",
+            ${JSON.stringify(bubbles[platformId])}
+          );
+          document.body.dataset.enterSent = "true";
+        });
+      </script>
+    `);
+
+    await submitQuestion(page, PLATFORMS[platformId], question, 2_000);
+    assert.equal(
+      await page.locator("body").getAttribute("data-enter-sent"),
+      "true",
+      `${platformId} 应通过 Enter 发送`
+    );
+    assert.equal(await page.locator("textarea").inputValue(), "");
+    await page.close();
+  }
+});
+
+test("问题气泡已出现但输入框未清空时不能确认发送成功", async () => {
+  assert.ok(browser);
+  const page = await browser.newPage();
+  await page.setContent(`
+    <main id="conversation"></main>
+    <textarea></textarea>
+    <div role="button" tabindex="0"
+      class="ds-button ds-button--primary ds-button--filled ds-button--circle"></div>
+    <script>
+      document.querySelector('[role="button"]').addEventListener("click", () => {
+        const question = document.querySelector("textarea").value;
+        document.querySelector("#conversation").insertAdjacentHTML(
+          "beforeend",
+          '<div data-virtual-list-item-key="question-1"><div class="ds-message">' +
+            question +
+          '</div></div>'
+        );
+      });
+    </script>
+  `);
+
+  await assert.rejects(
+    () => submitQuestion(page, PLATFORMS.deepseek, "输入框未清空测试", 500),
+    /输入框未清空.*不会自动重复发送/
   );
   await page.close();
 });
@@ -1066,6 +1231,78 @@ test("DeepSeek 按虚拟列表相邻项恢复当前题回答，不受正文引�
   await page.close();
 });
 
+test("豆包恢复检查在问题气泡回收后只接受提交基线之后的稳定回答", async () => {
+  assert.ok(browser);
+  const page = await browser.newPage();
+  const question = "本题问题气泡随后会被虚拟列表回收";
+  const searchBlock = "block_type:10025 | search_query_result_block.search_type:1";
+  await page.setContent(`
+    <main id="conversation">
+      <div data-message-id="old-q" class="justify-end">历史问题</div>
+      <div data-message-id="old-a">
+        <div data-container-type="block-v2" id="old-answer">
+          <div data-plugin-identifier="block_type:10000">历史回答，不能误判为本题</div>
+          <div data-plugin-identifier="${searchBlock}">搜索 1 个关键词，参考 1 篇资料</div>
+        </div>
+      </div>
+    </main>
+  `);
+  await markDoubaoSearchResultBaseline(page);
+
+  await page.locator("#conversation").evaluate((conversation, currentSearchBlock) => {
+    conversation.insertAdjacentHTML("beforeend", `
+      <div data-message-id="current-a">
+        <div data-container-type="block-v2" id="current-answer">
+          <div data-plugin-identifier="${currentSearchBlock}">
+            搜索 3 个关键词，参考 9 篇资料
+          </div>
+          <div data-plugin-identifier="block_type:10000">这是基线之后新增的本题最终回答。</div>
+        </div>
+      </div>
+    `);
+  }, searchBlock);
+
+  assert.equal((await page.locator("body").innerText()).includes(question), false);
+  const inspection = await inspectCurrentQuestionAnswer(
+    page,
+    PLATFORMS.doubao,
+    question,
+    "business"
+  );
+  assert.equal(inspection.status, "answered", inspection.reason);
+  assert.equal(inspection.answerContent, "这是基线之后新增的本题最终回答。");
+  assert.equal(inspection.answerContent?.includes("历史回答"), false);
+  await page.close();
+});
+
+test("豆包问题气泡缺失且基线后没有新增内容时不会误收历史回答", async () => {
+  assert.ok(browser);
+  const page = await browser.newPage();
+  const searchBlock = "block_type:10025 | search_query_result_block.search_type:1";
+  await page.setContent(`
+    <main>
+      <div data-message-id="old-q" class="justify-end">历史问题</div>
+      <div data-message-id="old-a">
+        <div data-container-type="block-v2">
+          <div data-plugin-identifier="${searchBlock}">搜索 2 个关键词，参考 6 篇资料</div>
+          <div data-plugin-identifier="block_type:10000">页面中可见的历史完整回答。</div>
+        </div>
+      </div>
+    </main>
+  `);
+  await markDoubaoSearchResultBaseline(page);
+
+  const inspection = await inspectCurrentQuestionAnswer(
+    page,
+    PLATFORMS.doubao,
+    "当前已被回收且没有新增证据的问题",
+    "business"
+  );
+  assert.equal(inspection.status, "uncertain");
+  assert.equal(inspection.answerContent, undefined);
+  await page.close();
+});
+
 test("千问新版 complete 回答节点延迟挂载时只等待恢复而不重新提问", async () => {
   assert.ok(browser);
   const page = await browser.newPage();
@@ -1301,6 +1538,116 @@ test("千问恢复检查会等待本题回答节点和完成标记异步挂载",
   assert.equal(structured.answerComplete, true);
   assert.equal(structured.hasReferenceTrigger, true);
   assert.equal(await countQianwenReferenceTriggers(page), 2);
+  await page.close();
+});
+
+test("千问新版 reference-link-anchor 来源入口可确认未带 complete class 的回答已完成", async () => {
+  assert.ok(browser);
+  const page = await browser.newPage();
+  const question = "美妆/口红领域中，哪些品牌是主要参与者？";
+  await page.setContent(`
+    <main>
+      <div data-chat-question-wrap="message-current">${question}</div>
+      <div data-chat-answers-wrap="message-current">
+        <div class="qk-markdown">这是千问已经生成完毕的完整回答正文。</div>
+        <div
+          class="reference-wrap-iEjeb3"
+          id="reference-link-anchor-e1f940a915cc411b8c27a5de3092232d"
+        >
+          <div><div class="link-title-igf00C">10篇来源</div></div>
+        </div>
+      </div>
+    </main>
+    <script>
+      document.querySelector('[id^="reference-link-anchor-"]').addEventListener("click", () => {
+        document.body.dataset.referenceOpened = "true";
+        document.body.insertAdjacentHTML(
+          "beforeend",
+          '<div class="list-XPxyL2"><div><a href="https://example.com/source">来源</a></div></div>'
+        );
+      });
+    </script>
+  `);
+
+  const structured = await inspectQianwenQuestionAttempt(page, question);
+  assert.equal(structured.status, "answered");
+  assert.equal(structured.answerComplete, false);
+  assert.equal(structured.hasReferenceTrigger, true);
+  assert.equal(await countQianwenReferenceTriggers(page), 1);
+
+  const inspection = await inspectCurrentQuestionAnswer(
+    page,
+    PLATFORMS.qianwen,
+    question,
+    "business"
+  );
+  assert.equal(inspection.status, "answered", inspection.reason);
+  assert.equal(inspection.answerContent, "这是千问已经生成完毕的完整回答正文。");
+  assert.equal(await revealLatestQianwenReferenceList(page, 0, 1_000), 10);
+  assert.equal(await page.locator("body").getAttribute("data-reference-opened"), "true");
+  await page.close();
+});
+
+test("千问在 qk-markdown 消失后按配对 ID、来源入口和稳定正文确认完成", async () => {
+  assert.ok(browser);
+  const page = await browser.newPage();
+  const question = "测试千问改版后正文容器识别";
+  await page.setContent(`
+    <main>
+      <div data-chat-question-wrap="message-v2">${question}</div>
+      <div data-chat-answers-wrap="message-v2">
+        <section class="rendered-response-v2" id="current-text">正在组织本题回答的第一版正文。</section>
+        <div class="reference-wrap-v2" id="reference-link-anchor-current">9篇来源</div>
+        <button>复制</button>
+      </div>
+    </main>
+    <script>
+      setTimeout(() => {
+        document.querySelector("#current-text").textContent =
+          "这是没有 qk-markdown class 的本题最终稳定回答正文。";
+      }, 600);
+    </script>
+  `);
+
+  const early = await inspectQianwenQuestionAttempt(page, question);
+  assert.equal(early.status, "answered");
+  assert.equal(early.hasReferenceTrigger, true);
+  assert.equal(early.answerComplete, false);
+
+  const inspection = await inspectCurrentQuestionAnswer(
+    page,
+    PLATFORMS.qianwen,
+    question,
+    "business"
+  );
+  assert.equal(inspection.status, "answered", inspection.reason);
+  assert.equal(
+    inspection.answerContent,
+    "这是没有 qk-markdown class 的本题最终稳定回答正文。"
+  );
+  assert.equal(
+    await extractLatestPlatformAnswer(page, "qianwen"),
+    "这是没有 qk-markdown class 的本题最终稳定回答正文。"
+  );
+  await page.close();
+});
+
+test("千问配对容器只有来源入口而没有正文时仍保持 pending", async () => {
+  assert.ok(browser);
+  const page = await browser.newPage();
+  await page.setContent(`
+    <main>
+      <div data-chat-question-wrap="message-empty">当前问题</div>
+      <div data-chat-answers-wrap="message-empty">
+        <div class="reference-wrap-v2" id="reference-link-anchor-empty">9篇来源</div>
+        <button>复制</button>
+      </div>
+    </main>
+  `);
+
+  const inspection = await inspectQianwenQuestionAttempt(page, "当前问题");
+  assert.equal(inspection.status, "pending");
+  assert.equal(inspection.answerContent, undefined);
   await page.close();
 });
 
@@ -1664,6 +2011,73 @@ test("DeepSeek 必须点击最新 f93f59e4 的 X个网页按钮后再打开引�
 
   const records = await extractReferences(page, "测试问题", "DeepSeek");
   assert.deepEqual(records.map((record) => record.title), ["当前引用一", "当前引用二"]);
+  await page.close();
+});
+
+test("DeepSeek 来源按钮被页脚遮挡时精确 DOM 点击并识别无哈希来源面板", async () => {
+  assert.ok(browser);
+  const page = await browser.newPage({ viewport: { width: 1200, height: 800 } });
+  await page.setContent(`
+    <main>
+      <div id="current-web-pages" class="web-source-entry-v2" style="position:absolute;left:300px;top:500px">
+        2 个网页
+      </div>
+      <div id="footer-cover" style="position:fixed;left:250px;top:470px;width:300px;height:100px;z-index:20">
+        内容由 AI 生成，请仔细甄别
+      </div>
+    </main>
+    <script>
+      let clickCount = 0;
+      document.querySelector("#current-web-pages").addEventListener("click", () => {
+        clickCount += 1;
+        document.body.dataset.sourceClickCount = String(clickCount);
+        if (document.querySelector("#semantic-search-panel")) return;
+        document.body.insertAdjacentHTML("beforeend", ` + "`" + `
+          <div id="semantic-search-panel" style="position:fixed;right:0;top:0;width:380px;height:760px;background:white">
+            <h2>搜索结果</h2>
+            <div class="new-reference-list">
+              <article><a href="https://semantic.example.com/one"><h3>语义引用一</h3></a></article>
+              <article><a href="https://semantic.example.com/two"><h3>语义引用二</h3></a></article>
+            </div>
+          </div>
+        ` + "`" + `);
+      });
+    </script>
+  `);
+
+  const expectedCount = await revealLatestDeepSeekReferenceList(page, 8_000);
+  assert.equal(expectedCount, 2);
+  assert.equal(await page.locator("body").getAttribute("data-source-click-count"), "1");
+  assert.equal(await page.locator("._223dd7b").count(), 0);
+  assert.equal(await waitForDeepSeekReferenceListStable(page, 5_000, expectedCount), true);
+  assert.equal(await revealLatestDeepSeekReferenceList(page, 2_000), 2);
+  assert.equal(
+    await page.locator("body").getAttribute("data-source-click-count"),
+    "1",
+    "面板已打开时不能再次点击并切换关闭"
+  );
+  const records = await extractReferences(page, "测试问题", "DeepSeek");
+  assert.deepEqual(records.map((record) => record.title), ["语义引用一", "语义引用二"]);
+  await page.close();
+});
+
+test("DeepSeek 只从当前问题相邻回答读取已阅读网页数量", async () => {
+  assert.ok(browser);
+  const page = await browser.newPage();
+  const question = "当前云存储问题";
+  await page.setContent(`
+    <main>
+      <div data-virtual-list-item-key="old-q"><div class="ds-message">历史问题</div></div>
+      <div data-virtual-list-item-key="old-a"><div class="ds-message">已阅读 99 个网页</div></div>
+      <div data-virtual-list-item-key="current-q"><div class="ds-message">${question}</div></div>
+      <div data-virtual-list-item-key="current-a">
+        <div class="ds-message"><div>已阅读 12 个网页</div><div class="f93f59e4">12 个网页</div></div>
+      </div>
+    </main>
+  `);
+
+  assert.equal(await countCurrentDeepSeekWebReferences(page, question), 12);
+  assert.equal(await countCurrentDeepSeekWebReferences(page, "不存在的问题"), 0);
   await page.close();
 });
 

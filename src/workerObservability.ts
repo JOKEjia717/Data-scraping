@@ -20,6 +20,7 @@ import {
 } from "./platformExecution.js";
 import type { PlatformId } from "./types.js";
 import type { ExecuteQuestionResult } from "./crawler.js";
+import type { RpaBusinessType } from "./rpaTask.js";
 
 export type TaskLogEvent =
   | "TASK_COMPLETED"
@@ -51,6 +52,17 @@ export interface StructuredTaskLogRecord {
   errorMessage?: string;
   screenshotPath?: string;
   diagnosticPath?: string;
+  businessType?: RpaBusinessType;
+  executionId?: string;
+  businessTaskId?: string;
+  tenantId?: string;
+  projectId?: string;
+  intentEntryId?: string;
+  monitorDate?: string;
+  repetitionNo?: number;
+  conversationKey?: string;
+  conversationUrl?: string;
+  submissionState?: string;
 }
 
 export interface StructuredTaskLoggerOptions {
@@ -185,6 +197,23 @@ export class StructuredTaskLogger {
       brandId: boundedIdentifier(record.brandId),
       businessGroupId: boundedIdentifier(record.businessGroupId),
       conversationGroupId: boundedIdentifier(record.conversationGroupId, 1_000),
+      ...(record.executionId
+        ? { executionId: boundedIdentifier(record.executionId) }
+        : {}),
+      ...(record.businessTaskId
+        ? { businessTaskId: boundedIdentifier(record.businessTaskId) }
+        : {}),
+      ...(record.tenantId ? { tenantId: boundedIdentifier(record.tenantId) } : {}),
+      ...(record.projectId ? { projectId: boundedIdentifier(record.projectId) } : {}),
+      ...(record.intentEntryId
+        ? { intentEntryId: boundedIdentifier(record.intentEntryId) }
+        : {}),
+      ...(record.conversationKey
+        ? { conversationKey: boundedIdentifier(record.conversationKey, 1_000) }
+        : {}),
+      ...(record.conversationUrl
+        ? { conversationUrl: sanitizeUrl(record.conversationUrl) }
+        : {}),
       actualQuestion: boundedQuestion.text,
       questionTruncated: boundedQuestion.truncated,
       requestedDeepThinking: record.requestedDeepThinking ?? null,

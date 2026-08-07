@@ -22,7 +22,14 @@ export function validateGrayConfiguration(
   if (!config.dryRun) failures.push("静态验证必须保持 dry-run=true");
   if (config.maxTasks > 4) failures.push("灰度 maxTasks 不能超过 4");
   if (config.platforms.length > 1) failures.push("首轮灰度只能启用一个平台");
-  if (config.grayBrandIds.length === 0 && config.grayBusinessTaskIds.length === 0) {
+  const hasEntryProjectScope = config.workerType === "monitor" &&
+    config.entryMonitorEnabled &&
+    config.entryMonitorGrayProjectIds.length > 0;
+  if (
+    config.grayBrandIds.length === 0 &&
+    config.grayBusinessTaskIds.length === 0 &&
+    !hasEntryProjectScope
+  ) {
     failures.push("必须配置品牌或业务任务白名单");
   }
   if (!config.providerRoutingEnabled || config.workerProvider !== "NEW_RPA") {

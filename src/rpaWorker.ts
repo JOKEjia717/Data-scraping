@@ -10,6 +10,7 @@ import {
 } from "./conversationManager.js";
 import {
   executeQuestion,
+  hasExactUnsubmittedComposerDraft,
   inspectCurrentQuestionAnswer,
   isSafeSameQuestionRetryError,
   recoverSubmittedQuestionResult,
@@ -23,7 +24,11 @@ import {
   type PlatformHealthStatus
 } from "./platformExecution.js";
 import { JsonlRpaTaskAuditLogger } from "./rpaTaskAudit.js";
-import { RpaTaskRepository } from "./rpaTaskRepository.js";
+import {
+  RpaTaskRepository,
+  type RpaBrandCohort,
+  type RpaBrandWindowEntry
+} from "./rpaTaskRepository.js";
 import { RpaResultRepository } from "./rpaResultRepository.js";
 import {
   MetricsJsonSnapshotWriter,
@@ -81,6 +86,17 @@ import {
 } from "./consolePrivacy.js";
 import { checkDiskSpace } from "./runtimeSafety.js";
 import { assertPersistableReferenceResult } from "./referenceState.js";
+import {
+  assertEntryMonitorCollectionContext,
+  assertEntryMonitorTaskEligibleToday,
+  entryMonitorConversationKeyFor,
+  getShanghaiDate,
+  serializeEntryMonitorConversationKey
+} from "./entryMonitor.js";
+import {
+  JsonEntryMonitorConversationRepository,
+  type EntryMonitorConversationRepository
+} from "./entryMonitorConversationRepository.js";
 
 export interface PlannedRpaBatch {
   key: string;
@@ -123,9 +139,11 @@ export interface RpaWorkerSession {
   browserRuntime?: BrowserSelfCheckResult;
   platformHealth: Map<PlatformId, PlatformHealthState>;
   platformRecoveryChecks: Map<PlatformId, { lastCheckedAt: number; consecutiveReady: number }>;
+  batchStartFailureCounts: Map<PlatformId, number>;
   lastTaskStateMetricsAt?: number;
   filesystemDegraded: boolean;
   lockStateTrusted: boolean;
+  entryMonitorConversations?: EntryMonitorConversationRepository;
 }
 
 export function createRpaWorkerSession(config: RpaWorkerConfig): RpaWorkerSession {
@@ -154,11 +172,15 @@ export function createRpaWorkerSession(config: RpaWorkerConfig): RpaWorkerSessio
       retryScheduleEnabled: config.databaseRetryScheduleEnabled,
       ...(config.providerRoutingEnabled
         ? { workerProvider: config.workerProvider }
-        : {})
+        : {}),
+      entryMonitorEnabled: config.entryMonitorEnabled,
+      entryMonitorGrayProjectIds: config.entryMonitorGrayProjectIds
     }),
     resultRepository: new RpaResultRepository(),
     resultOutbox: new ResultOutbox({ directory: config.outboxDirectory }),
-    stateRepository: new RpaWorkerStateRepository(),
+    stateRepository: new RpaWorkerStateRepository(undefined, {
+      entryMonitorEnabled: config.entryMonitorEnabled
+    }),
     leases,
     logger: new StructuredTaskLogger({
       logDirectory: config.logDirectory,
@@ -174,9 +196,15 @@ export function createRpaWorkerSession(config: RpaWorkerConfig): RpaWorkerSessio
     metricsPublisher,
     platformHealth: new Map(),
     platformRecoveryChecks: new Map(),
+    batchStartFailureCounts: new Map(),
     filesystemDegraded: false,
     lockStateTrusted: true
   };
+  if (config.workerType === "monitor" && config.entryMonitorEnabled) {
+    session.entryMonitorConversations = new JsonEntryMonitorConversationRepository(
+      config.entryMonitorConversationFile
+    );
+  }
   sessionReference = session;
   metricsPublisher.start();
   return session;
@@ -208,11 +236,20 @@ class PlatformLeaseUnavailableError extends Error {
 export async function planGreyRpaBatches(
   repository: RpaTaskRepository,
   config: Pick<RpaWorkerConfig, "workerType" | "platforms" | "maxTasks" | "candidateLimit"> &
-    Partial<Pick<RpaWorkerConfig, "grayBrandIds" | "grayBusinessTaskIds" | "grayPercentage">>
+    Partial<Pick<
+      RpaWorkerConfig,
+      | "grayBrandIds"
+      | "grayBusinessTaskIds"
+      | "grayPercentage"
+      | "entryMonitorGrayProjectIds"
+      | "entryMonitorProjectChunkSize"
+    >>,
+  brandCohorts?: readonly RpaBrandCohort[]
 ): Promise<PlannedRpaBatch[]> {
   const enabledPlatforms = new Set(config.platforms);
   const seeds = (await repository.findPendingCollectionTasks(config.workerType, {
-    limit: config.candidateLimit
+    limit: config.candidateLimit,
+    ...(brandCohorts ? { brandCohorts } : {})
   })).filter((task) =>
     enabledPlatforms.has(task.platformId) && taskInGrayScope(task, config)
   );
@@ -225,7 +262,9 @@ export async function planGreyRpaBatches(
     if (seen.has(key)) continue;
     seen.add(key);
     const tasks = (await repository.findPendingBatchTasks(config.workerType, seed, {
-      limit: 1_000
+      limit: seed.businessType === "ENTRY_MONITOR"
+        ? config.entryMonitorProjectChunkSize ?? 5
+        : 1_000
     })).filter((task) =>
       task.platformId === seed.platformId && taskInGrayScope(task, config)
     );
@@ -239,26 +278,124 @@ export async function planGreyRpaBatches(
 }
 
 export function taskInGrayScope(
-  task: Pick<CollectionTask, "brandId" | "businessTaskId">,
+  task: {
+    brandId: string;
+    businessTaskId: string;
+    businessType?: CollectionTask["businessType"];
+    projectId?: string;
+  },
   config: Partial<Pick<
     RpaWorkerConfig,
-    "grayBrandIds" | "grayBusinessTaskIds" | "grayPercentage"
+    | "grayBrandIds"
+    | "grayBusinessTaskIds"
+    | "grayPercentage"
+    | "entryMonitorGrayProjectIds"
   >>
 ): boolean {
+  if (task.businessType === "ENTRY_MONITOR") {
+    if (!task.projectId) return false;
+    if (
+      config.entryMonitorGrayProjectIds?.length &&
+      !config.entryMonitorGrayProjectIds.includes(task.projectId)
+    ) return false;
+    return percentageScope(`${task.businessType}:${task.projectId}`, config.grayPercentage);
+  }
   if (config.grayBrandIds?.length && !config.grayBrandIds.includes(task.brandId)) return false;
   if (
     config.grayBusinessTaskIds?.length &&
     !config.grayBusinessTaskIds.includes(task.businessTaskId)
   ) return false;
-  const percentage = config.grayPercentage ?? 100;
+  return percentageScope(`${task.businessTaskId}:${task.brandId}`, config.grayPercentage);
+}
+
+const BATCH_START_RESTART_THRESHOLD = 3;
+
+type BatchStartStage =
+  | "platform-lease"
+  | "conversation-inspection"
+  | "new-conversation"
+  | "owner-storage";
+
+/** Batch-start failure invalidated the cached CDP runtime; retry in-process. */
+export class RpaBrowserRuntimeRefreshRequiredError extends Error {
+  readonly code = "RPA_BROWSER_RUNTIME_REFRESH_REQUIRED";
+
+  constructor(
+    readonly platformId: PlatformId,
+    readonly stage: BatchStartStage,
+    readonly consecutiveFailures: number,
+    options?: ErrorOptions
+  ) {
+    super(
+      `${platformId} batch start failed at ${stage}; CDP runtime refresh required ` +
+        `(consecutiveFailures=${consecutiveFailures})`,
+      options
+    );
+    this.name = "RpaBrowserRuntimeRefreshRequiredError";
+  }
+}
+
+/** Fleet must restart only this worker child after repeated reconnect failures. */
+export class RpaWorkerRestartRequiredError extends Error {
+  readonly code = "RPA_WORKER_RESTART_REQUIRED";
+
+  constructor(
+    readonly platformId: PlatformId,
+    readonly stage: BatchStartStage,
+    readonly consecutiveFailures: number,
+    options?: ErrorOptions
+  ) {
+    super(
+      `${platformId} batch start still fails after CDP refresh; worker restart required ` +
+        `(stage=${stage},consecutiveFailures=${consecutiveFailures})`,
+      options
+    );
+    this.name = "RpaWorkerRestartRequiredError";
+  }
+}
+
+function percentageScope(value: string, configuredPercentage: number | undefined): boolean {
+  const percentage = configuredPercentage ?? 100;
   if (percentage >= 100) return true;
   if (percentage <= 0) return false;
   let hash = 2166136261;
-  for (const char of `${task.businessTaskId}:${task.brandId}`) {
+  for (const char of value) {
     hash ^= char.charCodeAt(0);
     hash = Math.imul(hash, 16777619);
   }
   return (hash >>> 0) % 100 < percentage;
+}
+
+export async function resolveBrandWindow(
+  repository: Pick<RpaTaskRepository, "findBrandWindow">,
+  config: Pick<
+    RpaWorkerConfig,
+    "workerType" | "brandWindowSize" | "brandBarrierPlatforms"
+  >
+): Promise<RpaBrandWindowEntry[] | undefined> {
+  if (config.brandWindowSize === 0) return undefined;
+  return repository.findBrandWindow(config.workerType, {
+    size: config.brandWindowSize,
+    expectedPlatforms: config.brandBarrierPlatforms
+  });
+}
+
+function logBrandWindow(
+  config: Pick<RpaWorkerConfig, "workerId" | "brandWindowSize" | "brandBarrierPlatforms">,
+  window: readonly RpaBrandWindowEntry[] | undefined
+): void {
+  if (!window) return;
+  const blocked = window.filter((entry) =>
+    entry.finalFailed > 0 ||
+    (entry.platformCount < config.brandBarrierPlatforms.length &&
+      entry.pending === 0 && entry.processing === 0)
+  ).length;
+  rpaConsoleInfo({
+    workerId: config.workerId,
+    event: blocked > 0 ? "BRAND_WINDOW_BLOCKED" : "BRAND_WINDOW_READY",
+    batchProgress:
+      `window=${window.length}/${config.brandWindowSize},blocked=${blocked},expectedPlatforms=${config.brandBarrierPlatforms.length}`
+  });
 }
 
 export async function runRpaWorkerOnce(
@@ -304,7 +441,8 @@ export async function runRpaWorkerOnce(
     }
 
     if (config.dryRun) {
-      const planned = await planGreyRpaBatches(taskRepository, config);
+      const brandWindow = await resolveBrandWindow(taskRepository, config);
+      const planned = await planGreyRpaBatches(taskRepository, config, brandWindow);
       summary.selectedBatchCount = planned.length;
       summary.selectedTaskCount = countPlannedTasks(planned);
       printDryRun(config, planned);
@@ -454,6 +592,31 @@ export async function runRpaWorkerOnce(
       }
     }
 
+    const brandWindow = await resolveBrandWindow(taskRepository, config);
+    onProgress("brand-window-resolved");
+    if (config.brandWindowSize > 0 && (brandWindow?.length ?? 0) === 0) {
+      rpaConsoleInfo({
+        workerId: config.workerId,
+        event: "BRAND_WINDOW_EMPTY",
+        batchProgress: "window=0"
+      });
+      return summary;
+    }
+
+    if (session.entryMonitorConversations) {
+      await session.entryMonitorConversations.closeExpired(
+        getShanghaiDate()
+      ).catch((error) => {
+        rpaConsoleError({
+          workerId: config.workerId,
+          event: "ENTRY_MONITOR_CONVERSATION_EXPIRY_FAILED",
+          errorCode: "FILESYSTEM_ERROR",
+          error
+        });
+      });
+    }
+    logBrandWindow(config, brandWindow);
+
     const selfCheck = await ensureBrowserRuntime(session, config);
     onProgress("browser-ready");
     if (!selfCheck.connected) throw new Error(`无法连接 CDP：${config.cdpEndpoint}`);
@@ -477,7 +640,7 @@ export async function runRpaWorkerOnce(
 
     const runtimeConfig = { ...config, platforms: readyPlatforms };
     const planned = nextPlatformBatches(
-      await planGreyRpaBatches(taskRepository, runtimeConfig)
+      await planGreyRpaBatches(taskRepository, runtimeConfig, brandWindow)
     );
     onProgress("tasks-planned");
     summary.selectedBatchCount = planned.length;
@@ -513,6 +676,11 @@ export async function runRpaWorkerOnce(
     for (const { tasks } of claimed) {
       for (const task of tasks) {
         session.metrics.transitionTaskState(task.platformId, "pending", "processing");
+        session.metrics.transitionBusinessTypeTaskState(
+          task.businessType,
+          "pending",
+          "processing"
+        );
       }
     }
     // 批次执行期间使用本地状态迁移；批次结束后再通过数据库聚合校准。
@@ -533,14 +701,15 @@ export async function runRpaWorkerOnce(
       evidenceStore,
       summary,
       metrics: session.metrics,
+      entryMonitorConversations: session.entryMonitorConversations,
       onFilesystemDegraded(degraded) {
         session.filesystemDegraded = degraded;
       },
-      invalidateBrowserRuntime() {
+      async invalidateBrowserRuntime() {
         const browser = session.browserRuntime?.browser;
         session.browserRuntime = undefined;
         if (browser?.isConnected()) {
-          void browser.close({ reason: "RPA browser runtime invalidated" }).catch(() => undefined);
+          await browser.close({ reason: "RPA browser runtime invalidated" }).catch(() => undefined);
         }
       },
       async recoverPlatformPage(platformId) {
@@ -554,6 +723,7 @@ export async function runRpaWorkerOnce(
         return result.page;
       },
       platformHealth: session.platformHealth,
+      batchStartFailureCounts: session.batchStartFailureCounts,
       shouldStop,
       onProgress
     });
@@ -616,6 +786,7 @@ async function ensureBrowserRuntime(
     selfCheck = await runBrowserSelfCheck({
     cdpEndpoint: config.cdpEndpoint,
     platforms: config.platforms.map((platformId) => PLATFORMS[platformId]),
+    openMissingTabs: true,
     onPlatformFailure: async (result, page) => {
       if (!page || !result.errorCode) return;
       await session.evidenceStore.capture({
@@ -865,10 +1036,12 @@ interface ExecuteClaimedInput {
   evidenceStore: FailureEvidenceStore;
   summary: RpaWorkerRunSummary;
   metrics: MetricsRegistry;
+  entryMonitorConversations?: EntryMonitorConversationRepository;
   onFilesystemDegraded: (degraded: boolean) => void;
-  invalidateBrowserRuntime: () => void;
+  invalidateBrowserRuntime: () => Promise<void>;
   recoverPlatformPage: (platformId: PlatformId) => Promise<Page>;
   platformHealth: Map<PlatformId, PlatformHealthState>;
+  batchStartFailureCounts: Map<PlatformId, number>;
   shouldStop: () => boolean;
   onProgress: (stage: string) => void;
 }
@@ -950,8 +1123,15 @@ async function executeClaimedBatches(input: ExecuteClaimedInput): Promise<void> 
   const lifecycleStates = new Map<string, RpaTaskLifecycleState>(
     allTasks.map((task) => [task.executionId, "NOT_SUBMITTED"])
   );
-  const conversationManagers = new Map<PlatformId, ConversationManager>();
+  const conversationManagers = new Map<string, ConversationManager>();
   const batchPlatformLeases = new Map<string, string>();
+  const batchStartStages = new Map<string, BatchStartStage>();
+  let batchStartRecovery: {
+    platformId: PlatformId;
+    stage: BatchStartStage;
+    consecutiveFailures: number;
+    error: unknown;
+  } | undefined;
   const lastQuestion = new Map<PlatformId, string>();
   const resumedCurrentAnswerBatches = new Set<string>();
   const heartbeat = new ExecutionHeartbeat(input.stateRepository, [...owned], {
@@ -961,20 +1141,33 @@ async function executeClaimedBatches(input: ExecuteClaimedInput): Promise<void> 
       event: "HEARTBEAT_FAILED",
       errorCode: "DATABASE_ERROR",
       error
-    }),
-    onSuccess: () => input.onProgress("execution-heartbeat")
+    })
   });
 
-  for (const platformId of config.platforms) {
-    conversationManagers.set(platformId, createPageConversationManager(
-      requirePage(input.pages, platformId),
-      PLATFORMS[platformId],
-      {
-        maxDurationMs: config.maxConversationDurationMs,
-        maxQuestions: config.maxConversationQuestions
-      }
-    ));
-  }
+  const conversationManagerFor = (
+    task: CollectionTask,
+    platformId: PlatformId
+  ): ConversationManager => {
+    const key = `${platformId}:${task.businessType}`;
+    let manager = conversationManagers.get(key);
+    if (!manager) {
+      manager = createPageConversationManager(
+        requirePage(input.pages, platformId),
+        PLATFORMS[platformId],
+        task.businessType === "ENTRY_MONITOR"
+          ? {
+            maxDurationMs: config.entryMonitorConversationMaxDurationMs,
+            maxQuestions: config.entryMonitorConversationMaxQuestions
+          }
+          : {
+            maxDurationMs: config.maxConversationDurationMs,
+            maxQuestions: config.maxConversationQuestions
+          }
+      );
+      conversationManagers.set(key, manager);
+    }
+    return manager;
+  };
 
   const layer = new MultiPlatformExecutionLayer({
     platforms: config.platforms,
@@ -986,24 +1179,150 @@ async function executeClaimedBatches(input: ExecuteClaimedInput): Promise<void> 
     }])),
     hooks: {
       async onBatchStart(batch) {
-        const lockName = platformLeaseName(batch.platformId);
+        batchStartStages.set(batch.id, "platform-lease");
+        const firstTask = requireTask(taskById, batch.tasks[0]?.id);
+        if (firstTask.businessType === "ENTRY_MONITOR") {
+          assertEntryMonitorCollectionContext(firstTask);
+          assertEntryMonitorTaskEligibleToday(firstTask);
+        }
+        const lockName = platformLeaseName(config.workerType, batch.platformId);
         const acquired = await waitForAdvisoryLease(input.leases, lockName, {
           waitMs: config.leaseWaitMs,
           pollMs: config.leasePollMs
         });
         if (!acquired) throw new PlatformLeaseUnavailableError(batch.platformId);
         batchPlatformLeases.set(batch.id, lockName);
-        const task = requireTask(taskById, batch.tasks[0]?.id);
-        const context = {
+        batchStartStages.set(batch.id, "conversation-inspection");
+        const task = firstTask;
+        const context: ConversationOwnerContext = {
           batchId: batch.id,
           tenantId: task.tenantKey,
           brandId: task.brandId,
           businessTaskId: task.businessTaskId,
           businessGroupId: task.businessGroupId,
-          platformId: batch.platformId
+          platformId: batch.platformId,
+          ...(task.businessType === "ENTRY_MONITOR"
+            ? {
+              executionId: task.executionId,
+              intentEntryId: task.intentEntryId,
+              repetitionNo: task.repetitionNo,
+              submissionState: "PREPARED",
+              conversationKey: serializeEntryMonitorConversationKey(
+                entryMonitorConversationKeyFor({
+                  tenantId: task.tenantId!,
+                  projectId: task.projectId!,
+                  platformId: batch.platformId,
+                  monitorDate: task.monitorDate!
+                })
+              )
+            }
+            : {})
         };
         const page = requirePage(input.pages, batch.platformId);
-        const manager = conversationManagers.get(batch.platformId)!;
+        const manager = conversationManagerFor(task, batch.platformId);
+        if (task.businessType === "ENTRY_MONITOR") {
+          assertEntryMonitorCollectionContext(task);
+          const repository = input.entryMonitorConversations;
+          if (!repository) {
+            throw Object.assign(new Error("ENTRY_MONITOR 会话仓储未启用。"), {
+              errorCode: "INVALID_EXECUTION_CONTEXT"
+            });
+          }
+          const key = entryMonitorConversationKeyFor({
+            tenantId: task.tenantId,
+            projectId: task.projectId,
+            platformId: batch.platformId,
+            monitorDate: task.monitorDate
+          });
+          const record = await repository.find(key);
+          if (record?.status === "ACTIVE") {
+            if (!isConversationUrlForPlatform(record.conversationUrl, batch.platformId)) {
+              await repository.markUnavailable(key, "conversation URL 不属于目标平台");
+            } else {
+              const restored = await page.goto(record.conversationUrl, {
+                waitUntil: "domcontentloaded",
+                timeout: Math.min(config.questionTimeoutMs, 30_000)
+              }).then(() => true).catch(() => false);
+              const ready = restored
+                ? await inspectPlatformPage(page, PLATFORMS[batch.platformId], 2_000)
+                : undefined;
+              if (ready?.ready) {
+                const executionOwnerMatches = await currentPageMatchesConversationOwner(
+                  page,
+                  context
+                );
+                const storedOwner = executionOwnerMatches
+                  ? await readConversationOwner(page)
+                  : undefined;
+                const currentBaseline = executionOwnerMatches
+                  ? await readEntryMonitorDomBaseline(page, batch.platformId)
+                  : undefined;
+                const inspection = executionOwnerMatches
+                  ? await inspectCurrentQuestionAnswer(
+                    page,
+                    PLATFORMS[batch.platformId],
+                    task.keyword,
+                    "business"
+                  ).catch(() => ({ status: "uncertain" as const, reason: "页面检查异常" }))
+                  : { status: "absent" as const };
+                manager.resumeVerifiedBatch(context);
+                await repository.touch(key, new Date());
+                if (
+                  inspection.status === "answered" &&
+                  storedOwner &&
+                  currentBaseline &&
+                  currentBaseline.baselineUserMessageCount >
+                    (storedOwner.baselineUserMessageCount ?? -1) &&
+                  currentBaseline.baselineAssistantMessageCount >
+                    (storedOwner.baselineAssistantMessageCount ?? -1)
+                ) {
+                  heartbeat.remove(task.executionId);
+                  lifecycleStates.set(task.executionId, "ANSWER_VISIBLE");
+                  resumedCurrentAnswerBatches.add(batch.id);
+                } else if (executionOwnerMatches && inspection.status !== "absent") {
+                  throw Object.assign(
+                    new Error("ENTRY_MONITOR 页面属于当前 execution，但无法明确恢复提交结果。"),
+                    { errorCode: "AMBIGUOUS_RECOVERY" }
+                  );
+                }
+                rpaConsoleInfo({
+                  workerId: config.workerId,
+                  event: "ENTRY_MONITOR_CONVERSATION_RESTORED",
+                  executionId: task.executionId,
+                  brandId: task.brandId,
+                  platformId: batch.platformId,
+                  batchProgress: `conversationKey=${context.conversationKey}`
+                });
+                batchStartStages.delete(batch.id);
+                input.batchStartFailureCounts.delete(batch.platformId);
+                return;
+              }
+              await repository.markUnavailable(key, ready?.reason ?? "conversation restore failed");
+            }
+          }
+
+          batchStartStages.set(batch.id, "new-conversation");
+          await manager.startBatch(context, lastQuestion.get(batch.platformId) ?? "");
+          const conversationUrl = page.url();
+          if (!isConversationUrlForPlatform(conversationUrl, batch.platformId)) {
+            throw Object.assign(new Error("新建会话后未取得目标平台会话 URL。"), {
+              errorCode: "CONVERSATION_RESTORE_FAILED"
+            });
+          }
+          const now = new Date().toISOString();
+          batchStartStages.set(batch.id, "owner-storage");
+          await repository.upsertActive({
+            ...key,
+            conversationKey: serializeEntryMonitorConversationKey(key),
+            conversationUrl,
+            status: "ACTIVE",
+            createdAt: now,
+            lastUsedAt: now
+          });
+          batchStartStages.delete(batch.id);
+          input.batchStartFailureCounts.delete(batch.platformId);
+          return;
+        }
         // 只有页面上的持久化业务归属标记与本批次完全一致，且当前第一题已有完整回答，
         // 才接管中断会话。仅凭问题文本相同不足以跨进程恢复，避免跨品牌误复用。
         const ownerMatches = await currentPageMatchesConversationOwner(page, context);
@@ -1016,7 +1335,13 @@ async function executeClaimedBatches(input: ExecuteClaimedInput): Promise<void> 
           ).catch(() => ({ status: "uncertain" as const, reason: "页面检查异常" }))
           : { status: "uncertain" as const, reason: "页面不属于当前批次" };
         if (inspection.status === "answered") {
+          // The execution is actively recovering an already submitted answer.
+          // Keep its advisory lock, but stop refreshing modify_time so a
+          // five-minute business stall is immediately recoverable after the
+          // watchdog releases that lock.
+          heartbeat.remove(task.executionId);
           lifecycleStates.set(task.executionId, "ANSWER_VISIBLE");
+          input.onProgress(`task-answer-resumed:${task.executionId}`);
           manager.resumeVerifiedBatch(context);
           resumedCurrentAnswerBatches.add(batch.id);
           rpaConsoleInfo({
@@ -1027,6 +1352,8 @@ async function executeClaimedBatches(input: ExecuteClaimedInput): Promise<void> 
             platformId: batch.platformId,
             batchProgress: "existing-answer"
           });
+          batchStartStages.delete(batch.id);
+          input.batchStartFailureCounts.delete(batch.platformId);
           return;
         }
         if (ownerMatches && inspection.status === "uncertain") {
@@ -1041,6 +1368,30 @@ async function executeClaimedBatches(input: ExecuteClaimedInput): Promise<void> 
             );
           }
 
+          // DeepSeek 如果仍原样保留当前题草稿，并且虚拟消息列表里完全没有本题，
+          // 可以严格证明上次提交没有被页面接收。此时复用当前归属会话重新进入执行，
+          // 不再携带未发送草稿强制新建对话而形成 new-conversation 失败循环。
+          const exactUnsubmittedDraft = batch.platformId === "deepseek" &&
+            await hasExactUnsubmittedComposerDraft(
+              page,
+              PLATFORMS[batch.platformId],
+              task.keyword
+            );
+          if (exactUnsubmittedDraft) {
+            manager.resumeVerifiedBatch(context);
+            rpaConsoleInfo({
+              workerId: config.workerId,
+              event: "BATCH_CONVERSATION_RESUMED",
+              executionId: task.executionId,
+              brandId: task.brandId,
+              platformId: batch.platformId,
+              batchProgress: "exact-unsubmitted-draft:retry-send"
+            });
+            batchStartStages.delete(batch.id);
+            input.batchStartFailureCounts.delete(batch.platformId);
+            return;
+          }
+
           // 此 task 来自 pending 查询并已重新领取，因此数据库仍无 answer_id。诊断业务
           // 明确接受重复提问：创建干净会话后由 executeTask 正常发送并按 executionId
           // 落库，避免旧 owner 标记造成“领取—冷却—释放”的无限循环。
@@ -1052,12 +1403,20 @@ async function executeClaimedBatches(input: ExecuteClaimedInput): Promise<void> 
             platformId: batch.platformId,
             batchProgress: "pending-answer-unrecognized:new-conversation"
           });
+          batchStartStages.set(batch.id, "new-conversation");
           await manager.startBatch(context, lastQuestion.get(batch.platformId) ?? "");
+          batchStartStages.set(batch.id, "owner-storage");
           await storeConversationOwner(page, context);
+          batchStartStages.delete(batch.id);
+          input.batchStartFailureCounts.delete(batch.platformId);
           return;
         }
+        batchStartStages.set(batch.id, "new-conversation");
         await manager.startBatch(context, lastQuestion.get(batch.platformId) ?? "");
+        batchStartStages.set(batch.id, "owner-storage");
         await storeConversationOwner(page, context);
+        batchStartStages.delete(batch.id);
+        input.batchStartFailureCounts.delete(batch.platformId);
       },
       async onBatchComplete(batch) {
         input.metrics.observeBrandBatchDuration(
@@ -1065,8 +1424,28 @@ async function executeClaimedBatches(input: ExecuteClaimedInput): Promise<void> 
           Math.max(0, Date.now() - (batch.startedAt ?? Date.now())),
           "completed"
         );
-        const manager = conversationManagers.get(batch.platformId)!;
+        const task = requireTask(taskById, batch.tasks[0]?.id);
+        const manager = conversationManagerFor(task, batch.platformId);
         manager.finishBatch(batch.id, "completed");
+        if (task.businessType === "ENTRY_MONITOR") {
+          assertEntryMonitorCollectionContext(task);
+          const key = entryMonitorConversationKeyFor({
+            tenantId: task.tenantId,
+            projectId: task.projectId,
+            platformId: batch.platformId,
+            monitorDate: task.monitorDate
+          });
+          const repository = input.entryMonitorConversations;
+          if (repository) {
+            const page = requirePage(input.pages, batch.platformId);
+            if (isConversationUrlForPlatform(page.url(), batch.platformId)) {
+              await repository.updateUrl(key, page.url());
+              await repository.touch(key, new Date());
+            }
+          }
+          await releasePlatformLeaseAfterInterval(input, batch, batchPlatformLeases);
+          return;
+        }
         await clearConversationOwner(requirePage(input.pages, batch.platformId));
         const opened = await manager.resetToBlank(lastQuestion.get(batch.platformId) ?? "");
         if (!opened) {
@@ -1083,7 +1462,31 @@ async function executeClaimedBatches(input: ExecuteClaimedInput): Promise<void> 
           Math.max(0, Date.now() - (batch.startedAt ?? Date.now())),
           "failed"
         );
-        const manager = conversationManagers.get(batch.platformId)!;
+        const batchStartStage = batchStartStages.get(batch.id);
+        batchStartStages.delete(batch.id);
+        if (batchStartStage && batchStartStage !== "platform-lease") {
+          const consecutiveFailures =
+            (input.batchStartFailureCounts.get(batch.platformId) ?? 0) + 1;
+          input.batchStartFailureCounts.set(batch.platformId, consecutiveFailures);
+          batchStartRecovery = {
+            platformId: batch.platformId,
+            stage: batchStartStage,
+            consecutiveFailures,
+            error
+          };
+          rpaConsoleError({
+            workerId: config.workerId,
+            event: "BATCH_START_FAILED",
+            platformId: batch.platformId,
+            errorCode: "TECHNICAL_FAILURE",
+            error,
+            batchProgress:
+              `stage=${batchStartStage},consecutiveFailures=${consecutiveFailures},` +
+              `restartThreshold=${BATCH_START_RESTART_THRESHOLD}`
+          });
+        }
+        const task = requireTask(taskById, batch.tasks[0]?.id);
+        const manager = conversationManagerFor(task, batch.platformId);
         if (manager.currentState?.batchId === batch.id) {
           if (manager.currentState.status === "active") manager.markDamaged(error);
           manager.finishBatch(batch.id, "failed");
@@ -1099,6 +1502,11 @@ async function executeClaimedBatches(input: ExecuteClaimedInput): Promise<void> 
             const task = taskById.get(executionId);
             if (task && releaseable.includes(executionId)) {
               input.metrics.transitionTaskState(task.platformId, "processing", "pending");
+              input.metrics.transitionBusinessTypeTaskState(
+                task.businessType,
+                "processing",
+                "pending"
+              );
             }
             owned.delete(executionId);
             await input.leases.release(executionLeaseName(executionId));
@@ -1109,8 +1517,13 @@ async function executeClaimedBatches(input: ExecuteClaimedInput): Promise<void> 
     },
     executeTask: async (context) => {
       const task = requireTask(taskById, context.task.id);
+      if (task.businessType === "ENTRY_MONITOR") {
+        assertEntryMonitorCollectionContext(task);
+        // 候选查询后可能刚好跨过上海 00:00，点击发送前必须再次复查。
+        assertEntryMonitorTaskEligibleToday(task);
+      }
       await ensureBatchLeaseOwnership(input, context.batch, task.executionId);
-      const manager = conversationManagers.get(context.platformId)!;
+      const manager = conversationManagerFor(task, context.platformId);
       const conversation = await manager.acquireForQuestion({
         batchId: context.batch.id,
         tenantId: task.tenantKey,
@@ -1120,6 +1533,36 @@ async function executeClaimedBatches(input: ExecuteClaimedInput): Promise<void> 
         platformId: context.platformId
       }, lastQuestion.get(context.platformId) ?? "");
       const page = requirePage(input.pages, context.platformId);
+      if (task.businessType === "ENTRY_MONITOR") {
+        assertEntryMonitorCollectionContext(task);
+        const key = entryMonitorConversationKeyFor({
+          tenantId: task.tenantId,
+          projectId: task.projectId,
+          platformId: context.platformId,
+          monitorDate: task.monitorDate
+        });
+        await storeConversationOwner(page, {
+          batchId: context.batch.id,
+          tenantId: task.tenantId,
+          brandId: task.brandId,
+          businessTaskId: task.businessTaskId,
+          businessGroupId: task.businessGroupId,
+          platformId: context.platformId,
+          conversationKey: serializeEntryMonitorConversationKey(key),
+          executionId: task.executionId,
+          intentEntryId: task.intentEntryId,
+          repetitionNo: task.repetitionNo,
+          submissionState: "PREPARED",
+          ...await readEntryMonitorDomBaseline(page, context.platformId)
+        });
+        if (
+          input.entryMonitorConversations &&
+          isConversationUrlForPlatform(page.url(), context.platformId)
+        ) {
+          await input.entryMonitorConversations.updateUrl(key, page.url());
+          await input.entryMonitorConversations.touch(key, new Date());
+        }
+      }
       const preflight = await inspectPlatformPage(page, PLATFORMS[context.platformId], 2_000);
       const preflightError = preflight.ready
         ? undefined
@@ -1150,6 +1593,15 @@ async function executeClaimedBatches(input: ExecuteClaimedInput): Promise<void> 
         verified: false,
         failureReason: "尚未执行联网状态检查"
       };
+      let entryOwnerStateWrite = Promise.resolve();
+      const queueEntryOwnerState = (
+        state: NonNullable<ConversationOwnerContext["submissionState"]>
+      ): void => {
+        if (task.businessType !== "ENTRY_MONITOR") return;
+        entryOwnerStateWrite = entryOwnerStateWrite.then(() =>
+          updateConversationOwnerSubmissionState(page, task.executionId, state)
+        );
+      };
       const finalizeSuccessfulAnswer = async (
         answerContent: string,
         references: readonly ReferenceRecord[],
@@ -1160,6 +1612,8 @@ async function executeClaimedBatches(input: ExecuteClaimedInput): Promise<void> 
         referenceStatus: ReferenceExtractionStatus
       ) => {
         assertPersistableReferenceResult(referenceStatus, references, task.businessType);
+        queueEntryOwnerState("ANSWER_READY");
+        await entryOwnerStateWrite;
         lifecycleStates.set(task.executionId, "ANSWER_CAPTURED");
         lifecycleStates.set(task.executionId, "REFERENCES_CONFIRMED");
         manager.recordQuestion(task.keyword);
@@ -1235,9 +1689,16 @@ async function executeClaimedBatches(input: ExecuteClaimedInput): Promise<void> 
           });
         });
         if (persistenceStatus === "saved") {
+          queueEntryOwnerState("PERSISTED");
+          await entryOwnerStateWrite;
           input.summary.completedTaskCount += 1;
           input.metrics.transitionTaskState(
             context.platformId,
+            "processing",
+            "succeeded"
+          );
+          input.metrics.transitionBusinessTypeTaskState(
+            task.businessType,
             "processing",
             "succeeded"
           );
@@ -1252,6 +1713,7 @@ async function executeClaimedBatches(input: ExecuteClaimedInput): Promise<void> 
             ? "TASK_COMPLETED"
             : "RESULT_PERSISTENCE_PENDING",
           workerId: config.workerId,
+          ...structuredTaskLogContext(task, context.platformId, page.url(), "PERSISTED"),
           brandId: task.brandId,
           businessGroupId: task.businessGroupId,
           platform: context.platformId,
@@ -1341,10 +1803,16 @@ async function executeClaimedBatches(input: ExecuteClaimedInput): Promise<void> 
           },
           onSubmissionStateChange(state) {
             submissionState = state;
+            queueEntryOwnerState(state === "submitted" ? "SUBMITTED" : "SUBMITTING");
+            // Waiting tasks keep their DB heartbeat. Once a question has been
+            // sent (or sending is uncertain), the execution lock prevents
+            // concurrent ownership and modify_time becomes the stall clock.
+            heartbeat.remove(task.executionId);
             lifecycleStates.set(
               task.executionId,
               state === "submitted" ? "SUBMITTED" : "POST_SUBMIT_UNCERTAIN"
             );
+            input.onProgress(`task-${state}:${task.executionId}`);
           }
         });
         const answerContent = collected.answer?.answer;
@@ -1352,19 +1820,25 @@ async function executeClaimedBatches(input: ExecuteClaimedInput): Promise<void> 
           throw Object.assign(new Error("回答正文为空"), { errorCode: "EMPTY_ANSWER" });
         }
       } catch (error) {
+        const initialExecutionError = error;
+        let inspectionPage = page;
+        await entryOwnerStateWrite.catch((ownerError) => {
+          throw ownerError;
+        });
         let errorCode = classifyTechnicalError(error);
         const reconnectable =
           errorCode === "BROWSER_DISCONNECTED" ||
           errorCode === "PAGE_DISCONNECTED" ||
           errorCode === "CDP_CONNECTION_FAILED";
         if (reconnectable) {
-          input.invalidateBrowserRuntime();
+          await input.invalidateBrowserRuntime();
         }
         if (submissionState !== "not_submitted") {
           try {
             const recoveredPage = reconnectable
               ? await input.recoverPlatformPage(context.platformId)
               : page;
+            inspectionPage = recoveredPage;
             if (reconnectable) {
               input.pages[context.platformId] = recoveredPage;
               manager.rebindOperations(conversationPageOperations(
@@ -1395,8 +1869,15 @@ async function executeClaimedBatches(input: ExecuteClaimedInput): Promise<void> 
               recovered.referenceStatus
             );
           } catch (recoveryError) {
-            error = recoveryError;
-            errorCode = classifyTechnicalError(recoveryError);
+            const recoveryErrorCode = classifyTechnicalError(recoveryError);
+            error = isSafeSameQuestionRetryError(recoveryError)
+              ? recoveryError
+              : Object.assign(new Error(
+                  `提交后只读恢复失败：${boundedError(recoveryError)}；` +
+                  `触发恢复的初始错误：${boundedError(initialExecutionError)}`,
+                  { cause: recoveryError }
+                ), { errorCode: recoveryErrorCode });
+            errorCode = recoveryErrorCode;
             if (
               errorCode !== "REFERENCE_UNKNOWN" &&
               !isSafeSameQuestionRetryError(recoveryError)
@@ -1407,7 +1888,7 @@ async function executeClaimedBatches(input: ExecuteClaimedInput): Promise<void> 
         let inspectionReason: string | undefined;
         if (submissionState !== "not_submitted") {
           const inspection = await inspectCurrentQuestionAnswer(
-            page,
+            inspectionPage,
             PLATFORMS[context.platformId],
             task.keyword,
             "business"
@@ -1437,7 +1918,7 @@ async function executeClaimedBatches(input: ExecuteClaimedInput): Promise<void> 
           }
         }
         const evidence = await input.evidenceStore.capture({
-          page,
+          page: inspectionPage,
           workerId: config.workerId,
           brandId: task.brandId,
           businessGroupId: task.businessGroupId,
@@ -1451,6 +1932,12 @@ async function executeClaimedBatches(input: ExecuteClaimedInput): Promise<void> 
           timestamp: new Date().toISOString(),
           event: postSubmitUncertain ? "POST_SUBMIT_UNCERTAIN" : "TASK_FAILED",
           workerId: config.workerId,
+          ...structuredTaskLogContext(
+            task,
+            context.platformId,
+            inspectionPage.url(),
+            entryMonitorSubmissionStateForLog(submissionState)
+          ),
           brandId: task.brandId,
           businessGroupId: task.businessGroupId,
           platform: context.platformId,
@@ -1536,10 +2023,16 @@ async function executeClaimedBatches(input: ExecuteClaimedInput): Promise<void> 
             "processing",
             "pending"
           );
+          input.metrics.transitionBusinessTypeTaskState(
+            task.businessType,
+            "processing",
+            "pending"
+          );
           await input.logger.write({
             timestamp: new Date().toISOString(),
             event: "TASK_RETRY_SCHEDULED",
             workerId: config.workerId,
+            ...structuredTaskLogContext(task, context.platformId, inspectionPage.url(), "PREPARED"),
             brandId: task.brandId,
             businessGroupId: task.businessGroupId,
             platform: context.platformId,
@@ -1561,6 +2054,11 @@ async function executeClaimedBatches(input: ExecuteClaimedInput): Promise<void> 
           input.summary.failedTaskCount += 1;
           input.metrics.transitionTaskState(
             context.platformId,
+            "processing",
+            "finalFailed"
+          );
+          input.metrics.transitionBusinessTypeTaskState(
+            task.businessType,
             "processing",
             "finalFailed"
           );
@@ -1622,6 +2120,24 @@ async function executeClaimedBatches(input: ExecuteClaimedInput): Promise<void> 
           input.metrics.setPlatformHealth(platformId, "READY");
         }
       }
+      if (batchStartRecovery) {
+        const recovery = batchStartRecovery;
+        await input.invalidateBrowserRuntime();
+        if (recovery.consecutiveFailures >= BATCH_START_RESTART_THRESHOLD) {
+          throw new RpaWorkerRestartRequiredError(
+            recovery.platformId,
+            recovery.stage,
+            recovery.consecutiveFailures,
+            { cause: recovery.error }
+          );
+        }
+        throw new RpaBrowserRuntimeRefreshRequiredError(
+          recovery.platformId,
+          recovery.stage,
+          recovery.consecutiveFailures,
+          { cause: recovery.error }
+        );
+      }
       const activeResult = Object.values(results).some(
         (result) => result?.kind === "completed" || result?.kind === "failed"
       );
@@ -1638,6 +2154,11 @@ async function executeClaimedBatches(input: ExecuteClaimedInput): Promise<void> 
         const task = taskById.get(executionId);
         if (task && releaseable.includes(executionId)) {
           input.metrics.transitionTaskState(task.platformId, "processing", "pending");
+          input.metrics.transitionBusinessTypeTaskState(
+            task.businessType,
+            "processing",
+            "pending"
+          );
         }
         await input.leases.release(executionLeaseName(executionId));
       }
@@ -1679,7 +2200,7 @@ export async function claimCompleteBatches(
         }
         acquiredLocks.push(lockName);
         onProgress(`execution-lock-acquired:${task.executionId}`);
-        if (!await taskRepository.claimTask(workerType, task.executionId)) {
+        if (!await taskRepository.claimTask(workerType, task.businessType, task.executionId)) {
           complete = false;
           break;
         }
@@ -1750,7 +2271,7 @@ async function ensureBatchLeaseOwnership(
   batch: BrandBatch,
   executionId: string
 ): Promise<void> {
-  const platformLock = platformLeaseName(batch.platformId);
+  const platformLock = platformLeaseName(input.config.workerType, batch.platformId);
   const executionLock = executionLeaseName(executionId);
   const platformOwned = await input.leases.tryAcquire(platformLock);
   if (!platformOwned) {
@@ -1855,6 +2376,33 @@ async function refreshWorkerMetrics(
         }
       ])));
     }
+    const businessTypeCounter = session.taskRepository.countTaskStatesByBusinessType;
+    const statesByBusinessType = typeof businessTypeCounter === "function"
+      ? await businessTypeCounter.call(session.taskRepository, config.workerType)
+        .catch(() => undefined)
+      : undefined;
+    if (statesByBusinessType) {
+      const totals = new Map<CollectionTask["businessType"], {
+        pending: number;
+        processing: number;
+        succeeded: number;
+        finalFailed: number;
+      }>();
+      for (const state of statesByBusinessType) {
+        const current = totals.get(state.businessType) ?? {
+          pending: 0,
+          processing: 0,
+          succeeded: 0,
+          finalFailed: 0
+        };
+        current.pending += state.pending;
+        current.processing += state.processing;
+        current.succeeded += state.succeeded;
+        current.finalFailed += state.finalFailed;
+        totals.set(state.businessType, current);
+      }
+      session.metrics.replaceBusinessTypeTaskStates(totals);
+    }
   }
   const outboxEntries = await session.resultOutbox.list().catch(() => undefined);
   if (outboxEntries) session.metrics.setOutboxPending(outboxEntries.length);
@@ -1872,6 +2420,13 @@ interface ConversationOwnerContext {
   businessTaskId: string;
   businessGroupId: string;
   platformId: PlatformId;
+  conversationKey?: string;
+  executionId?: string;
+  intentEntryId?: string;
+  repetitionNo?: number;
+  submissionState?: "PREPARED" | "SUBMITTING" | "SUBMITTED" | "ANSWER_READY" | "PERSISTED";
+  baselineUserMessageCount?: number;
+  baselineAssistantMessageCount?: number;
 }
 
 /** 在平台标签页的 sessionStorage 保存低敏感度归属，供同一标签页进程恢复使用。 */
@@ -1897,13 +2452,24 @@ async function currentPageMatchesConversationOwner(
     if (!raw) return false;
     try {
       const actual = JSON.parse(raw) as Record<string, unknown>;
-      return [
+      const fields = [
         "tenantId",
         "brandId",
         "businessTaskId",
         "businessGroupId",
         "platformId"
-      ].every((field) => actual[field] === expected[field as keyof typeof expected]);
+      ];
+      for (const optional of [
+        "conversationKey",
+        "executionId",
+        "intentEntryId",
+        "repetitionNo"
+      ]) {
+        if (expected[optional as keyof typeof expected] !== undefined) fields.push(optional);
+      }
+      return fields.every(
+        (field) => actual[field] === expected[field as keyof typeof expected]
+      );
     } catch {
       return false;
     }
@@ -1916,8 +2482,143 @@ async function clearConversationOwner(page: Page): Promise<void> {
 }
 
 function batchIdentity(task: CollectionTask): string {
-  return JSON.stringify([task.brandId, task.businessGroupId, task.platformId]);
+  return JSON.stringify([
+    task.businessType,
+    task.brandId,
+    task.businessGroupId,
+    task.platformId
+  ]);
 }
+
+async function readConversationOwner(
+  page: Page
+): Promise<ConversationOwnerContext | undefined> {
+  return page.evaluate((key) => {
+    const raw = sessionStorage.getItem(key);
+    if (!raw) return undefined;
+    try {
+      return JSON.parse(raw) as ConversationOwnerContext;
+    } catch {
+      return undefined;
+    }
+  }, CONVERSATION_OWNER_STORAGE_KEY).catch(() => undefined);
+}
+
+async function readEntryMonitorDomBaseline(
+  page: Page,
+  platformId: PlatformId
+): Promise<{
+  baselineUserMessageCount: number;
+  baselineAssistantMessageCount: number;
+}> {
+  const selectors: Record<PlatformId, string> = {
+    doubao: "[data-message-id], [data-testid*='message']",
+    deepseek: ".ds-message, .ds-markdown.ds-assistant-message-main-content",
+    qianwen: "[data-message-id], [data-chat-answers-wrap]",
+    yuanbao: "[data-conv-speaker], .agent-chat__speech-card__text"
+  };
+  const count = await page.locator(selectors[platformId]).count().catch(() => 0);
+  return {
+    baselineUserMessageCount: count,
+    baselineAssistantMessageCount: count
+  };
+}
+
+async function updateConversationOwnerSubmissionState(
+  page: Page,
+  executionId: string,
+  submissionState: NonNullable<ConversationOwnerContext["submissionState"]>
+): Promise<void> {
+  const updated = await page.evaluate(({ key, expectedExecutionId, nextState }) => {
+    const raw = sessionStorage.getItem(key);
+    if (!raw) return false;
+    try {
+      const owner = JSON.parse(raw) as Record<string, unknown>;
+      if (owner.executionId !== expectedExecutionId) return false;
+      owner.submissionState = nextState;
+      sessionStorage.setItem(key, JSON.stringify(owner));
+      return true;
+    } catch {
+      return false;
+    }
+  }, {
+    key: CONVERSATION_OWNER_STORAGE_KEY,
+    expectedExecutionId: executionId,
+    nextState: submissionState
+  }).catch(() => false);
+  if (!updated) {
+    throw Object.assign(new Error("ENTRY_MONITOR 页面 owner 与 executionId 不一致。"), {
+      errorCode: "AMBIGUOUS_RECOVERY"
+    });
+  }
+}
+
+function isConversationUrlForPlatform(value: string, platformId: PlatformId): boolean {
+  try {
+    const host = new URL(value).hostname.replace(/^www\./, "");
+    const allowed = (PLATFORMS[platformId].hostnames ?? [
+      new URL(PLATFORMS[platformId].url).hostname
+    ]).map((item) => item.replace(/^www\./, ""));
+    return allowed.some((candidate) => host === candidate || host.endsWith(`.${candidate}`));
+  } catch {
+    return false;
+  }
+}
+
+function structuredTaskLogContext(
+  task: CollectionTask,
+  platformId: PlatformId,
+  conversationUrl: string,
+  submissionState: string
+): {
+  businessType: CollectionTask["businessType"];
+  executionId: string;
+  businessTaskId: string;
+  tenantId: string;
+  projectId?: string;
+  intentEntryId?: string;
+  monitorDate?: string;
+  repetitionNo?: number;
+  conversationKey?: string;
+  conversationUrl?: string;
+  submissionState: string;
+} {
+  const common = {
+    businessType: task.businessType,
+    executionId: task.executionId,
+    businessTaskId: task.businessTaskId,
+    tenantId: task.tenantKey,
+    submissionState
+  };
+  if (task.businessType !== "ENTRY_MONITOR") return common;
+  assertEntryMonitorCollectionContext(task);
+  const key = entryMonitorConversationKeyFor({
+    tenantId: task.tenantId,
+    projectId: task.projectId,
+    platformId,
+    monitorDate: task.monitorDate
+  });
+  return {
+    ...common,
+    projectId: task.projectId,
+    intentEntryId: task.intentEntryId,
+    monitorDate: task.monitorDate,
+    repetitionNo: task.repetitionNo,
+    conversationKey: serializeEntryMonitorConversationKey(key),
+    ...(isConversationUrlForPlatform(conversationUrl, platformId)
+      ? { conversationUrl }
+      : {})
+  };
+}
+
+function entryMonitorSubmissionStateForLog(
+  state: "not_submitted" | "submitted" | "uncertain"
+): "PREPARED" | "SUBMITTED" | "SUBMITTING" {
+  if (state === "submitted") return "SUBMITTED";
+  if (state === "uncertain") return "SUBMITTING";
+  return "PREPARED";
+}
+
 
 function countPlannedTasks(batches: readonly PlannedRpaBatch[]): number {
   return batches.reduce((count, batch) => count + batch.tasks.length, 0);

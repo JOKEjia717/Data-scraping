@@ -36,12 +36,14 @@ export class WebSearchTechnicalError extends Error {
   }
 }
 
-/** ARTICLE_PROBE 固定强制联网；DIAGNOSIS 才接受部署配置。 */
+/** 两类 monitor 业务固定强制联网；DIAGNOSIS 才接受部署配置。 */
 export function webSearchPolicyForBusinessType(
   businessType: RpaBusinessType,
   diagnosisPolicy: WebSearchPolicy
 ): WebSearchPolicy {
-  return businessType === "ARTICLE_PROBE" ? "REQUIRED" : diagnosisPolicy;
+  return businessType === "ARTICLE_PROBE" || businessType === "ENTRY_MONITOR"
+    ? "REQUIRED"
+    : diagnosisPolicy;
 }
 
 /**

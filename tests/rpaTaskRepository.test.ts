@@ -145,6 +145,79 @@ test("完整批次查询按业务任务、租户和 AI 平台收齐任务", asyn
   ]);
 });
 
+test("品牌窗口锚定最早未完成品牌，后一个品牌先完成也不会开放第三个", async () => {
+  const client = new RecordingSqlClient([[
+    {
+      tenantKey: "tenant-a",
+      businessTaskId: "3001",
+      brandId: "7001",
+      priority: "0",
+      createdAt: "2026-08-03T00:00:00.000Z",
+      totalTasks: "32",
+      platformCount: "4",
+      pending: "8",
+      processing: "0",
+      succeeded: "24",
+      finalFailed: "0"
+    },
+    {
+      tenantKey: "tenant-a",
+      businessTaskId: "3002",
+      brandId: "7002",
+      priority: "1",
+      createdAt: "2026-08-03T01:00:00.000Z",
+      totalTasks: "32",
+      platformCount: "4",
+      pending: "0",
+      processing: "0",
+      succeeded: "32",
+      finalFailed: "0"
+    }
+  ]]);
+  const repository = new RpaTaskRepository(client);
+
+  const window = await repository.findBrandWindow("diagnosis", {
+    size: 2,
+    expectedPlatforms: ["doubao", "deepseek", "qianwen", "yuanbao"]
+  });
+  assert.deepEqual(window.map(({ businessTaskId, brandId }) => ({ businessTaskId, brandId })), [
+    { businessTaskId: "3001", brandId: "7001" },
+    { businessTaskId: "3002", brandId: "7002" }
+  ]);
+  const query = client.queries[0]!;
+  assert.match(
+    query.sql,
+    /e\.ai_model_id IN \('1', '2', '4', '3'\).*AS platformCount/
+  );
+  assert.match(query.sql, /oldest_incomplete AS/);
+  assert.match(query.sql, /WHERE succeeded < totalTasks OR platformCount < \?/);
+  assert.match(query.sql, /cohort\.sortId >= anchor\.sortId/);
+  assert.match(
+    query.sql,
+    /ORDER BY cohort\.priority ASC, cohort\.createdAt ASC, cohort\.sortId ASC/
+  );
+  assert.deepEqual(query.parameters, ["DIAGNOSIS", 4, 2]);
+});
+
+test("待处理查询被数据库品牌窗口限制，不能领取第三个品牌", async () => {
+  const client = new RecordingSqlClient([[]]);
+  const repository = new RpaTaskRepository(client);
+  await repository.findPendingTasks("diagnosis", {
+    limit: 25,
+    brandCohorts: [
+      { tenantKey: "tenant-a", businessTaskId: "3001", brandId: "7001" },
+      { tenantKey: "tenant-a", businessTaskId: "3002", brandId: "7002" }
+    ]
+  });
+
+  const query = client.queries[0]!;
+  assert.match(query.sql, /d\.business_task_id = \? AND d\.tenant_key = \?/);
+  assert.equal((query.sql.match(/d\.business_task_id = \?/g) ?? []).length, 2);
+  assert.deepEqual(query.parameters, [
+    "DIAGNOSIS", "3001", "tenant-a", "3002", "tenant-a", 25
+  ]);
+});
+
 test("领取使用双状态条件更新且绝不更新 dispatch 完成状态", async () => {
   const client = new RecordingSqlClient([], [1]);
   const repository = new RpaTaskRepository(client);
@@ -368,4 +441,159 @@ test("仓储验证 CLI 默认只读，领取必须显式开启", () => {
     logDirectory: "rpa-task-logs"
   });
   assert.equal(parseCheckOptions(["--claim=true"]).claim, true);
+});
+
+test("monitor 开关启用后同时读取 ARTICLE_PROBE 与 ENTRY_MONITOR execution", async () => {
+  const entryRow = row({
+    executionId: "90071992547409939",
+    businessType: "ENTRY_MONITOR",
+    businessTaskId: "5001",
+    brandId: undefined,
+    projectId: "7001",
+    intentEntryId: "8001",
+    monitorDate: "2026-08-06",
+    repetitionNo: 30,
+    aiModelId: "1",
+    aiModelName: "豆包"
+  });
+  const client = new RecordingSqlClient([[], [entryRow]]);
+  const repository = new RpaTaskRepository(client, undefined, {
+    entryMonitorEnabled: true,
+    entryMonitorGrayProjectIds: ["7001"],
+    workerProvider: "NEW_RPA",
+    now: () => new Date("2026-08-05T16:00:00.000Z")
+  });
+
+  const [task] = await repository.findPendingCollectionTasks("monitor", { limit: 10 });
+  assert.equal(task?.businessType, "ENTRY_MONITOR");
+  assert.equal(task?.brandId, "7001", "调度层仅使用 projectId 作为分组身份");
+  assert.equal(task?.projectId, "7001");
+  assert.equal(task?.intentEntryId, "8001");
+  assert.equal(task?.monitorDate, "2026-08-06");
+  assert.equal(task?.repetitionNo, 30);
+  assert.equal(task?.tenantId, "tenant-a");
+  assert.equal(client.queries.length, 2);
+  const entryQuery = client.queries[1]!;
+  assert.match(entryQuery.sql, /FROM rpa_task_execution AS e/);
+  assert.match(entryQuery.sql, /INNER JOIN rpa_task_execution_context AS ctx/);
+  assert.match(entryQuery.sql, /ctx\.monitor_date = \?/);
+  assert.match(entryQuery.sql, /ctx\.project_id IN \(\?\)/);
+  assert.doesNotMatch(
+    entryQuery.sql,
+    /brand_article_publish_record|brand_media_publish_order|probe_article_(?:task|target|sample|match)/
+  );
+  assert.deepEqual(
+    entryQuery.parameters,
+    ["ENTRY_MONITOR", "NEW_RPA", "2026-08-06", "7001", 10]
+  );
+});
+
+test("ENTRY_MONITOR 批次按项目、租户、平台和上海自然日读取并支持切片", async () => {
+  const entryRow = row({
+    businessType: "ENTRY_MONITOR",
+    brandId: undefined,
+    projectId: "7001",
+    intentEntryId: "8001",
+    monitorDate: "2026-08-06",
+    repetitionNo: 1
+  });
+  const client = new RecordingSqlClient([[entryRow]]);
+  const repository = new RpaTaskRepository(client, undefined, {
+    entryMonitorEnabled: true,
+    workerProvider: "NEW_RPA"
+  });
+  const [task] = await repository.findPendingBatchTasks("monitor", {
+    businessType: "ENTRY_MONITOR",
+    businessTaskId: "5001",
+    tenantKey: "tenant-a",
+    tenantId: "tenant-a",
+    projectId: "7001",
+    monitorDate: "2026-08-06",
+    aiModelId: "1"
+  }, { limit: 5 });
+  assert.equal(task?.businessType, "ENTRY_MONITOR");
+  assert.deepEqual(client.queries[0]?.parameters, [
+    "ENTRY_MONITOR", "7001", "tenant-a", "1", "2026-08-06", "NEW_RPA", 5
+  ]);
+  assert.doesNotMatch(client.queries[0]!.sql, /probe_article_task/);
+});
+
+test("原子领取携带真实业务类型并拒绝 Worker 越界", async () => {
+  const client = new RecordingSqlClient([], [1]);
+  const repository = new RpaTaskRepository(client, undefined, {
+    workerProvider: "NEW_RPA"
+  });
+  assert.equal(
+    await repository.claimTask("monitor", "ENTRY_MONITOR", "9001"),
+    true
+  );
+  assert.deepEqual(client.updates[0]?.parameters, [
+    "9001", "ENTRY_MONITOR", "NEW_RPA"
+  ]);
+  await assert.rejects(
+    () => repository.claimTask("diagnosis", "ENTRY_MONITOR", "9002"),
+    /worker business type mismatch/
+  );
+  assert.equal(client.updates.length, 1);
+});
+
+test("ENTRY_MONITOR 行映射严格拒绝缺少项目上下文和非法 repetitionNo", () => {
+  assert.throws(
+    () => mapRpaTaskRow(row({
+      businessType: "ENTRY_MONITOR",
+      brandId: undefined,
+      intentEntryId: "8001",
+      monitorDate: "2026-08-06",
+      repetitionNo: 1
+    }), "ENTRY_MONITOR"),
+    /projectId/
+  );
+  assert.throws(
+    () => mapRpaTaskRow(row({
+      businessType: "ENTRY_MONITOR",
+      brandId: undefined,
+      projectId: "7001",
+      intentEntryId: "8001",
+      monitorDate: "2026-08-06",
+      repetitionNo: 0
+    }), "ENTRY_MONITOR"),
+    /repetitionNo 必须是正整数/
+  );
+});
+
+test("monitor 指标可按 ARTICLE_PROBE 与 ENTRY_MONITOR 分开聚合", async () => {
+  const client = new RecordingSqlClient([[
+    {
+      businessType: "ARTICLE_PROBE",
+      aiModelId: "1",
+      aiModelName: "豆包",
+      pending: 2,
+      processing: 1,
+      succeeded: 3,
+      finalFailed: 0
+    },
+    {
+      businessType: "ENTRY_MONITOR",
+      aiModelId: "1",
+      aiModelName: "豆包",
+      pending: 30,
+      processing: 1,
+      succeeded: 10,
+      finalFailed: 2
+    }
+  ]]);
+  const repository = new RpaTaskRepository(client, undefined, {
+    entryMonitorEnabled: true,
+    workerProvider: "NEW_RPA"
+  });
+  const states = await repository.countTaskStatesByBusinessType("monitor");
+  assert.deepEqual(states.map(({ businessType, pending }) => ({ businessType, pending })), [
+    { businessType: "ARTICLE_PROBE", pending: 2 },
+    { businessType: "ENTRY_MONITOR", pending: 30 }
+  ]);
+  assert.match(client.queries[0]!.sql, /d\.business_type IN \(\?, \?\)/);
+  assert.match(client.queries[0]!.sql, /GROUP BY d\.business_type/);
+  assert.deepEqual(client.queries[0]!.parameters, [
+    "ARTICLE_PROBE", "ENTRY_MONITOR", "NEW_RPA"
+  ]);
 });

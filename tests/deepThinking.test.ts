@@ -287,6 +287,74 @@ test("千问新版思考按钮可直接确认深度思考关闭且不点击", as
   }
 });
 
+test("千问新版快速模式可直接确认深度思考关闭且不点击", async () => {
+  assert.ok(browser);
+  const page = await browser.newPage();
+  try {
+    await page.setContent(`
+      <button id="mode" type="button" aria-label="快速"
+        aria-expanded="false" aria-haspopup="menu">快速</button>
+      <script>
+        document.querySelector("#mode").addEventListener("click", () => {
+          document.body.dataset.clickCount = "1";
+        });
+      </script>
+    `);
+    const result = await ensureDeepThinkingState(
+      page,
+      PLATFORMS.qianwen,
+      false,
+      "fail"
+    );
+    assert.deepEqual(result, {
+      requested: false,
+      actual: false,
+      changed: false,
+      degraded: false
+    });
+    assert.equal(await clickCount(page), 0);
+  } finally {
+    await page.close();
+  }
+});
+
+test("千问要求关闭时找不到模式控件会按未知状态降级继续", async () => {
+  assert.ok(browser);
+  const page = await browser.newPage();
+  try {
+    await page.setContent("<main>千问输入框已加载，但模式控件不可见</main>");
+    const result = await ensureDeepThinkingState(
+      page,
+      PLATFORMS.qianwen,
+      false,
+      "fail"
+    );
+    assert.deepEqual(result, {
+      requested: false,
+      actual: null,
+      changed: false,
+      degraded: true
+    });
+  } finally {
+    await page.close();
+  }
+});
+
+test("千问要求开启时找不到模式控件仍然阻止发送", async () => {
+  assert.ok(browser);
+  const page = await browser.newPage();
+  try {
+    await page.setContent("<main>千问输入框已加载，但模式控件不可见</main>");
+    await assert.rejects(
+      () => ensureDeepThinkingState(page, PLATFORMS.qianwen, true, "fail"),
+      (error: unknown) => error instanceof DeepThinkingTechnicalError &&
+        error.errorCode === "DOM_CHANGED" && /找不到/.test(error.message)
+    );
+  } finally {
+    await page.close();
+  }
+});
+
 test("元宝新版 selected class 可幂等识别并切换深度思考", async () => {
   assert.ok(browser);
   const page = await browser.newPage();

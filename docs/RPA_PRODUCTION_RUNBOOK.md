@@ -9,6 +9,8 @@
 - Browser/CDP/标签页关闭或跳转支持有限次数重新连接和页面重新发现；若题目已经提交，重连路径只读检查原问题锚点、回答和引用，不再次点击发送，并把页面操作句柄重新绑定到原批次会话。登录、验证码和限流不进行无限刷新；DOM_CHANGED 仅按固定间隔只读复检，连续确认 READY 后才恢复。
 - 可选数据库调度通过 `next_retry_at`、`last_error_code`、`last_error_at` 释放失败任务的平台执行权；退避采用有上限指数算法和随机抖动。
 - 增加磁盘停止领取阈值、JSONL 日志滚动、日志/证据保留期、错误分类和指标输出；Outbox/quarantine 不属于清理范围。
+- monitor 新增默认关闭的 `ENTRY_MONITOR` 路由：execution 是唯一队列，上海自然日双检，
+  项目 × 平台 × 自然日复用会话；`DIAGNOSIS` 查询与页面策略不依赖该开关。
 
 ## 2. 新数据结构和兼容边界
 
@@ -24,6 +26,11 @@
 - `worker_provider varchar(32) NOT NULL DEFAULT 'LEGACY'`
 
 Java DO 只增加同名属性，回答表和引用表字段、事务顺序、状态 0/1/2/3 语义均未改变。旧代码忽略新增 nullable/default 字段仍可运行。
+
+ENTRY_MONITOR 还依赖 Java 提供一对一、不可变的 execution context（或等价只读 API）：
+`project_id`、`intent_entry_id`、`monitor_date`、`repetition_no`。爬虫实现按建议表名
+`rpa_task_execution_context` 查询，但不会创建表、执行 DDL 或回查发布/probe 业务表补字段。
+若生产协议字段名不同，必须先对齐查询；上下文缺失时禁止发送。
 
 重要限制：兼容 migration 不会切换任务，最终切换由独立 `cutover_to_new` 脚本完成。如果旧 RPA 仍无条件扫描 `status=0`，单任务真实测试窗口和最终切换窗口都必须先停止旧 RPA。没有确认旧进程停止时，新 Worker 必须保持 dry-run。
 
@@ -53,6 +60,8 @@ Java DO 只增加同名属性，回答表和引用表字段、事务顺序、状
 - `BROWSER_RECONNECT_BACKOFF_MS=2000`
 - `WATCHDOG_STALL_MS=300000`
 - `STALE_AFTER_MS=300000`
+- `RPA_DIAGNOSIS_BRAND_WINDOW_SIZE=2`（当前品牌加最多领先一个品牌；设为 0 可临时关闭）
+- `RPA_DIAGNOSIS_BRAND_BARRIER_PLATFORMS=doubao,deepseek,qianwen,yuanbao`
 - `PLATFORM_RECHECK_INTERVAL_MS=60000`
 - `PLATFORM_READY_CONFIRMATIONS=2`
 - `PLATFORM_PROCESS_RESTART_MS=5000`
@@ -83,10 +92,10 @@ npm run rpa:gray:validate -- --worker=diagnosis --platforms=doubao \
 
 1. 单品牌单平台：只开一个平台，确认批内同 conversationGroupId。
 2. 单品牌四平台：每个平台独立 Chrome 页面；确认平台间并行、平台内串行。
-3. A 后 B：检查日志中同平台 A 批次完成时间早于 B 开始时间。
+3. A、B、C 滑动窗口：让某个平台先完成 A、B，确认 A 四平台未全部成功前该平台不能领取 C；A 完成后确认窗口自动变为 B、C。
 4. 回答后断 DB：等待 Outbox 文件出现，恢复 DB；确认只回放数据库且回答只有一条。
 5. 关闭标签页：在未提交题或专门测试题中关闭，确认最多重连配置次数并重新发现页面。
-6. Worker 异常终止：不得在 Outbox 写盘失败期间强杀；普通处理中断后等 stale 阈值，确认 advisory lock 互斥恢复。
+6. Worker 异常终止：不得在 Outbox 写盘失败期间强杀；确认数据库心跳不会重置业务看门狗，5 分钟无真实任务进展时仅异常平台断开 CDP、回滚未提交任务并释放 advisory lock，由 Fleet 单独拉起后立即执行 stale 恢复。
 7. 引用入口存在但解析失败：DOM fixture/受控页面必须产生 `REFERENCE_UNKNOWN`，数据库不得出现空引用成功。
 8. ARTICLE_PROBE：分别验证 URL 严格命中、疑似转载、平台明确无引用；UNKNOWN 不进入未曝光统计。
 9. 磁盘不足：把停止阈值临时设为高于测试机可用空间，确认不领取；已有 Outbox 仍优先回放。

@@ -1,7 +1,7 @@
 import { mkdir, open, rename } from "node:fs/promises";
 import path from "node:path";
 import type { PlatformHealthStatus } from "./platformExecution.js";
-import type { RpaWorkerType } from "./rpaTask.js";
+import type { RpaBusinessType, RpaWorkerType } from "./rpaTask.js";
 import type { PlatformId } from "./types.js";
 
 export interface TaskStateMetrics {
@@ -42,6 +42,7 @@ export interface RpaMetricsSnapshot {
   outboxPending: number;
   outboxCorrupted: number;
   diskFreeBytes: number | null;
+  businessTypes: Partial<Record<RpaBusinessType, TaskStateMetrics>>;
   totals: {
     taskStates: TaskStateMetrics;
     taskWait: DurationMetrics;
@@ -84,6 +85,7 @@ export class MetricsRegistry {
   private outboxCorrupted = 0;
   private diskFreeBytes: number | null = null;
   private heartbeatAt: Date;
+  private readonly businessTypeTaskStates = new Map<RpaBusinessType, TaskStateMetrics>();
 
   constructor(
     readonly workerType: RpaWorkerType,
@@ -117,6 +119,28 @@ export class MetricsRegistry {
       const next = states.get(platform);
       metrics.taskStates = next ? normalizeTaskStates(next) : emptyTaskStates();
     }
+  }
+
+  replaceBusinessTypeTaskStates(
+    states: ReadonlyMap<RpaBusinessType, Readonly<TaskStateMetrics>>
+  ): void {
+    this.businessTypeTaskStates.clear();
+    for (const [businessType, taskStates] of states) {
+      this.businessTypeTaskStates.set(businessType, normalizeTaskStates(taskStates));
+    }
+  }
+
+  transitionBusinessTypeTaskState(
+    businessType: RpaBusinessType,
+    from: TaskStateMetricName,
+    to: TaskStateMetricName,
+    count = 1
+  ): void {
+    const amount = nonNegativeInteger(count, "businessTypeTaskStateTransitionCount");
+    const states = this.businessTypeTaskStates.get(businessType) ?? emptyTaskStates();
+    states[from] = Math.max(0, states[from] - amount);
+    states[to] += amount;
+    this.businessTypeTaskStates.set(businessType, states);
   }
 
   transitionTaskState(
@@ -181,6 +205,12 @@ export class MetricsRegistry {
       outboxPending: this.outboxPending,
       outboxCorrupted: this.outboxCorrupted,
       diskFreeBytes: this.diskFreeBytes,
+      businessTypes: Object.fromEntries(
+        [...this.businessTypeTaskStates].map(([businessType, states]) => [
+          businessType,
+          { ...states }
+        ])
+      ),
       totals: {
         taskStates: sumTaskStates(platforms.map(({ taskStates }) => taskStates)),
         taskWait: sumDurations(platforms.map(({ taskWait }) => taskWait)),

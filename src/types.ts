@@ -29,6 +29,11 @@ export interface DeepThinkingControlConfig {
   enabledClassNameFragment?: string;
   /** 页面明确展示“已关闭”模式时使用；仅用于读状态，不会被点击。 */
   disabledStateSelectors?: string[];
+  /**
+   * 请求关闭时若页面没有可识别控件，是否允许按状态未知降级继续。
+   * 仅适用于“关闭”目标；请求开启时仍必须找到并确认控件。
+   */
+  allowMissingControlWhenDisabled?: boolean;
 }
 
 /** business 模式的输入批次；三项身份共同决定对话隔离边界。 */

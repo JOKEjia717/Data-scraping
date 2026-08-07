@@ -6,6 +6,7 @@ import { chromium, type Locator, type Page } from "playwright";
 import {
   clickLatestQianwenRegenerate,
   countDeepSeekReferenceContainers,
+  countCurrentDeepSeekWebReferences,
   countDoubaoSearchResultBlocks,
   countQianwenReferenceTriggers,
   countReferenceRevealButtons,
@@ -801,6 +802,12 @@ export async function inspectCurrentQuestionAnswer(
     if (outcome.status === "answered" && outcome.answerContent?.trim()) {
       const busy = await isAnswerGenerating(page, config.id).catch(() => true);
       if (busy) return { status: "uncertain", reason: "当前页面仍显示回答生成中" };
+      if (!shouldCompleteQianwenAttempt(outcome, busy)) {
+        return {
+          status: "uncertain",
+          reason: "当前问题已按消息 ID 配对到正文，但尚未确认来源入口或回答完成状态"
+        };
+      }
       return {
         status: "answered",
         answerContent: outcome.answerContent,
@@ -841,7 +848,7 @@ export async function inspectCurrentQuestionAnswer(
     }
   }
   if (config.id === "yuanbao" || config.id === "doubao") {
-    const structured = await inspectStructuredMessagePair(
+    let structured = await inspectStructuredMessagePair(
       page,
       config.id,
       submittedQuestion
@@ -852,6 +859,27 @@ export async function inspectCurrentQuestionAnswer(
         return { status: "uncertain", reason: "当前页面仍显示回答生成中" };
       }
       if (structured.answerContent.trim()) {
+        if (config.id === "doubao") {
+          const firstAnswerContent = structured.answerContent.trim();
+          await page.waitForTimeout(DOUBAO_RECOVERY_ANSWER_STABLE_MS);
+          const settledPair = await inspectStructuredMessagePair(
+            page,
+            "doubao",
+            submittedQuestion
+          ).catch(() => null);
+          const stillBusy = await isAnswerGenerating(page, "doubao").catch(() => true);
+          if (
+            !settledPair?.matched ||
+            stillBusy ||
+            settledPair.answerContent.trim() !== firstAnswerContent
+          ) {
+            return {
+              status: "uncertain",
+              reason: "豆包已配对到本题回答，但正文尚未连续稳定或生成状态再次出现"
+            };
+          }
+          structured = settledPair;
+        }
         return {
           status: "answered",
           answerContent: structured.answerContent,
@@ -859,6 +887,19 @@ export async function inspectCurrentQuestionAnswer(
         };
       }
       return { status: "uncertain", reason: "已定位本题消息，但配对回答正文为空" };
+    }
+    if (config.id === "doubao") {
+      const baselineAnswer = await inspectDoubaoBaselineAnswerSettled(
+        page,
+        submittedQuestion
+      ).catch(() => null);
+      if (baselineAnswer?.answerContent) {
+        return {
+          status: "answered",
+          answerContent: baselineAnswer.answerContent,
+          reason: "本题问题气泡已被回收，但已按提交前元素基线确认新增回答、引用入口和停止生成状态"
+        };
+      }
     }
     if (structured && structured.userMessageCount === 0) {
       return { status: "absent", reason: "当前会话没有真实用户问题消息" };
@@ -1027,6 +1068,45 @@ async function inspectStructuredMessagePair(
   );
 }
 
+/**
+ * 豆包长会话会回收问题气泡。气泡缺失时只接受提交前 WeakSet 基线之后新挂载的
+ * 回答容器与搜索入口，并要求正文在停止生成后持续稳定；基线随 document 重载
+ * 自动失效，因此不会退化为读取整页最后一段历史正文。
+ */
+async function inspectDoubaoBaselineAnswerSettled(
+  page: Page,
+  submittedQuestion: string,
+  timeoutMs = 3_000
+): Promise<{ answerContent: string } | null> {
+  const deadline = Date.now() + Math.max(timeoutMs, DOUBAO_RECOVERY_ANSWER_STABLE_MS);
+  let stableAnswerContent = "";
+  let stableSince = 0;
+
+  while (Date.now() < deadline) {
+    const [hasReferenceEntry, answerContent, busy] = await Promise.all([
+      hasCurrentDoubaoReferenceEntry(page, submittedQuestion, 0).catch(() => false),
+      extractLatestPlatformAnswer(page, "doubao").catch(() => ""),
+      isAnswerGenerating(page, "doubao").catch(() => true)
+    ]);
+    const currentAnswerContent = answerContent.trim();
+    if (hasReferenceEntry && currentAnswerContent && !busy) {
+      if (currentAnswerContent !== stableAnswerContent) {
+        stableAnswerContent = currentAnswerContent;
+        stableSince = Date.now();
+      } else if (Date.now() - stableSince >= DOUBAO_RECOVERY_ANSWER_STABLE_MS) {
+        return { answerContent: currentAnswerContent };
+      }
+    } else {
+      stableAnswerContent = "";
+      stableSince = 0;
+    }
+
+    await page.waitForTimeout(Math.min(250, Math.max(1, deadline - Date.now())));
+  }
+
+  return null;
+}
+
 export function canonicalQuestionIdentity(value: string): string {
   return value
     .normalize("NFKC")
@@ -1044,6 +1124,8 @@ export interface QianwenQuestionAttemptInspection {
 
 const QIANWEN_INSPECTION_SETTLE_TIMEOUT_MS = 5_000;
 const QIANWEN_INSPECTION_POLL_INTERVAL_MS = 200;
+const QIANWEN_ANSWER_STABLE_MS = 1_500;
+const DOUBAO_RECOVERY_ANSWER_STABLE_MS = 1_200;
 
 /**
  * 千问会先挂载问题节点，再异步挂载同 message-id 的回答节点和 complete class。
@@ -1063,14 +1145,18 @@ async function inspectQianwenQuestionAttemptSettled(
     submittedQuestion,
     excludedQuestionMessageIds
   );
+  let stableAnswerContent = outcome.status === "answered"
+    ? outcome.answerContent?.trim() ?? ""
+    : "";
+  let stableSince = stableAnswerContent ? Date.now() : 0;
 
-  while (
-    Date.now() < deadline &&
-    (
-      outcome.status === "pending" ||
-      (outcome.status === "answered" && outcome.answerComplete === false)
-    )
-  ) {
+  while (Date.now() < deadline) {
+    const hasCompletionSignal = outcome.status === "answered" &&
+      (outcome.answerComplete === true || outcome.hasReferenceTrigger === true);
+    const stableForMs = stableSince > 0 ? Date.now() - stableSince : 0;
+    if (hasCompletionSignal && stableForMs >= QIANWEN_ANSWER_STABLE_MS) return outcome;
+    if (outcome.status === "absent" || outcome.status === "system_timeout") return outcome;
+
     await page.waitForTimeout(Math.min(
       QIANWEN_INSPECTION_POLL_INTERVAL_MS,
       Math.max(1, deadline - Date.now())
@@ -1080,6 +1166,16 @@ async function inspectQianwenQuestionAttemptSettled(
       submittedQuestion,
       excludedQuestionMessageIds
     );
+    const currentAnswerContent = outcome.status === "answered"
+      ? outcome.answerContent?.trim() ?? ""
+      : "";
+    if (!currentAnswerContent) {
+      stableAnswerContent = "";
+      stableSince = 0;
+    } else if (currentAnswerContent !== stableAnswerContent) {
+      stableAnswerContent = currentAnswerContent;
+      stableSince = Date.now();
+    }
   }
 
   return outcome;
@@ -1121,28 +1217,68 @@ export async function inspectQianwenQuestionAttempt(
     )).find((element) => element.getAttribute("data-chat-answers-wrap") === messageId);
     if (!answer) return { status: "pending" as const, messageId };
 
-    const markdown = answer.querySelector<HTMLElement>(".qk-markdown");
-    const answerContent = (markdown?.innerText || markdown?.textContent || "")
-      .replace(/\s+/g, " ")
-      .trim();
-    if (answerContent) {
-      return {
-        status: "answered" as const,
-        messageId,
-        answerContent,
-        answerComplete: markdown?.classList.contains("qk-markdown-complete") === true,
-        hasReferenceTrigger: Boolean(answer.querySelector('[class~="link-title-igf0OC"]'))
-      };
-    }
-
     const answerText = (answer.innerText || answer.textContent || "")
       .replace(/\s+/g, " ")
       .trim();
     const systemTimeout = /(?:系统|请求|服务).{0,8}超时.{0,12}(?:稍后|重新)(?:重试|再试)/u
       .test(answerText);
-    return systemTimeout
-      ? { status: "system_timeout" as const, messageId }
-      : { status: "pending" as const, messageId };
+    if (systemTimeout) return { status: "system_timeout" as const, messageId };
+
+    const contentCandidates = Array.from(answer.querySelectorAll<HTMLElement>([
+      ".qk-markdown",
+      "[data-testid*='answer-content' i]",
+      "[data-testid*='markdown' i]",
+      "[class*='answer-content' i]",
+      "[class*='markdown' i]",
+      "article",
+      ".answer-common-card"
+    ].join(", ")));
+    if (contentCandidates.length === 0) contentCandidates.push(answer);
+
+    let answerContent = "";
+    for (const candidate of contentCandidates) {
+      const clone = candidate.cloneNode(true) as HTMLElement;
+      for (const removable of clone.querySelectorAll([
+        '[id^="reference-link-anchor-"]',
+        '[class*="reference-wrap-"]',
+        '[class~="link-title-igf0OC"]',
+        "button",
+        "[role='button']",
+        "[data-copy-ignore]",
+        "[class*='options-item-']",
+        "[class~='qk-md-has-multi-modal']",
+        "script",
+        "style",
+        "noscript",
+        "[aria-hidden='true']",
+        "[contenteditable='true']"
+      ].join(", "))) removable.remove();
+      const text = (clone.innerText || clone.textContent || "")
+        .replace(/\s+/g, " ")
+        .trim();
+      const sourceOrControlOnly = /^(?:(?:参考)?来源|\d+\s*篇来源|复制|重新生成|赞|踩|分享|更多)+$/u
+        .test(text.replace(/\s+/g, ""));
+      if (!sourceOrControlOnly && text.length >= 4 && text.length > answerContent.length) {
+        answerContent = text;
+      }
+    }
+    if (answerContent) {
+      const markdown = answer.querySelector<HTMLElement>(".qk-markdown");
+      return {
+        status: "answered" as const,
+        messageId,
+        answerContent,
+        answerComplete: Boolean(answer.querySelector(
+          ".qk-markdown-complete, [data-chat-status='finished'], " +
+          "[data-status='finished'], [class*='answer-complete']"
+        )) || markdown?.classList.contains("qk-markdown-complete") === true,
+        hasReferenceTrigger: Boolean(answer.querySelector(
+          '[id^="reference-link-anchor-"], [class*="reference-wrap-"], ' +
+          '[class~="link-title-igf0OC"]'
+        ))
+      };
+    }
+    return { status: "pending" as const, messageId };
   }, {
     expectedQuestion: submittedQuestion,
     excludedIds: [...excludedQuestionMessageIds]
@@ -1238,12 +1374,25 @@ export async function recoverSubmittedQuestionResult(
       "business",
       options.allowUnverifiedZeroReferences === true
     );
-    const inspection = await inspectCurrentQuestionAnswer(
-      page,
-      config,
-      submittedQuestion,
-      "business"
-    );
+    let inspection: CurrentQuestionAnswerInspection | null = null;
+    const probeDelaysMs = config.id === "doubao"
+      ? [0, 1_000, 2_500, 5_000, 8_000, 12_000]
+      : [0, 1_000, 2_500];
+    for (const delayMs of probeDelaysMs) {
+      if (delayMs > 0) await page.waitForTimeout(delayMs);
+      inspection = await inspectCurrentQuestionAnswer(
+        page,
+        config,
+        submittedQuestion,
+        "business"
+      );
+      if (inspection.status === "answered" || inspection.status === "retryable") break;
+    }
+    if (!inspection) {
+      throw Object.assign(new Error(`${config.name} 提交后 DOM 恢复检查未执行`), {
+        errorCode: "REFERENCE_UNKNOWN"
+      });
+    }
     if (inspection.status === "retryable" && config.id === "qianwen") {
       throw new QianwenSystemTimeoutError(
         `[千问] 当前问题对应的回答卡明确显示系统超时，需要重新发送原问题。`
@@ -1271,6 +1420,15 @@ export async function recoverSubmittedQuestionResult(
       false
     );
     if (!referenceReady) {
+      const declaredDeepSeekReferenceCount = config.id === "deepseek"
+        ? await countCurrentDeepSeekWebReferences(page, submittedQuestion)
+        : 0;
+      if (declaredDeepSeekReferenceCount > 0) {
+        throw Object.assign(new Error(
+          `DeepSeek 当前回答明确声明已阅读 ${declaredDeepSeekReferenceCount} 个网页，` +
+          "但搜索结果面板未能展开或稳定，不能误记为零引用"
+        ), { errorCode: "REFERENCE_UNKNOWN" });
+      }
       if (options.requireReferences === true) {
         throw Object.assign(new Error(`${config.name} 当前回答没有可确认的参考列表`), {
           errorCode: "REFERENCE_UNKNOWN"
@@ -2111,19 +2269,101 @@ export async function submitQuestion(
   }
 
   const clickedSend = await clickSendButton(page, config.sendButtonSelectors);
-  if (!clickedSend) await page.keyboard.press("Enter");
-
-  if (messageBaseline) {
-    await waitForSubmittedQuestionMessage(
+  if (!clickedSend) {
+    await pressEnterToSend(page, inputBox);
+  } else {
+    // click() 成功只表示浏览器完成了点击，不代表站点接收了问题。给页面一个短暂的
+    // 回显窗口；如果输入内容仍原样保留且没有本题气泡，才使用 Enter 兜底，避免重复发送。
+    const clickConfirmation = await waitForSubmittedQuestionMessage(
       page,
       config,
       question,
       messageBaseline,
-      confirmationTimeoutMs,
-      doubaoGeneratingBeforeSubmit
+      Math.min(2_500, confirmationTimeoutMs),
+      inputBox,
+      doubaoGeneratingBeforeSubmit,
+      false
     );
+    if (clickConfirmation.confirmed) return;
+    if (!clickConfirmation.inputCleared && !clickConfirmation.questionAccepted) {
+      await pressEnterToSend(page, inputBox);
+    }
   }
 
+  let finalConfirmation = await waitForSubmittedQuestionMessage(
+    page,
+    config,
+    question,
+    messageBaseline,
+    confirmationTimeoutMs,
+    inputBox,
+    doubaoGeneratingBeforeSubmit,
+    false
+  );
+  if (finalConfirmation.confirmed) return;
+
+  // DeepSeek 偶发出现真实发送按钮可见、可点击且未被遮挡，但 Playwright 鼠标点击
+  // 与 Enter 都没有进入 React 提交处理器的情况。只有在等待完整确认窗口后，输入框
+  // 仍精确保留本题且页面不存在本题问题消息时，才允许对同一真实按钮补一次 DOM
+  // click；任何一项状态已经变化都禁止补点，避免把慢回显误判成未提交而重复发送。
+  if (
+    config.id === "deepseek" &&
+    !finalConfirmation.inputCleared &&
+    !finalConfirmation.questionAccepted &&
+    await hasExactUnsubmittedComposerDraft(page, config, question)
+  ) {
+    const domClicked = await clickSendButtonViaDom(page, config.sendButtonSelectors);
+    if (domClicked) {
+      console.log("[DeepSeek] 常规点击与 Enter 均无提交状态变化，执行一次精确 DOM click 兜底。");
+      finalConfirmation = await waitForSubmittedQuestionMessage(
+        page,
+        config,
+        question,
+        messageBaseline,
+        Math.min(10_000, confirmationTimeoutMs),
+        inputBox,
+        doubaoGeneratingBeforeSubmit,
+        false
+      );
+      if (finalConfirmation.confirmed) return;
+    }
+  }
+
+  const missing = [
+    finalConfirmation.inputCleared ? "" : "输入框未清空",
+    finalConfirmation.questionAccepted ? "" : "没有出现本题真实问题消息"
+  ].filter(Boolean).join("，");
+  throw new Error(
+    `[${config.name}] 发送控件已触发，但提交确认失败：${missing}；` +
+    "已停止且不会自动重复发送。"
+  );
+}
+
+/**
+ * 只把“输入框仍精确等于本题，并且页面完全没有本题问题项”识别为明确未提交。
+ * 该条件用于 DeepSeek 的安全重试；历史同文问题存在时会保守返回 false。
+ */
+export async function hasExactUnsubmittedComposerDraft(
+  page: Page,
+  config: PlatformConfig,
+  question: string
+): Promise<boolean> {
+  const inputBox = await findInput(page, config.inputSelectors, 500);
+  if (!inputBox) return false;
+  const inputText = await readComposerInputText(inputBox);
+  if (
+    inputText === null ||
+    canonicalQuestionIdentity(inputText) !== canonicalQuestionIdentity(question)
+  ) return false;
+
+  if (config.id === "deepseek") {
+    const attempt = await inspectDeepSeekQuestionAttempt(page, question).catch(() => ({
+      status: "pending" as const
+    }));
+    return attempt.status === "absent";
+  }
+  const snapshot = await snapshotSubmittedQuestionMessages(page, config.id, question);
+  return snapshot.matchingKeys.length === 0;
 }
 
 export interface InterruptingPopupDismissal {
@@ -2268,11 +2508,7 @@ async function snapshotSubmittedQuestionMessages(
   page: Page,
   platformId: PlatformId,
   question: string
-): Promise<SubmittedQuestionMessageSnapshot | null> {
-  if (platformId !== "doubao" && platformId !== "qianwen" && platformId !== "yuanbao") {
-    return null;
-  }
-
+): Promise<SubmittedQuestionMessageSnapshot> {
   return page.evaluate(
     ({ platform, expected }) => {
       let messages: Element[] = [];
@@ -2292,6 +2528,10 @@ async function snapshotSubmittedQuestionMessages(
           !element.parentElement?.closest("[data-chat-question-wrap], .message-card-wrap.question")
         );
         keyAttribute = "data-chat-question-wrap";
+      } else if (platform === "deepseek") {
+        messages = Array.from(document.querySelectorAll("[data-virtual-list-item-key]"))
+          .filter((element) => Boolean(element.querySelector(":scope > .ds-message")));
+        keyAttribute = "data-virtual-list-item-key";
       } else {
         messages = Array.from(document.querySelectorAll("[data-conv-speaker='human']"));
         keyAttribute = "data-conv-idx";
@@ -2359,53 +2599,99 @@ async function snapshotSubmittedQuestionMessages(
   }));
 }
 
+interface SubmittedQuestionConfirmation {
+  confirmed: boolean;
+  inputCleared: boolean;
+  questionAccepted: boolean;
+}
+
 async function waitForSubmittedQuestionMessage(
   page: Page,
   config: PlatformConfig,
   question: string,
   baseline: SubmittedQuestionMessageSnapshot,
   timeoutMs: number,
-  doubaoGeneratingBeforeSubmit = false
-): Promise<void> {
+  inputBox: Locator,
+  doubaoGeneratingBeforeSubmit = false,
+  throwOnTimeout = true
+): Promise<SubmittedQuestionConfirmation> {
   const startedAt = Date.now();
   const baselineKeys = new Set(baseline.matchingKeys);
   const baselineDoubaoQuestionEvidenceKeys = new Set(baseline.doubaoQuestionEvidenceKeys);
   const baselineDoubaoAnswerEvidenceKeys = new Set(baseline.doubaoAnswerEvidenceKeys);
+  let inputCleared = false;
+  let questionAccepted = false;
   while (Date.now() - startedAt < timeoutMs) {
     if (page.isClosed()) throw new Error(`[${config.name}] 提交后页面已关闭，无法确认问题消息。`);
     await dismissInterruptingPopup(page, config.id);
-    const current = await snapshotSubmittedQuestionMessages(page, config.id, question);
-    if (current) {
-      const hasNewMatchingKey = current.matchingKeys.some((key) => !baselineKeys.has(key));
-      const matchingCountGrew = current.matchingKeys.length > baseline.matchingKeys.length;
-      if (hasNewMatchingKey || matchingCountGrew) return;
+    const [current, cleared] = await Promise.all([
+      snapshotSubmittedQuestionMessages(page, config.id, question),
+      isComposerInputCleared(page, config, inputBox)
+    ]);
+    inputCleared ||= cleared;
+    const hasNewMatchingKey = current.matchingKeys.some((key) => !baselineKeys.has(key));
+    const matchingCountGrew = current.matchingKeys.length > baseline.matchingKeys.length;
+    questionAccepted ||= hasNewMatchingKey || matchingCountGrew;
 
-      if (config.id === "doubao") {
-        const hasNewQuestionEvidence = current.doubaoQuestionEvidenceKeys.some(
-          (key) => !baselineDoubaoQuestionEvidenceKeys.has(key)
-        );
-        const hasNewAnswerEvidence = current.doubaoAnswerEvidenceKeys.some(
-          (key) => !baselineDoubaoAnswerEvidenceKeys.has(key)
-        );
-        const hasNewReferenceEntry =
-          current.doubaoReferenceEntryCount > baseline.doubaoReferenceEntryCount;
-        const generationStarted = !doubaoGeneratingBeforeSubmit &&
-          await isAnswerGenerating(page, "doubao").catch(() => false);
-        if (
-          hasNewQuestionEvidence ||
-          hasNewAnswerEvidence ||
-          hasNewReferenceEntry ||
-          generationStarted
-        ) return;
-      }
+    if (config.id === "doubao" && !questionAccepted) {
+      const hasNewQuestionEvidence = current.doubaoQuestionEvidenceKeys.some(
+        (key) => !baselineDoubaoQuestionEvidenceKeys.has(key)
+      );
+      const hasNewAnswerEvidence = current.doubaoAnswerEvidenceKeys.some(
+        (key) => !baselineDoubaoAnswerEvidenceKeys.has(key)
+      );
+      const hasNewReferenceEntry =
+        current.doubaoReferenceEntryCount > baseline.doubaoReferenceEntryCount;
+      const generationStarted = !doubaoGeneratingBeforeSubmit &&
+        await isAnswerGenerating(page, "doubao").catch(() => false);
+      // 豆包第二题偶尔会回收用户气泡；新增的本题精确文本、回答流或搜索结构
+      // 都能证明问题已被接收，但仍必须同时确认输入框已经清空。
+      questionAccepted = hasNewQuestionEvidence || hasNewAnswerEvidence ||
+        hasNewReferenceEntry || generationStarted;
+    }
+    if (inputCleared && questionAccepted) {
+      return { confirmed: true, inputCleared, questionAccepted };
     }
     await page.waitForTimeout(250);
   }
 
+  const outcome = { confirmed: false, inputCleared, questionAccepted };
+  if (!throwOnTimeout) return outcome;
+  const missing = [
+    inputCleared ? "" : "输入框未清空",
+    questionAccepted ? "" : "没有出现本题真实问题消息"
+  ].filter(Boolean).join("，");
   throw new Error(
-    `[${config.name}] 发送控件已触发，但 ${Math.round(timeoutMs / 1000)} 秒内没有出现本题真实问题消息；` +
+    `[${config.name}] 发送控件已触发，但 ${Math.round(timeoutMs / 1000)} 秒内提交确认失败：${missing}；` +
     "已停止且不会自动重复发送。"
   );
+}
+
+async function readComposerInputText(inputBox: Locator): Promise<string | null> {
+  return inputBox.evaluate((element) => {
+    if (element instanceof HTMLTextAreaElement || element instanceof HTMLInputElement) {
+      return element.value;
+    }
+    return (element as HTMLElement).innerText || element.textContent || "";
+  }).catch(() => null);
+}
+
+async function isComposerInputCleared(
+  page: Page,
+  config: PlatformConfig,
+  originalInput: Locator
+): Promise<boolean> {
+  const originalText = await readComposerInputText(originalInput);
+  if (originalText !== null) return originalText.trim().length === 0;
+  const currentInput = await findInput(page, config.inputSelectors, 250);
+  if (!currentInput) return false;
+  const currentText = await readComposerInputText(currentInput);
+  return currentText !== null && currentText.trim().length === 0;
+}
+
+async function pressEnterToSend(page: Page, inputBox: Locator): Promise<void> {
+  await inputBox.focus({ timeout: 2_000 }).catch(() => undefined);
+  await page.keyboard.press("Enter");
 }
 
 /** 从后向前寻找最新且可点击的发送控件。 */
@@ -2692,6 +2978,28 @@ async function snapshotTrackedAnswerBaseline(
   };
 }
 
+/** 只在调用方已经证明问题未提交后，对同一个可见发送控件执行一次 DOM click。 */
+async function clickSendButtonViaDom(page: Page, selectors: string[]): Promise<boolean> {
+  for (const selector of selectors) {
+    const locators = await page.locator(selector).all().catch(() => []);
+    for (const locator of locators.slice(-4).reverse()) {
+      const [visible, enabled, ariaDisabled] = await Promise.all([
+        locator.isVisible().catch(() => false),
+        locator.isEnabled().catch(() => false),
+        locator.getAttribute("aria-disabled").catch(() => null)
+      ]);
+      if (!visible || !enabled || ariaDisabled === "true") continue;
+      const clicked = await locator.evaluate((element) => {
+        if (!(element instanceof HTMLElement)) return false;
+        element.click();
+        return true;
+      }).catch(() => false);
+      if (clicked) return true;
+    }
+  }
+  return false;
+}
+
 /**
  * 千问点击“重新生成”后快速确认动作真正生效，避免点击失败后继续等待完整超时。
  */
@@ -2746,6 +3054,8 @@ async function waitForTrackedAnswerComplete(
   let sawAnswerStart = answerStartAlreadyConfirmed;
   let doubaoReferenceReadySince = 0;
   let qianwenStructuredAttemptObserved = false;
+  let qianwenStableAnswerContent = "";
+  let qianwenAnswerStableSince = 0;
   const referenceLabel = platformId === "qianwen" ? "参考来源" : "引用来源";
   const stableWindowMs = 12_000;
   const minWaitMs = 15_000;
@@ -2832,7 +3142,20 @@ async function waitForTrackedAnswerComplete(
           );
         }
       }
-      if (shouldCompleteQianwenAttempt(attempt, busy)) return;
+      const currentPairedAnswerContent = attempt.status === "answered"
+        ? attempt.answerContent?.trim() ?? ""
+        : "";
+      if (!currentPairedAnswerContent) {
+        qianwenStableAnswerContent = "";
+        qianwenAnswerStableSince = 0;
+      } else if (currentPairedAnswerContent !== qianwenStableAnswerContent) {
+        qianwenStableAnswerContent = currentPairedAnswerContent;
+        qianwenAnswerStableSince = Date.now();
+      }
+      const qianwenAnswerStableForMs = qianwenAnswerStableSince > 0
+        ? Date.now() - qianwenAnswerStableSince
+        : 0;
+      if (shouldCompleteQianwenAttempt(attempt, busy, qianwenAnswerStableForMs)) return;
 
       const currentAnswerText = extractCurrentQianwenAnswerText(
         snapshot,
@@ -2912,10 +3235,12 @@ export interface QianwenAnswerLoopDetection {
 
 export function shouldCompleteQianwenAttempt(
   attempt: QianwenQuestionAttemptInspection,
-  busy: boolean
+  busy: boolean,
+  answerStableForMs = Number.POSITIVE_INFINITY
 ): boolean {
   return attempt.status === "answered" &&
     !busy &&
+    answerStableForMs >= QIANWEN_ANSWER_STABLE_MS &&
     (attempt.answerComplete === true || attempt.hasReferenceTrigger === true);
 }
 

@@ -29,3 +29,13 @@ test("ARTICLE_PROBE 的 UNKNOWN 不能解释为未曝光或普通零引用", () 
       (error as { errorCode?: string }).errorCode === "REFERENCE_UNKNOWN"
   );
 });
+
+test("ENTRY_MONITOR 允许确认空引用，但 UNKNOWN 必须失败且不能额外重问", () => {
+  assert.doesNotThrow(() =>
+    assertPersistableReferenceResult("CONFIRMED_EMPTY", [], "ENTRY_MONITOR")
+  );
+  assert.throws(
+    () => assertPersistableReferenceResult("UNKNOWN", [], "ENTRY_MONITOR"),
+    /不能持久化/
+  );
+});

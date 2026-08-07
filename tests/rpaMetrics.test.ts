@@ -20,6 +20,9 @@ test("MetricsRegistry 聚合任务、耗时、零引用和低基数平台指标"
     ["deepseek", { pending: 4, processing: 2, succeeded: 6, finalFailed: 1 }]
   ]));
   registry.setOutboxPending(2);
+  registry.replaceBusinessTypeTaskStates(new Map([
+    ["DIAGNOSIS", { pending: 7, processing: 3, succeeded: 11, finalFailed: 3 }]
+  ]));
   registry.transitionTaskState("doubao", "pending", "processing");
   registry.transitionTaskState("doubao", "processing", "succeeded");
   registry.observeTaskWait("doubao", 1_000);
@@ -39,6 +42,12 @@ test("MetricsRegistry 聚合任务、耗时、零引用和低基数平台指标"
   assert.equal(snapshot.workerType, "diagnosis");
   assert.equal(snapshot.workerHeartbeatAt, now.toISOString());
   assert.equal(snapshot.outboxPending, 2);
+  assert.deepEqual(snapshot.businessTypes.DIAGNOSIS, {
+    pending: 7,
+    processing: 3,
+    succeeded: 11,
+    finalFailed: 3
+  });
   assert.deepEqual(snapshot.totals.taskStates, {
     pending: 6,
     processing: 3,

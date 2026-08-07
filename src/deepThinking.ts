@@ -58,6 +58,14 @@ export async function ensureDeepThinkingState(
 
   const control = await findDeepThinkingControl(page, config);
   if (!control) {
+    if (!requested && config.deepThinkingControl.allowMissingControlWhenDisabled) {
+      return {
+        requested,
+        actual: null,
+        changed: false,
+        degraded: true
+      };
+    }
     throw new DeepThinkingTechnicalError(
       `${config.name} 找不到可识别的深度思考开关，无法确认目标状态。`,
       "DOM_CHANGED"

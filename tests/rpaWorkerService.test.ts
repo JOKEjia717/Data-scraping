@@ -1,6 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import type { RpaWorkerRunSummary, RpaWorkerSession } from "../src/rpaWorker.js";
+import {
+  RpaWorkerRestartRequiredError,
+  type RpaWorkerRunSummary,
+  type RpaWorkerSession
+} from "../src/rpaWorker.js";
 import { parseRpaWorkerConfig } from "../src/rpaWorkerConfig.js";
 import {
   DefaultRpaWorkerCycleRunner,
@@ -247,6 +251,35 @@ test("单次运行模式下异常会被抛出且仍会关闭 CycleRunner", async
   assert.deepEqual(waiter.waits, []);
 });
 
+test("连续批次启动失败要求进程重启时不再服务内退避重试", async () => {
+  const runner = new FakeRunner();
+  const waiter = new FakeWaiter();
+  const service = new RpaWorkerService(config(), {
+    runner,
+    waiter,
+    onError: () => undefined
+  });
+  runner.execute = async () => {
+    throw new RpaWorkerRestartRequiredError(
+      "doubao",
+      "new-conversation",
+      3,
+      { cause: new Error("stale page handle") }
+    );
+  };
+
+  await assert.rejects(
+    () => service.run(),
+    (error: unknown) =>
+      error instanceof RpaWorkerRestartRequiredError &&
+      error.platformId === "doubao" &&
+      error.consecutiveFailures === 3
+  );
+  assert.equal(runner.calls, 1);
+  assert.equal(runner.closeCalls, 1);
+  assert.deepEqual(waiter.waits, []);
+});
+
 test("任务长期无进展时看门狗安全中止会话并以错误退出", async () => {
   const runner = new FakeRunner();
   runner.execute = async () => new Promise<RpaWorkerRunSummary>(() => undefined);
@@ -279,6 +312,69 @@ test("排空文件存在时不领取新批次并正常关闭", async () => {
   assert.equal(runner.closeCalls, 1);
   assert.equal(summary.stopped, true);
   assert.equal(waiter.wakeCount, 1);
+});
+
+test("execution heartbeat does not reset the business progress watchdog", async () => {
+  const runner = new FakeRunner();
+  let heartbeatTimer: NodeJS.Timeout | undefined;
+  let finishRun!: (summary: RpaWorkerRunSummary) => void;
+  runner.execute = async (_call, _shouldStop, onProgress) =>
+    new Promise<RpaWorkerRunSummary>((resolve) => {
+      finishRun = resolve;
+      heartbeatTimer = setInterval(() => onProgress?.("execution-heartbeat"), 2);
+    });
+  runner.abort = async () => {
+    runner.abortCalls++;
+    if (heartbeatTimer) clearInterval(heartbeatTimer);
+    finishRun(runSummary());
+  };
+  const service = new RpaWorkerService(config(), {
+    runner,
+    waiter: new FakeWaiter(),
+    watchdogStallMs: 20,
+    onError: () => undefined
+  });
+
+  await assert.rejects(
+    () => service.run(),
+    (error: unknown) => error instanceof WorkerStalledError && error.lastStage === "cycle-start"
+  );
+  assert.equal(runner.abortCalls, 1);
+  assert.equal(runner.closeCalls, 1);
+});
+
+test("default runner disconnects CDP and waits for run cleanup before closing leases", async () => {
+  const events: string[] = [];
+  let finishRun!: () => void;
+  const runGate = new Promise<void>((resolve) => { finishRun = resolve; });
+  const fakeSession = {
+    browserRuntime: {
+      browser: {
+        isConnected: () => true,
+        async close() {
+          events.push("browser-disconnected");
+          finishRun();
+        }
+      }
+    }
+  } as unknown as RpaWorkerSession;
+  const runner = new DefaultRpaWorkerCycleRunner(config(), {
+    createSession: () => fakeSession,
+    async runOnce() {
+      await runGate;
+      events.push("run-cleanup");
+      return runSummary();
+    },
+    async closeSession() {
+      events.push("session-closed");
+    },
+    abortCleanupMs: 100
+  });
+
+  const running = runner.runOnce(() => false);
+  await runner.abort(new Error("stalled"));
+  await running;
+  assert.deepEqual(events, ["browser-disconnected", "run-cleanup", "session-closed"]);
 });
 
 test("中断等待器对非法等待时长会立即报错", async () => {

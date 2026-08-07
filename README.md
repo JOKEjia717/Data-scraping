@@ -4,7 +4,35 @@
 
 每条记录包含：问题、抓取平台、引用排名、文章来源、文章时间、标题、摘要、URL 和抓取时间。默认问题位于 `src/questions.ts`，也可以在运行时传入 TXT 或 JSON 问题文件。
 
-## 正式 Worker：从零启动
+## 功能概览
+
+- 同时支持豆包、DeepSeek、千问和元宝，平台之间并发、单个平台内串行执行；
+- 提供 `research`（普通问题库）和 `business`（带租户、任务与品牌身份的批次）两种采集模式；
+- 支持回答正文与引用来源提取、URL 清洗去重、JSON/CSV 输出和 MySQL 事务入库；
+- 提供面向 `geno-digital-api` 的常驻 RPA Worker，包含 dry-run、灰度路由、健康检查、Outbox、指标、失败证据和安全停止；
+- 四个平台均可在发送前校验深度思考与联网搜索状态，避免在页面状态未知时产生不可解释的数据。
+
+> 本项目通过 CDP 操作已经登录的本机 Chrome，不负责启动 Chrome、自动登录或绕过验证码。平台页面改版后，DOM 选择器可能需要同步维护。
+
+## 先选择运行方式
+
+| 使用场景 | 从哪里开始 | 默认输出 |
+| --- | --- | --- |
+| 本地运行一批调研问题 | [本地采集：快速开始](#本地采集快速开始) | `results/` 与 MySQL；可用 `--database=false` 仅写文件 |
+| 运行带业务身份的品牌批次 | [Business 品牌批次模式](#business-品牌批次模式) | `results/` 与 MySQL |
+| 接管后端下发的生产 RPA 任务 | [生产 Worker：从零启动](#生产-worker从零启动) | RPA 数据库、Outbox、日志、证据与指标 |
+| 开发或适配平台页面改版 | [开发与验证](#开发与验证) | 类型检查与自动化测试结果 |
+
+生产部署前请同时阅读：
+
+- [RPA 生产运行手册](docs/RPA_PRODUCTION_RUNBOOK.md)：migration、灰度、切换、验证与回滚；
+- [Windows Worker 守护说明](docs/WINDOWS_WORKER_SUPERVISION.md)：计划任务安装、停止与升级；
+- [.env.example](.env.example)：全部环境变量、默认值与安全门禁。
+
+## 生产 Worker：从零启动
+
+如果只是从问题文件运行本地采集，不需要配置本节的 RPA Worker，请直接前往
+[本地采集：快速开始](#本地采集快速开始)。
 
 如果目标是接管 `geno-digital-api` 的全部 RPA 任务，只按下面顺序操作。完整接管前必须执行
 database migration；如果只有生产数据库，先按下方“生产库兼容测试”使用单平台和指定业务任务
@@ -13,7 +41,8 @@ database migration；如果只有生产数据库，先按下方“生产库兼�
 ### 只有生产数据库时的兼容测试
 
 首次验证可以先不部署 Java provider 代码、不执行 migration：保持
-`PROVIDER_ROUTING_ENABLED=false` 和 `DATABASE_RETRY_SCHEDULE_ENABLED=false`，暂停旧 RPA，
+`RPA_WORKER_PROVIDER_ROUTING_ENABLED=false` 和
+`RPA_WORKER_DATABASE_RETRY_SCHEDULE_ENABLED=false`，暂停旧 RPA，
 通过现有后端创建一个专用测试业务任务，然后使用
 `--gray-business-task-ids=<业务任务ID> --platforms=doubao --run-once=true --max-tasks=1`
 限制新 Worker。dry-run 确认只命中该批次后，才临时增加
@@ -25,11 +54,21 @@ database migration；如果只有生产数据库，先按下方“生产库兼�
 
 ### 1. 安装并创建配置
 
+在项目根目录安装锁定版本的依赖：
+
 ```bash
-cd /Users/joke/Desktop/爬虫
-npm install
+npm ci
 cp -n .env.example .env
 ```
+
+Windows PowerShell 使用：
+
+```powershell
+npm.cmd ci
+Copy-Item .env.example .env
+```
+
+如果 `.env` 已存在，请不要覆盖，直接检查并补充新增配置项。
 
 然后编辑 `.env`，至少填写：
 
@@ -61,13 +100,13 @@ macOS：
 ```bash
 "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
   --remote-debugging-port=9222 \
-  --user-data-dir=/Users/joke/Desktop/爬虫/.chrome-profiles/diagnosis
+  --user-data-dir="$PWD/.chrome-profiles/diagnosis"
 ```
 
 ```bash
 "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
   --remote-debugging-port=9223 \
-  --user-data-dir=/Users/joke/Desktop/爬虫/.chrome-profiles/monitor
+  --user-data-dir="$PWD/.chrome-profiles/monitor"
 ```
 
 Windows PowerShell（先进入项目根目录）：
@@ -95,7 +134,6 @@ Windows PowerShell（先进入项目根目录）：
 ### 3. 健康检查
 
 ```bash
-cd /Users/joke/Desktop/爬虫
 npm run rpa:diagnosis:health
 npm run rpa:monitor:health
 ```
@@ -167,15 +205,17 @@ research 完成整轮、business 每个品牌完成后立即新建对话
 
 程序连接本机已经打开的 Chrome，不会自动启动浏览器、登录账号或关闭标签页，也不需要安装 Playwright 自带的 Chromium。
 
-## 快速开始
+## 本地采集：快速开始
 
 ### 1. 安装依赖
 
 在项目根目录执行：
 
 ```bash
-npm install
+npm ci
 ```
+
+如果正在主动升级依赖而不是复现锁定环境，再使用 `npm install`。
 
 ### 2. 启动调试模式 Chrome
 
@@ -224,12 +264,21 @@ Invoke-RestMethod http://127.0.0.1:9222/json/version
 
 只采集某个平台时，只需打开对应页面。
 
-### 4. 配置 MySQL
+### 4. 选择数据落地方式
 
-复制环境变量模板：
+如果只需要 JSON/CSV 文件，可以跳过 MySQL 配置，并在运行时添加
+`--database=false`。文件会写入 `results/`。
+
+需要同时入库时，复制环境变量模板：
 
 ```bash
 cp .env.example .env
+```
+
+Windows PowerShell 使用：
+
+```powershell
+Copy-Item .env.example .env
 ```
 
 在 `.env` 中填写低权限数据库账号。默认连接本机 `127.0.0.1:3306` 的
@@ -276,6 +325,12 @@ npm run crawl
 
 默认运行模式是 `research`，完全保留原问题文件、提示词、CLI、数据库和本地
 JSON/CSV 输出行为。
+
+不使用 MySQL 时执行：
+
+```bash
+npm run crawl -- --database=false
+```
 
 ### Business 品牌批次模式
 
@@ -423,7 +478,8 @@ Worker 可按部署目录分别实例化日志器和证据存储，再将观察�
 }
 ```
 
-`businessType` 只接受 `DIAGNOSIS` 和 `ARTICLE_PROBE`。`aiModelId` 可以直接使用
+`businessType` 接受 `DIAGNOSIS`、`ARTICLE_PROBE` 和 `ENTRY_MONITOR`。后者还必须提供
+`projectId`、`intentEntryId`、`monitorDate` 和正整数 `repetitionNo`。`aiModelId` 可以直接使用
 `doubao`、`deepseek`、`qianwen`、`yuanbao`，也可以使用项目侧模型 ID 并由
 `aiModelName` 映射平台。任务按租户、业务类型、业务任务、品牌和平台归批；每个平台
 独立串行，一个批次只由 ConversationManager 创建一次对话。`deepThinking` 会完整传给
@@ -466,7 +522,8 @@ rpa_task_execution.task_id
   → brand_rpa_dispatch_task.id                  （dispatch ID）
   → brand_rpa_dispatch_task.business_task_id    （真正业务任务 ID）
       ├─ DIAGNOSIS → diagnosis_task.id → profile_id（brandId）
-      └─ ARTICLE_PROBE → probe_article_task.id → brand_id（brandId）
+      ├─ ARTICLE_PROBE → probe_article_task.id → brand_id（brandId）
+      └─ ENTRY_MONITOR → rpa_task_execution_context（projectId/intentEntryId/monitorDate/repetitionNo）
 ```
 
 所有 MySQL `bigint` 均按字符串进入 `RpaTask`，避免 JavaScript 精度丢失。
@@ -478,7 +535,9 @@ rpa_task_execution.task_id
 仓储作用域严格区分 Worker：
 
 - `findPendingTasks("diagnosis")` 只查询 `business_type = 'DIAGNOSIS'`；
-- `findPendingTasks("monitor")` 只查询 `business_type = 'ARTICLE_PROBE'`。
+- `findPendingTasks("monitor")` 默认保持只查询 `ARTICLE_PROBE`；启用
+  `ENTRY_MONITOR_ENABLED=true` 后，再通过独立 SQL 查询 `ENTRY_MONITOR`。新查询只关联
+  execution、dispatch 和通用 execution context，不读取发布表或 probe 业务表。
 
 领取通过单条条件 UPDATE 完成：只有 execution 的 `status = 0` 且
 `task_status = 0` 时，才同时更新为 1，并写入开始/修改时间。dispatch 表只用于 JOIN、
@@ -544,7 +603,8 @@ execution、dispatch ID、原始 keyword、处理状态和既有回答。通过�
 提供两个完全独立的入口：
 
 - `npm run rpa:diagnosis`：只读取和领取 `DIAGNOSIS`；默认 CDP 为 9222；
-- `npm run rpa:monitor`：只读取和领取 `ARTICLE_PROBE`；默认 CDP 为 9223。
+- `npm run rpa:monitor`：兼容 `ARTICLE_PROBE`，并在功能开关开启后读取和领取
+  `ENTRY_MONITOR`；默认 CDP 为 9223。
 
 Windows 长期运行、异常自动拉起和排空重启见
 [`docs/WINDOWS_WORKER_SUPERVISION.md`](docs/WINDOWS_WORKER_SUPERVISION.md)。Worker 不需要每天重启；
@@ -604,9 +664,18 @@ RPA_MONITOR_DRY_RUN=true
 RPA_MONITOR_MAX_TASKS=1
 RPA_MONITOR_WEB_SEARCH_POLICY=REQUIRED
 
+ENTRY_MONITOR_ENABLED=false
+ENTRY_MONITOR_GRAY_PROJECT_IDS=
+ENTRY_MONITOR_PROJECT_CHUNK_SIZE=5
+ENTRY_MONITOR_CONVERSATION_MAX_QUESTIONS=10000
+ENTRY_MONITOR_CONVERSATION_MAX_DURATION_MS=86400000
+ENTRY_MONITOR_TIMEZONE=Asia/Shanghai
+
 RPA_WORKER_HEARTBEAT_MS=30000
 RPA_WORKER_STALE_AFTER_MS=300000
 RPA_WORKER_WATCHDOG_STALL_MS=300000
+RPA_DIAGNOSIS_BRAND_WINDOW_SIZE=2
+RPA_DIAGNOSIS_BRAND_BARRIER_PLATFORMS=doubao,deepseek,qianwen,yuanbao
 RPA_WORKER_PLATFORM_PROCESS_RESTART_MS=5000
 RPA_WORKER_RUN_ONCE=false
 RPA_WORKER_POLL_INTERVAL_MS=10000
@@ -635,6 +704,9 @@ execution 仍保持处理态并持有 advisory lock，避免另一 Worker 立即
 executionId、brandId、完整问题、回答、租户凭据或 URL，不能把这些高基数/敏感字段追加为
 监控标签。可用以下命令检查快照：
 
+快照中的 `businessTypes` 会把 `DIAGNOSIS`、`ARTICLE_PROBE`、`ENTRY_MONITOR` 的
+pending/processing/succeeded/finalFailed 分开，避免新旧 monitor 任务互相掩盖。
+
 ```bash
 cat rpa-runtime/diagnosis/metrics/doubao/worker-metrics.json
 cat rpa-runtime/monitor/metrics/doubao/worker-metrics.json
@@ -658,11 +730,30 @@ cat rpa-runtime/monitor/metrics/doubao/worker-metrics.json
   仍会转为联网未确认技术错误，不能记作普通未曝光；
 - `DISABLED`：不点击联网开关，只记录能够只读识别到的页面状态。
 
-ARTICLE_PROBE 无条件使用 `REQUIRED`，即使 monitor 配置误写成其他值也不会降级。
+ARTICLE_PROBE 和 ENTRY_MONITOR 无条件使用 `REQUIRED`，即使 monitor 配置误写成其他值也不会降级。
 DIAGNOSIS 默认 `PREFERRED`，可通过 `RPA_DIAGNOSIS_WEB_SEARCH_POLICY` 配置。平台明确不
 支持时使用稳定错误码 `WEB_SEARCH_UNSUPPORTED`；开关存在但无法确认时使用
 `WEB_SEARCH_UNVERIFIED`。两者都会暂停对应平台，避免继续产生不可解释的零引用结果。
 research 不显式传 `--web-search-policy` 时继续保持历史宽松尝试行为。
+
+#### ENTRY_MONITOR 词条监测
+
+该业务默认关闭，并与品牌诊断策略隔离。Java 为每次真实提问创建一条 execution，并提供
+一对一的不可变 `rpa_task_execution_context`：`project_id`、`intent_entry_id`、
+`monitor_date`、`repetition_no`。爬虫不会查询发布记录、文章 URL、probe target/sample，
+也不会自行补足每日 30 次。发送前使用 `Asia/Shanghai` 再次校验自然日；跨日且尚未发送
+的 execution 会安全释放，不会越界提问。
+
+对话键固定为租户 × 项目 × 平台 × 上海自然日，同项目当天的多个词条共用会话；不同项目
+按 `ENTRY_MONITOR_PROJECT_CHUNK_SIZE` 分片后可交叉执行。单机灰度使用 monitor runtime 下
+的原子 JSON 会话仓储保存 URL，以支持 A→B→A 恢复。多 Worker 生产部署必须由 Java 提供
+集中式等价会话仓储，不能把本地 JSON 当作分布式一致性的最终方案。平台 advisory lock
+使用 `geno-rpa-platform:${workerType}:${platformId}`，因此 diagnosis 与 monitor 的两个
+Chrome 可以并行，而同一 workerType 内同平台仍互斥。
+
+结果仍只通过既有 Outbox 和事务写入 `rpa_answer`、`rpa_answer_reference` 及 execution
+完成状态。`CONFIRMED_EMPTY` 是合法零引用成功，`UNKNOWN` 必须失败；URL 标准化、目标 URL
+比较和 `probe_article_match` 仍全部由 Java 完成。
 
 #### 3. 健康检查和 dry-run
 
@@ -682,8 +773,13 @@ npm run rpa:monitor
 
 dry-run 和健康检查始终只运行一次。显式关闭 dry-run 后，diagnosis 与 monitor 各自启动
 四个常驻平台子进程；每个平台独立执行 Outbox 重放、僵尸恢复和待办查询，并且每轮只领取
-一个完整品牌批次。该批次结束后，下个轮询周期才能领取同平台下一个品牌批次，但不等待
-其他平台。CDP 连接、页面、数据库仓储和平台健康状态在各平台子进程内跨轮询复用。
+一个完整品牌批次。diagnosis 默认使用大小为 2 的数据库品牌窗口：按优先级和创建时间只开放
+最早的两个未完成品牌，即“当前品牌 + 最多领先一个品牌”。四个平台可以独立完成窗口内任务，
+但当前品牌未满足四平台结果完成屏障时，任何平台都不能领取第三个品牌。当前品牌的全部
+execution 成功且四个平台齐全后，窗口自动向前滑动；最终失败或缺少平台会保持屏障关闭并
+记录 `BRAND_WINDOW_BLOCKED`。窗口直接从数据库状态计算，因此单个平台子进程重启不会丢失
+或重置调度进度。monitor 默认关闭品牌窗口；一次性定向灰度如需绕过窗口，可显式使用
+`--brand-window-size=0`。CDP 连接、页面、数据库仓储和平台健康状态在各平台子进程内跨轮询复用。
 
 首次灰度建议只启用一个平台，并明确关闭 dry-run：
 
@@ -730,10 +826,16 @@ SQL、连接池取连接和 advisory lock 均有硬超时。任务级进展超�
 
 #### 4. 心跳、僵尸恢复和安全停止
 
-领取后的 execution 会持续更新 `modify_time`，同时持有以 executionId 命名的 MySQL
-advisory lock。僵尸恢复必须同时满足：双状态仍为 1、没有 answer_id、`modify_time` 已超过
-阈值，并且恢复进程能取得同一个 execution lock。仍在运行的其他 Worker 持有锁时只会被
-记录为“仍锁定”，不会被抢占。
+领取后尚未提交的问题会持续更新 `modify_time`，同时持有以 executionId 命名的 MySQL
+advisory lock。问题一旦提交（或提交结果不确定），立即停止用数据库心跳刷新该 execution；
+此后 execution lock 继续防止并发领取，而 `modify_time` 专门作为业务停滞计时器。数据库
+心跳只证明进程存活，不能重置任务看门狗。僵尸恢复必须同时满足：双状态仍为 1、没有
+answer_id、`modify_time` 已超过阈值，并且恢复进程能取得同一个 execution lock。
+
+平台连续 5 分钟没有提交、回答恢复或结果持久化等真实业务进展时，看门狗先断开该 Worker
+的 Playwright CDP 客户端，让执行层回滚未提交任务并释放 advisory lock，再由 Fleet 只重启
+该平台子进程。Chrome 本身不会被关闭；已提交且尚未确认的诊断题在锁释放后已满足 stale
+条件，下一次独立轮询可以立即检查并恢复，不会再额外等待一个 5 分钟周期。
 
 按一次 `Ctrl+C`、发送 `SIGTERM` 或创建配置的 `stop.request` 文件会进入安全停止：唤醒空闲轮询、
 不再领取新批次，正在执行的题先安全结束，尚未提交的已领取任务恢复为 0，任务心跳和 advisory lock 随后
@@ -977,6 +1079,7 @@ npm run crawl:yuanbao
 | 参数 | 作用 | 示例 |
 | --- | --- | --- |
 | `--mode` | 执行模式：`research`（默认）或 `business` | `--mode=business` |
+| `--platforms` | 逗号分隔的平台 ID：`doubao`、`deepseek`、`qianwen`、`yuanbao`；默认全部 | `--platforms=doubao,qianwen` |
 | `--questions` | research 使用 TXT/字符串数组 JSON；business 使用品牌批次 JSON | `--questions=questions.txt` |
 | `--out` | 修改输出目录 | `--out=results-2026-07-17` |
 | `--cdp` | 修改 CDP 地址，默认 `http://127.0.0.1:9222` | `--cdp=http://127.0.0.1:9333` |
@@ -1088,6 +1191,8 @@ npm test
 | `src/resultOutbox.ts` | 采集成功结果的原子本地落盘、数据库重放和安全清理 |
 | `src/rpaRetryPolicy.ts` | 技术错误、平台暂停、Outbox 与零引用成功的纯重试策略 |
 | `src/rpaWorkerService.ts` | 正式 Worker 常驻轮询、退避、信号停止和跨轮询运行时复用 |
+| `src/entryMonitor.ts` | 词条监测任务的自然日校验、项目分片与会话复用编排 |
+| `src/entryMonitorConversationRepository.ts` | 单机灰度下词条监测会话 URL 的原子 JSON 仓储 |
 | `src/extractReferences.ts` | 提取各平台最终回答，并展开、解析引用列表 |
 | `src/platforms.ts` | 平台地址与页面选择器配置 |
 | `src/questions.ts` | 默认问题列表 |
