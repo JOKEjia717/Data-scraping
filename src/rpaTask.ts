@@ -9,6 +9,7 @@ export type RpaBusinessType =
 export type ContextualMonitorBusinessType =
   | "ENTRY_MONITOR"
   | "CONTENT_STYLE_MONITOR";
+export type EntryMonitorScope = "GRAY" | "ALL";
 export type RpaWorkerRole = "diagnosis" | "monitor" | "style";
 export type RpaWorkerType = "diagnosis" | "monitor";
 

@@ -518,8 +518,10 @@ test("check CLI uses the formal monitor repository configuration", () => {
   assert.deepEqual(disabled, {
     retryScheduleEnabled: false,
     entryMonitorEnabled: false,
+    entryMonitorScope: "GRAY",
     entryMonitorGrayProjectIds: [],
     contentStyleMonitorEnabled: false,
+    contentStyleMonitorScope: "GRAY",
     contentStyleMonitorGrayProjectIds: [],
     articleProbeLegacyEnabled: true
   });
@@ -540,8 +542,10 @@ test("check CLI uses the formal monitor repository configuration", () => {
     retryScheduleEnabled: true,
     workerProvider: "NEW_RPA",
     entryMonitorEnabled: true,
+    entryMonitorScope: "GRAY",
     entryMonitorGrayProjectIds: ["5", "7"],
     contentStyleMonitorEnabled: false,
+    contentStyleMonitorScope: "GRAY",
     contentStyleMonitorGrayProjectIds: [],
     articleProbeLegacyEnabled: true
   });
@@ -561,8 +565,10 @@ test("check CLI uses the formal monitor repository configuration", () => {
     retryScheduleEnabled: false,
     workerProvider: "NEW_RPA",
     entryMonitorEnabled: false,
+    entryMonitorScope: "GRAY",
     entryMonitorGrayProjectIds: [],
     contentStyleMonitorEnabled: true,
+    contentStyleMonitorScope: "GRAY",
     contentStyleMonitorGrayProjectIds: ["5"],
     articleProbeLegacyEnabled: false
   });
@@ -584,8 +590,10 @@ test("check CLI keeps ENTRY_MONITOR disabled for diagnosis", () => {
     retryScheduleEnabled: false,
     workerProvider: "NEW_RPA",
     entryMonitorEnabled: false,
+    entryMonitorScope: "GRAY",
     entryMonitorGrayProjectIds: [],
     contentStyleMonitorEnabled: false,
+    contentStyleMonitorScope: "GRAY",
     contentStyleMonitorGrayProjectIds: [],
     articleProbeLegacyEnabled: false
   });
@@ -640,6 +648,54 @@ test("monitor 开关启用后同时读取 ARTICLE_PROBE 与 ENTRY_MONITOR execut
     entryQuery.parameters,
     ["ENTRY_MONITOR", "NEW_RPA", "2026-08-06", "7001", 10]
   );
+});
+
+test("ENTRY_MONITOR ALL 保留协议过滤但不生成项目白名单条件", async () => {
+  const entryRow = row({
+    executionId: "90071992547409940",
+    businessType: "ENTRY_MONITOR",
+    businessTaskId: "5002",
+    brandId: undefined,
+    projectId: "9001",
+    intentEntryId: "8002",
+    monitorDate: "2026-08-06",
+    repetitionNo: 1,
+    aiModelId: "2",
+    aiModelName: "DeepSeek"
+  });
+  const client = new RecordingSqlClient([[entryRow]]);
+  const repository = new RpaTaskRepository(client, undefined, {
+    articleProbeLegacyEnabled: false,
+    entryMonitorEnabled: true,
+    entryMonitorScope: "ALL",
+    entryMonitorGrayProjectIds: [],
+    workerProvider: "NEW_RPA",
+    now: () => new Date("2026-08-05T16:00:00.000Z")
+  });
+
+  const [task] = await repository.findPendingCollectionTasks("monitor", { limit: 10 });
+  assert.equal(task?.businessType, "ENTRY_MONITOR");
+  assert.equal(task?.projectId, "9001");
+  assert.equal(client.queries.length, 1);
+  assert.doesNotMatch(client.queries[0]!.sql, /ctx\.project_id IN/);
+  assert.match(client.queries[0]!.sql, /e\.business_type = \?/);
+  assert.match(client.queries[0]!.sql, /d\.worker_provider = \?/);
+  assert.match(client.queries[0]!.sql, /ctx\.monitor_date = \?/);
+  assert.deepEqual(client.queries[0]!.parameters, [
+    "ENTRY_MONITOR", "NEW_RPA", "2026-08-06", 10
+  ]);
+});
+
+test("ENTRY_MONITOR GRAY 空白名单不会退化为全量查询", async () => {
+  const client = new RecordingSqlClient();
+  const repository = new RpaTaskRepository(client, undefined, {
+    articleProbeLegacyEnabled: false,
+    entryMonitorEnabled: true,
+    entryMonitorScope: "GRAY",
+    entryMonitorGrayProjectIds: []
+  });
+  assert.deepEqual(await repository.findPendingCollectionTasks("monitor", { limit: 10 }), []);
+  assert.equal(client.queries.length, 0);
 });
 
 test("ENTRY_MONITOR 批次按项目、租户、平台和上海自然日读取并支持切片", async () => {
@@ -704,6 +760,39 @@ test("style 只查询 CONTENT_STYLE_MONITOR，monitor 即使误传开关也不�
   });
   assert.deepEqual(await monitorRepository.findPendingTasks("monitor"), []);
   assert.equal(monitorClient.queries.length, 0);
+});
+
+test("CONTENT_STYLE_MONITOR ALL 保留协议过滤但不生成项目白名单条件", async () => {
+  const styleRow = row({
+    businessType: "CONTENT_STYLE_MONITOR",
+    brandId: undefined,
+    projectId: "9001",
+    intentEntryId: "8001",
+    monitorDate: "2026-08-06",
+    repetitionNo: 1,
+    aiModelId: "4",
+    aiModelName: "千问"
+  });
+  const client = new RecordingSqlClient([[styleRow]]);
+  const repository = new RpaTaskRepository(client, undefined, {
+    contentStyleMonitorEnabled: true,
+    contentStyleMonitorScope: "ALL",
+    contentStyleMonitorGrayProjectIds: [],
+    workerProvider: "NEW_RPA",
+    now: () => new Date("2026-08-05T16:00:00.000Z")
+  });
+
+  const [task] = await repository.findPendingCollectionTasks("style", { limit: 10 });
+  assert.equal(task?.businessType, "CONTENT_STYLE_MONITOR");
+  assert.equal(task?.projectId, "9001");
+  assert.equal(client.queries.length, 1);
+  assert.doesNotMatch(client.queries[0]!.sql, /ctx\.project_id IN/);
+  assert.match(client.queries[0]!.sql, /e\.business_type = \?/);
+  assert.match(client.queries[0]!.sql, /d\.worker_provider = \?/);
+  assert.match(client.queries[0]!.sql, /ctx\.monitor_date = \?/);
+  assert.deepEqual(client.queries[0]!.parameters, [
+    "CONTENT_STYLE_MONITOR", "NEW_RPA", "2026-08-06", 10
+  ]);
 });
 
 test("原子领取携带真实业务类型并拒绝 Worker 越界", async () => {
@@ -828,6 +917,8 @@ test("单条 ENTRY_MONITOR 上下文无效时记录审计并继续返回其他�
     }
   }, {
     entryMonitorEnabled: true,
+    entryMonitorScope: "GRAY",
+    entryMonitorGrayProjectIds: ["7001"],
     workerProvider: "NEW_RPA",
     now: () => new Date("2026-08-05T16:00:00.000Z")
   });

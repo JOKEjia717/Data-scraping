@@ -24,9 +24,11 @@ export function validateGrayConfiguration(
   if (config.platforms.length > 1) failures.push("首轮灰度只能启用一个平台");
   const hasEntryProjectScope = config.workerRole === "monitor" &&
     config.entryMonitorEnabled &&
+    config.entryMonitorScope === "GRAY" &&
     config.entryMonitorGrayProjectIds.length > 0;
   const hasStyleProjectScope = config.workerRole === "style" &&
     config.contentStyleMonitorEnabled &&
+    config.contentStyleMonitorScope === "GRAY" &&
     config.contentStyleMonitorGrayProjectIds.length > 0;
   if (
     config.grayBrandIds.length === 0 &&

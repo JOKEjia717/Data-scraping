@@ -24,6 +24,7 @@ import {
   resolveRpaPlatform,
   toCollectionTask,
   type CollectionTask,
+  type EntryMonitorScope,
   type RpaBusinessType,
   type RpaTask,
   type RpaWorkerRole,
@@ -73,8 +74,10 @@ export interface RpaTaskRepositoryOptions {
   retryScheduleEnabled?: boolean;
   workerProvider?: string;
   entryMonitorEnabled?: boolean;
+  entryMonitorScope?: EntryMonitorScope;
   entryMonitorGrayProjectIds?: readonly string[];
   contentStyleMonitorEnabled?: boolean;
+  contentStyleMonitorScope?: EntryMonitorScope;
   contentStyleMonitorGrayProjectIds?: readonly string[];
   articleProbeLegacyEnabled?: boolean;
   now?: () => Date;
@@ -87,8 +90,10 @@ export interface RpaTaskRepositoryRuntimeConfig {
   providerRoutingEnabled: boolean;
   workerProvider: string;
   entryMonitorEnabled: boolean;
+  entryMonitorScope: EntryMonitorScope;
   entryMonitorGrayProjectIds: readonly string[];
   contentStyleMonitorEnabled: boolean;
+  contentStyleMonitorScope: EntryMonitorScope;
   contentStyleMonitorGrayProjectIds: readonly string[];
   articleProbeLegacyEnabled: boolean;
 }
@@ -98,19 +103,23 @@ export function createRpaTaskRepositoryOptions(
   config: RpaTaskRepositoryRuntimeConfig
 ): RpaTaskRepositoryOptions {
   const entryMonitorEnabled = config.workerRole === "monitor" && config.entryMonitorEnabled;
+  const contentStyleMonitorEnabled = config.workerRole === "style" &&
+    config.contentStyleMonitorEnabled;
   return {
     retryScheduleEnabled: config.databaseRetryScheduleEnabled,
     ...(config.providerRoutingEnabled
       ? { workerProvider: config.workerProvider }
       : {}),
     entryMonitorEnabled,
+    entryMonitorScope: entryMonitorEnabled ? config.entryMonitorScope : "GRAY",
     entryMonitorGrayProjectIds: entryMonitorEnabled
       ? [...config.entryMonitorGrayProjectIds]
       : [],
-    contentStyleMonitorEnabled: config.workerRole === "style" &&
-      config.contentStyleMonitorEnabled,
-    contentStyleMonitorGrayProjectIds: config.workerRole === "style" &&
-      config.contentStyleMonitorEnabled
+    contentStyleMonitorEnabled,
+    contentStyleMonitorScope: contentStyleMonitorEnabled
+      ? config.contentStyleMonitorScope
+      : "GRAY",
+    contentStyleMonitorGrayProjectIds: contentStyleMonitorEnabled
       ? [...config.contentStyleMonitorGrayProjectIds]
       : [],
     articleProbeLegacyEnabled: config.workerRole === "monitor" &&
@@ -292,33 +301,46 @@ export class RpaTaskRepository {
       const contextualTypes: Array<{
         businessType: "ENTRY_MONITOR" | "CONTENT_STYLE_MONITOR";
         enabled: boolean;
+        scope: EntryMonitorScope;
         projectIds: readonly string[] | undefined;
       }> = [
         {
           businessType: "ENTRY_MONITOR",
           enabled: workerType === "monitor" && this.options.entryMonitorEnabled === true,
+          scope: this.options.entryMonitorScope ?? "GRAY",
           projectIds: this.options.entryMonitorGrayProjectIds
         },
         {
           businessType: "CONTENT_STYLE_MONITOR",
           enabled: workerType === "style" && this.options.contentStyleMonitorEnabled === true,
+          scope: this.options.contentStyleMonitorScope ?? "GRAY",
           projectIds: this.options.contentStyleMonitorGrayProjectIds
         }
       ];
       for (const contextual of contextualTypes) {
         if (!contextual.enabled) continue;
         const projectIds = normalizeProjectIds(contextual.projectIds);
+        if (contextual.scope === "GRAY" && projectIds.length === 0) {
+          await this.safeAudit({
+            timestamp: new Date().toISOString(),
+            event: "PENDING_QUERY",
+            workerType,
+            businessType: contextual.businessType,
+            candidateCount: 0
+          });
+          continue;
+        }
         const rows = await this.client.queryRows<RpaTaskRow>(
           contextualMonitorPendingQueryFor(
             this.options.retryScheduleEnabled === true,
             this.options.workerProvider !== undefined,
-            projectIds.length
+            contextual.scope === "GRAY" ? projectIds.length : 0
           ),
           [
             contextual.businessType,
             ...(this.options.workerProvider ? [this.options.workerProvider] : []),
             getShanghaiDate((this.options.now ?? (() => new Date()))()),
-            ...projectIds,
+            ...(contextual.scope === "GRAY" ? projectIds : []),
             limit
           ]
         );

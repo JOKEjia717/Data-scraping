@@ -7,6 +7,7 @@ import type {
 } from "./types.js";
 import {
   workerTypeForRole,
+  type EntryMonitorScope,
   type RpaWorkerRole,
   type RpaWorkerType
 } from "./rpaTask.js";
@@ -75,13 +76,15 @@ export interface RpaWorkerConfig {
   maxConversationQuestions: number;
   /** 新业务默认关闭；这些配置只由 monitor 读取，diagnosis 不依赖。 */
   entryMonitorEnabled: boolean;
+  entryMonitorScope: EntryMonitorScope;
   entryMonitorGrayProjectIds: string[];
   entryMonitorProjectChunkSize: number;
   entryMonitorConversationMaxDurationMs: number;
   entryMonitorConversationMaxQuestions: number;
   entryMonitorTimezone: "Asia/Shanghai";
-  /** 风格监测仅由独立 style Role 读取，并使用项目灰度门禁。 */
+  /** 风格监测仅由独立 style Role 读取，并使用显式 GRAY/ALL 项目作用域。 */
   contentStyleMonitorEnabled: boolean;
+  contentStyleMonitorScope: EntryMonitorScope;
   contentStyleMonitorGrayProjectIds: string[];
   contentStyleMonitorProjectChunkSize: number;
   contentStyleMonitorConversationMaxDurationMs: number;
@@ -372,6 +375,9 @@ export function parseRpaWorkerConfig(
     entryMonitorEnabled: workerRole === "monitor"
       ? booleanValue(entryConfigured("ENABLED") ?? "false", "entry-monitor-enabled")
       : false,
+    entryMonitorScope: workerRole === "monitor"
+      ? entryMonitorScope(entryConfigured("SCOPE") ?? "GRAY")
+      : "GRAY",
     entryMonitorGrayProjectIds: workerRole === "monitor"
       ? csvIds(entryConfigured("GRAY_PROJECT_IDS"))
       : [],
@@ -408,6 +414,9 @@ export function parseRpaWorkerConfig(
         "content-style-monitor-enabled"
       )
       : false,
+    contentStyleMonitorScope: workerRole === "style"
+      ? entryMonitorScope(contentStyleConfigured("SCOPE") ?? "GRAY")
+      : "GRAY",
     contentStyleMonitorGrayProjectIds: workerRole === "style"
       ? csvIds(contentStyleConfigured("GRAY_PROJECT_IDS"))
       : [],
@@ -453,16 +462,34 @@ export function parseRpaWorkerConfig(
     if (!config.providerRoutingEnabled) {
       throw new Error("启用 ENTRY_MONITOR 前必须开启 provider-routing-enabled。");
     }
-    if (config.entryMonitorGrayProjectIds.length === 0) {
-      throw new Error("启用 ENTRY_MONITOR 时必须配置灰度项目白名单。");
+    if (config.entryMonitorScope === "GRAY" && config.entryMonitorGrayProjectIds.length === 0) {
+      throw new Error("ENTRY_MONITOR_SCOPE=GRAY 时必须配置灰度项目白名单。");
+    }
+    if (config.entryMonitorScope === "ALL" && config.entryMonitorGrayProjectIds.length > 0) {
+      throw new Error("ENTRY_MONITOR_SCOPE=ALL 时必须清空灰度项目白名单。");
+    }
+    if (config.entryMonitorScope === "ALL" && config.grayPercentage !== 100) {
+      throw new Error("ENTRY_MONITOR_SCOPE=ALL 时 gray-percentage 必须为 100。");
     }
   }
   if (config.contentStyleMonitorEnabled) {
     if (!config.providerRoutingEnabled) {
       throw new Error("启用 CONTENT_STYLE_MONITOR 前必须开启 provider-routing-enabled。");
     }
-    if (config.contentStyleMonitorGrayProjectIds.length === 0) {
-      throw new Error("启用 CONTENT_STYLE_MONITOR 时必须配置灰度项目白名单。");
+    if (
+      config.contentStyleMonitorScope === "GRAY" &&
+      config.contentStyleMonitorGrayProjectIds.length === 0
+    ) {
+      throw new Error("CONTENT_STYLE_MONITOR_SCOPE=GRAY 时必须配置灰度项目白名单。");
+    }
+    if (
+      config.contentStyleMonitorScope === "ALL" &&
+      config.contentStyleMonitorGrayProjectIds.length > 0
+    ) {
+      throw new Error("CONTENT_STYLE_MONITOR_SCOPE=ALL 时必须清空灰度项目白名单。");
+    }
+    if (config.contentStyleMonitorScope === "ALL" && config.grayPercentage !== 100) {
+      throw new Error("CONTENT_STYLE_MONITOR_SCOPE=ALL 时 gray-percentage 必须为 100。");
     }
   }
   if (
@@ -498,6 +525,12 @@ function csvIds(value: string | undefined): string[] {
     throw new Error("灰度 ID 白名单只能包含逗号分隔的数字 ID。");
   }
   return values;
+}
+
+function entryMonitorScope(value: string): EntryMonitorScope {
+  const normalized = value.trim().toUpperCase();
+  if (normalized === "GRAY" || normalized === "ALL") return normalized;
+  throw new Error("entry-monitor-scope 只能是 GRAY 或 ALL。");
 }
 
 function deepThinkingUnsupportedPolicy(value: string): DeepThinkingUnsupportedPolicy {

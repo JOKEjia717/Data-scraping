@@ -243,8 +243,10 @@ export async function planGreyRpaBatches(
       | "grayBrandIds"
       | "grayBusinessTaskIds"
       | "grayPercentage"
+      | "entryMonitorScope"
       | "entryMonitorGrayProjectIds"
       | "entryMonitorProjectChunkSize"
+      | "contentStyleMonitorScope"
       | "contentStyleMonitorGrayProjectIds"
       | "contentStyleMonitorProjectChunkSize"
     >>,
@@ -295,24 +297,28 @@ export function taskInGrayScope(
     | "grayBrandIds"
     | "grayBusinessTaskIds"
     | "grayPercentage"
+    | "entryMonitorScope"
     | "entryMonitorGrayProjectIds"
+    | "contentStyleMonitorScope"
     | "contentStyleMonitorGrayProjectIds"
   >>
 ): boolean {
   if (task.businessType === "ENTRY_MONITOR") {
     if (!task.projectId) return false;
-    if (
-      config.entryMonitorGrayProjectIds?.length &&
-      !config.entryMonitorGrayProjectIds.includes(task.projectId)
-    ) return false;
+    const scope = config.entryMonitorScope ?? "GRAY";
+    if (scope === "GRAY") {
+      if (!config.entryMonitorGrayProjectIds?.length) return false;
+      if (!config.entryMonitorGrayProjectIds.includes(task.projectId)) return false;
+    }
     return percentageScope(`${task.businessType}:${task.projectId}`, config.grayPercentage);
   }
   if (task.businessType === "CONTENT_STYLE_MONITOR") {
     if (!task.projectId) return false;
-    if (
-      config.contentStyleMonitorGrayProjectIds?.length &&
-      !config.contentStyleMonitorGrayProjectIds.includes(task.projectId)
-    ) return false;
+    const scope = config.contentStyleMonitorScope ?? "GRAY";
+    if (scope === "GRAY") {
+      if (!config.contentStyleMonitorGrayProjectIds?.length) return false;
+      if (!config.contentStyleMonitorGrayProjectIds.includes(task.projectId)) return false;
+    }
     return percentageScope(`${task.businessType}:${task.projectId}`, config.grayPercentage);
   }
   if (config.grayBrandIds?.length && !config.grayBrandIds.includes(task.brandId)) return false;

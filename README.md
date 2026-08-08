@@ -557,7 +557,10 @@ rpa_task_execution.task_id
 - `findPendingTasks("diagnosis")` 只查询 `business_type = 'DIAGNOSIS'`；
 - `findPendingTasks("monitor")` 默认保持只查询 `ARTICLE_PROBE`；启用
   `ENTRY_MONITOR_ENABLED=true` 后，再通过独立 SQL 查询 `ENTRY_MONITOR`。新查询只关联
-  execution、dispatch 和通用 execution context，不读取发布表或 probe 业务表。
+  execution、dispatch 和通用 execution context，不读取发布表或 probe 业务表；
+- `ENTRY_MONITOR_SCOPE=GRAY` 时必须配置项目白名单，查询增加 `ctx.project_id IN (...)`；
+- `ENTRY_MONITOR_SCOPE=ALL` 时项目白名单必须为空，查询不增加项目过滤，但仍校验
+  `ENTRY_MONITOR`、`NEW_RPA`、待处理状态、上海当前自然日、合法 dispatch 和完整上下文。
 
 领取通过单条条件 UPDATE 完成：只有 execution 的 `status = 0` 且
 `task_status = 0` 时，才同时更新为 1，并写入开始/修改时间。dispatch 表只用于 JOIN、
@@ -693,6 +696,7 @@ RPA_STYLE_DRY_RUN=true
 RPA_STYLE_WEB_SEARCH_POLICY=REQUIRED
 
 ENTRY_MONITOR_ENABLED=false
+ENTRY_MONITOR_SCOPE=GRAY
 ENTRY_MONITOR_GRAY_PROJECT_IDS=
 ENTRY_MONITOR_PROJECT_CHUNK_SIZE=5
 ENTRY_MONITOR_CONVERSATION_MAX_QUESTIONS=10000
@@ -700,6 +704,7 @@ ENTRY_MONITOR_CONVERSATION_MAX_DURATION_MS=86400000
 ENTRY_MONITOR_TIMEZONE=Asia/Shanghai
 
 CONTENT_STYLE_MONITOR_ENABLED=false
+CONTENT_STYLE_MONITOR_SCOPE=GRAY
 CONTENT_STYLE_MONITOR_GRAY_PROJECT_IDS=
 CONTENT_STYLE_MONITOR_PROJECT_CHUNK_SIZE=5
 CONTENT_STYLE_MONITOR_CONVERSATION_MAX_QUESTIONS=10000
@@ -796,8 +801,9 @@ Chrome 可以并行，而同一 workerRole 内同平台仍互斥。
 
 风格监测由独立 `style` Role 执行，只领取 `CONTENT_STYLE_MONITOR`，默认连接 9224。它复用
 monitor 的 execution context、回答/引用提取和结果写回能力，但拥有独立 Chrome、Profile、
-平台锁、Outbox、指标、日志、证据与停止文件。项目灰度仅使用
-`CONTENT_STYLE_MONITOR_GRAY_PROJECT_IDS`，对话与 ENTRY 通过 `business_type` 完全隔离。
+平台锁、Outbox、指标、日志、证据与停止文件。`CONTENT_STYLE_MONITOR_SCOPE=GRAY` 时必须
+配置项目白名单；`ALL` 时必须清空白名单且灰度百分比为 100。对话与 ENTRY 通过
+`business_type` 完全隔离。
 
 #### 3. 健康检查和 dry-run
 

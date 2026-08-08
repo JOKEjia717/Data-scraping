@@ -697,14 +697,54 @@ test("ENTRY_MONITOR 配置只由 monitor 解析，错误配置不阻止 diagnosi
     RPA_WORKER_PROVIDER_ROUTING_ENABLED: "true"
   }, "/workspace");
   assert.equal(monitor.entryMonitorEnabled, true);
+  assert.equal(monitor.entryMonitorScope, "GRAY");
   assert.deepEqual(monitor.entryMonitorGrayProjectIds, ["7001", "7002"]);
   assert.equal(monitor.entryMonitorProjectChunkSize, 7);
   assert.equal(monitor.entryMonitorConversationMaxQuestions, 10_000);
 
   assert.doesNotThrow(() => parseRpaWorkerConfig("diagnosis", [], {
+    ENTRY_MONITOR_SCOPE: "INVALID",
     ENTRY_MONITOR_ENABLED: "not-a-boolean",
     ENTRY_MONITOR_TIMEZONE: "UTC"
   }, "/workspace"));
+});
+
+test("ENTRY_MONITOR ALL 明确取消项目过滤且拒绝含混灰度配置", () => {
+  const all = parseRpaWorkerConfig("monitor", [], {
+    ENTRY_MONITOR_ENABLED: "true",
+    ENTRY_MONITOR_SCOPE: "ALL",
+    ENTRY_MONITOR_GRAY_PROJECT_IDS: "",
+    RPA_WORKER_GRAY_PERCENTAGE: "100",
+    RPA_WORKER_PROVIDER_ROUTING_ENABLED: "true"
+  }, "/workspace");
+  assert.equal(all.entryMonitorScope, "ALL");
+  assert.deepEqual(all.entryMonitorGrayProjectIds, []);
+  assert.equal(taskInGrayScope({
+    brandId: "ignored",
+    businessTaskId: "ignored",
+    businessType: "ENTRY_MONITOR",
+    projectId: "9001"
+  }, all), true);
+
+  assert.throws(() => parseRpaWorkerConfig("monitor", [], {
+    ENTRY_MONITOR_ENABLED: "true",
+    ENTRY_MONITOR_SCOPE: "ALL",
+    ENTRY_MONITOR_GRAY_PROJECT_IDS: "5",
+    RPA_WORKER_PROVIDER_ROUTING_ENABLED: "true"
+  }, "/workspace"), /必须清空灰度项目白名单/);
+  assert.throws(() => parseRpaWorkerConfig("monitor", [], {
+    ENTRY_MONITOR_ENABLED: "true",
+    ENTRY_MONITOR_SCOPE: "GRAY",
+    ENTRY_MONITOR_GRAY_PROJECT_IDS: "",
+    RPA_WORKER_PROVIDER_ROUTING_ENABLED: "true"
+  }, "/workspace"), /必须配置灰度项目白名单/);
+  assert.throws(() => parseRpaWorkerConfig("monitor", [], {
+    ENTRY_MONITOR_ENABLED: "true",
+    ENTRY_MONITOR_SCOPE: "ALL",
+    ENTRY_MONITOR_GRAY_PROJECT_IDS: "",
+    RPA_WORKER_GRAY_PERCENTAGE: "99",
+    RPA_WORKER_PROVIDER_ROUTING_ENABLED: "true"
+  }, "/workspace"), /gray-percentage 必须为 100/);
 });
 
 test("CONTENT_STYLE_MONITOR 只由 style 解析并保留安全门禁", () => {
@@ -715,6 +755,7 @@ test("CONTENT_STYLE_MONITOR 只由 style 解析并保留安全门禁", () => {
     CONTENT_STYLE_MONITOR_PROJECT_CHUNK_SIZE: "7"
   });
   assert.equal(style.contentStyleMonitorEnabled, true);
+  assert.equal(style.contentStyleMonitorScope, "GRAY");
   assert.deepEqual(style.contentStyleMonitorGrayProjectIds, ["5"]);
   assert.equal(style.contentStyleMonitorProjectChunkSize, 7);
   assert.equal(taskInGrayScope({
@@ -742,6 +783,44 @@ test("CONTENT_STYLE_MONITOR 只由 style 解析并保留安全门禁", () => {
     CONTENT_STYLE_MONITOR_ENABLED: "true",
     CONTENT_STYLE_MONITOR_GRAY_PROJECT_IDS: "5"
   }), /provider-routing-enabled/);
+});
+
+test("CONTENT_STYLE_MONITOR ALL 明确取消项目过滤且拒绝含混灰度配置", () => {
+  const all = parseRpaWorkerConfig("style", [], {
+    CONTENT_STYLE_MONITOR_ENABLED: "true",
+    CONTENT_STYLE_MONITOR_SCOPE: "ALL",
+    CONTENT_STYLE_MONITOR_GRAY_PROJECT_IDS: "",
+    RPA_WORKER_GRAY_PERCENTAGE: "100",
+    RPA_WORKER_PROVIDER_ROUTING_ENABLED: "true"
+  }, "/workspace");
+  assert.equal(all.contentStyleMonitorScope, "ALL");
+  assert.deepEqual(all.contentStyleMonitorGrayProjectIds, []);
+  assert.equal(taskInGrayScope({
+    brandId: "ignored",
+    businessTaskId: "ignored",
+    businessType: "CONTENT_STYLE_MONITOR",
+    projectId: "9001"
+  }, all), true);
+
+  assert.throws(() => parseRpaWorkerConfig("style", [], {
+    CONTENT_STYLE_MONITOR_ENABLED: "true",
+    CONTENT_STYLE_MONITOR_SCOPE: "ALL",
+    CONTENT_STYLE_MONITOR_GRAY_PROJECT_IDS: "5",
+    RPA_WORKER_PROVIDER_ROUTING_ENABLED: "true"
+  }, "/workspace"), /必须清空灰度项目白名单/);
+  assert.throws(() => parseRpaWorkerConfig("style", [], {
+    CONTENT_STYLE_MONITOR_ENABLED: "true",
+    CONTENT_STYLE_MONITOR_SCOPE: "GRAY",
+    CONTENT_STYLE_MONITOR_GRAY_PROJECT_IDS: "",
+    RPA_WORKER_PROVIDER_ROUTING_ENABLED: "true"
+  }, "/workspace"), /必须配置灰度项目白名单/);
+  assert.throws(() => parseRpaWorkerConfig("style", [], {
+    CONTENT_STYLE_MONITOR_ENABLED: "true",
+    CONTENT_STYLE_MONITOR_SCOPE: "ALL",
+    CONTENT_STYLE_MONITOR_GRAY_PROJECT_IDS: "",
+    RPA_WORKER_GRAY_PERCENTAGE: "99",
+    RPA_WORKER_PROVIDER_ROUTING_ENABLED: "true"
+  }, "/workspace"), /gray-percentage 必须为 100/);
 });
 
 test("品牌窗口默认限制为两个未完成品牌，并以四个平台作为完成屏障", async () => {
