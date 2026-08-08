@@ -1,4 +1,9 @@
-import type { CollectionTask, EntryMonitorRpaTask } from "./rpaTask.js";
+import type {
+  CollectionTask,
+  ContextualMonitorBusinessType,
+  ContentStyleMonitorRpaTask,
+  EntryMonitorRpaTask
+} from "./rpaTask.js";
 import type { PlatformId } from "./types.js";
 
 export const ENTRY_MONITOR_TIMEZONE = "Asia/Shanghai";
@@ -16,6 +21,10 @@ export interface EntryMonitorConversationKey {
   aiModelId: string;
   platformId: PlatformId;
   monitorDate: string;
+}
+
+export interface ContextualMonitorConversationKey extends EntryMonitorConversationKey {
+  businessType: ContextualMonitorBusinessType;
 }
 
 export type EntryMonitorSubmissionState =
@@ -89,8 +98,32 @@ export function assertEntryMonitorTaskEligibleToday(
   }
 }
 
+export function assertContextualMonitorTaskEligibleToday(
+  task: Pick<
+    EntryMonitorRpaTask | ContentStyleMonitorRpaTask,
+    "businessType" | "executionId" | "monitorDate"
+  >,
+  now = new Date()
+): void {
+  if (!isEntryMonitorTaskEligibleToday(task, now)) {
+    throw new EntryMonitorError(
+      "DATE_WINDOW_EXPIRED",
+      `${task.businessType} execution ${task.executionId} 不属于上海当前自然日。`
+    );
+  }
+}
+
 export type EntryMonitorCollectionTask = CollectionTask & {
   businessType: "ENTRY_MONITOR";
+  tenantId: string;
+  projectId: string;
+  intentEntryId: string;
+  monitorDate: string;
+  repetitionNo: number;
+};
+
+export type ContextualMonitorCollectionTask = CollectionTask & {
+  businessType: ContextualMonitorBusinessType;
   tenantId: string;
   projectId: string;
   intentEntryId: string;
@@ -116,6 +149,26 @@ export function assertEntryMonitorCollectionContext(
   }
 }
 
+export function assertContextualMonitorCollectionContext(
+  task: CollectionTask
+): asserts task is ContextualMonitorCollectionTask {
+  if (task.businessType !== "ENTRY_MONITOR" && task.businessType !== "CONTENT_STYLE_MONITOR") {
+    return;
+  }
+  try {
+    requireNonEmpty(task.tenantId ?? "", "tenantId");
+    requireDatabaseId(task.projectId ?? "", "projectId");
+    requireDatabaseId(task.intentEntryId ?? "", "intentEntryId");
+    requireMonitorDate(task.monitorDate ?? "");
+    requirePositiveInteger(task.repetitionNo ?? 0, "repetitionNo");
+  } catch (error) {
+    throw new EntryMonitorError(
+      "INVALID_EXECUTION_CONTEXT",
+      `${task.businessType}: ${error instanceof Error ? error.message : String(error)}`
+    );
+  }
+}
+
 export function entryMonitorConversationKeyFor(
   task: Pick<EntryMonitorRpaTask, "tenantId" | "projectId" | "aiModelId" | "monitorDate"> & {
     platformId: PlatformId;
@@ -130,12 +183,36 @@ export function entryMonitorConversationKeyFor(
   };
 }
 
+export function contextualMonitorConversationKeyFor(
+  task: Pick<
+    EntryMonitorRpaTask | ContentStyleMonitorRpaTask,
+    "businessType" | "tenantId" | "projectId" | "aiModelId" | "monitorDate"
+  > & { platformId: PlatformId }
+): ContextualMonitorConversationKey {
+  return {
+    businessType: task.businessType,
+    ...entryMonitorConversationKeyFor(task)
+  };
+}
+
 export function serializeEntryMonitorConversationKey(
   key: EntryMonitorConversationKey
 ): string {
   return JSON.stringify([
     requireNonEmpty(key.tenantId, "tenantId"),
     "ENTRY_MONITOR",
+    requireDatabaseId(key.projectId, "projectId"),
+    requireDatabaseId(key.aiModelId, "aiModelId"),
+    requireMonitorDate(key.monitorDate)
+  ]);
+}
+
+export function serializeContextualMonitorConversationKey(
+  key: ContextualMonitorConversationKey
+): string {
+  return JSON.stringify([
+    requireNonEmpty(key.tenantId, "tenantId"),
+    contextualBusinessType(key.businessType),
     requireDatabaseId(key.projectId, "projectId"),
     requireDatabaseId(key.aiModelId, "aiModelId"),
     requireMonitorDate(key.monitorDate)
@@ -179,7 +256,7 @@ export function transitionEntryMonitorPageOwner(
   if (nextIndex !== currentIndex + 1) {
     throw new EntryMonitorError(
       "AMBIGUOUS_RECOVERY",
-      `非法 ENTRY_MONITOR 提交状态迁移：${owner.submissionState} -> ${next}`
+      `非法上下文监测提交状态迁移：${owner.submissionState} -> ${next}`
     );
   }
   return {
@@ -203,6 +280,11 @@ export function entryMonitorOwnerMatchesExecution(
 function requireMonitorDate(value: string): string {
   if (!isMonitorDate(value)) throw new Error("monitorDate 必须是有效的 YYYY-MM-DD。");
   return value;
+}
+
+function contextualBusinessType(value: string): ContextualMonitorBusinessType {
+  if (value === "ENTRY_MONITOR" || value === "CONTENT_STYLE_MONITOR") return value;
+  throw new Error("businessType 不是上下文监测任务。");
 }
 
 function requireDatabaseId(value: string, field: string): string {

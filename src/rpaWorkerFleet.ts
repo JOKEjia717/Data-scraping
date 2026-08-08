@@ -8,7 +8,7 @@ import {
   rpaConsoleWarn
 } from "./consolePrivacy.js";
 import type { RpaWorkerConfig } from "./rpaWorkerConfig.js";
-import type { RpaWorkerType } from "./rpaTask.js";
+import type { RpaWorkerRole } from "./rpaTask.js";
 import type { PlatformId } from "./types.js";
 
 const DERIVED_ARGUMENTS = new Set([
@@ -27,7 +27,7 @@ export interface PlatformWorkerLaunchSpec {
 }
 
 export function platformWorkerLaunchSpecs(
-  workerType: RpaWorkerType,
+  workerRole: RpaWorkerRole,
   config: RpaWorkerConfig,
   originalArgs: readonly string[]
 ): PlatformWorkerLaunchSpec[] {
@@ -45,7 +45,7 @@ export function platformWorkerLaunchSpecs(
       outboxDirectory,
       metricsDirectory,
       argv: [
-        `--worker=${workerType}`,
+        `--worker=${workerRole}`,
         ...passthrough,
         `--platforms=${platformId}`,
         `--worker-id=${workerId}`,
@@ -80,7 +80,7 @@ export class RpaWorkerFleet {
   private oneShotFailure?: Error;
 
   constructor(
-    private readonly workerType: RpaWorkerType,
+    private readonly workerRole: RpaWorkerRole,
     private readonly config: RpaWorkerConfig,
     specs: readonly PlatformWorkerLaunchSpec[],
     options: RpaWorkerFleetOptions = {}

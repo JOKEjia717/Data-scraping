@@ -91,9 +91,9 @@ RPA_MONITOR_DRY_RUN=true
 不要提交 `.env`，也不要在首次启动时填写
 `RPA_WORKER_ALLOW_PRODUCTION_CLAIMS=true`。
 
-### 2. 启动两个独立 Chrome
+### 2. 启动三个独立 Chrome
 
-两个 Chrome 必须使用不同的调试端口和 Profile 目录。分别在两个终端中执行以下命令。
+三个 Chrome 必须使用不同的调试端口和 Profile 目录。分别在三个终端中执行以下命令。
 
 macOS：
 
@@ -107,6 +107,12 @@ macOS：
 "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
   --remote-debugging-port=9223 \
   --user-data-dir="$PWD/.chrome-profiles/monitor"
+```
+
+```bash
+"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
+  --remote-debugging-port=9224 \
+  --user-data-dir="$PWD/.chrome-profiles/style"
 ```
 
 Windows PowerShell（先进入项目根目录）：
@@ -123,19 +129,26 @@ Windows PowerShell（先进入项目根目录）：
   "--user-data-dir=$PWD\.chrome-profiles\monitor"
 ```
 
+```powershell
+& "$env:ProgramFiles\Google\Chrome\Application\chrome.exe" `
+  --remote-debugging-port=9224 `
+  "--user-data-dir=$PWD\.chrome-profiles\style"
+```
+
 如果 Windows 上的 Chrome 不在默认安装位置，请将命令中的
 `$env:ProgramFiles\Google\Chrome\Application\chrome.exe` 替换为实际的 `chrome.exe`
 路径；按当前 Windows 用户安装时，常见路径为
 `$env:LOCALAPPDATA\Google\Chrome\Application\chrome.exe`。
 
-在两个 Chrome 中分别打开豆包、DeepSeek、千问、元宝并完成登录。9222 专用于品牌诊断，
-9223 专用于文章监测，两个窗口不能共用 Profile。
+在三个 Chrome 中分别打开豆包、DeepSeek、千问、元宝并完成登录。9222 专用于品牌诊断，
+9223 专用于文章/词条监测，9224 专用于内容风格监测，三个窗口不能共用 Profile。
 
 ### 3. 健康检查
 
 ```bash
 npm run rpa:diagnosis:health
 npm run rpa:monitor:health
+npm run rpa:style:health
 ```
 
 只有数据库、CDP、平台标签页、登录状态和输入框全部正常后才继续。
@@ -145,6 +158,7 @@ npm run rpa:monitor:health
 ```bash
 npm run rpa:diagnosis
 npm run rpa:monitor
+npm run rpa:style
 ```
 
 默认 `dry-run=true`：只查询并显示将执行的完整品牌批次，不领取任务、不操作页面、不写结果。
@@ -157,6 +171,9 @@ npm run rpa:diagnosis -- \
 
 npm run rpa:monitor -- \
   --dry-run=false --run-once=true --platforms=doubao --max-tasks=1
+
+npm run rpa:style -- \
+  --dry-run=false --run-once=true --platforms=doubao --max-tasks=1
 ```
 
 确认任务领取、回答、引用、`answer_id`、双状态 `2/2` 和 Outbox 均正常后，才启动四平台常驻服务：
@@ -167,11 +184,14 @@ npm run rpa:diagnosis -- \
 
 npm run rpa:monitor -- \
   --dry-run=false --platforms=doubao,deepseek,qianwen,yuanbao
+
+npm run rpa:style -- \
+  --dry-run=false --platforms=doubao,deepseek,qianwen,yuanbao
 ```
 
-两个命令需要在两个独立终端或进程管理器中长期运行。按一次 `Ctrl+C` 会停止领取新批次，
+三个命令需要在三个独立终端或进程管理器中长期运行。按一次 `Ctrl+C` 会停止领取新批次，
 等待正在执行的题安全结束并释放尚未提交的任务后退出。运行日志、Outbox、证据和指标默认位于
-`rpa-runtime/diagnosis` 与 `rpa-runtime/monitor`。更完整的上线与回滚步骤见
+`rpa-runtime/diagnosis`、`rpa-runtime/monitor` 与 `rpa-runtime/style`。更完整的上线与回滚步骤见
 [`docs/RPA_PRODUCTION_RUNBOOK.md`](docs/RPA_PRODUCTION_RUNBOOK.md)。
 
 ## 核心流程
@@ -600,21 +620,23 @@ execution、dispatch ID、原始 keyword、处理状态和既有回答。通过�
 [`docs/RPA_PRODUCTION_RUNBOOK.md`](docs/RPA_PRODUCTION_RUNBOOK.md)。新部署安全默认是
 `staging + dry-run + provider 路由关闭`；未显式授权时不能领取生产任务。
 
-提供两个完全独立的入口：
+提供三个完全独立的入口：
 
 - `npm run rpa:diagnosis`：只读取和领取 `DIAGNOSIS`；默认 CDP 为 9222；
 - `npm run rpa:monitor`：兼容 `ARTICLE_PROBE`，并在功能开关开启后读取和领取
   `ENTRY_MONITOR`；默认 CDP 为 9223。
+- `npm run rpa:style`：只读取和领取 `CONTENT_STYLE_MONITOR`；默认 CDP 为 9224。
 
 Windows 长期运行、异常自动拉起和排空重启见
 [`docs/WINDOWS_WORKER_SUPERVISION.md`](docs/WINDOWS_WORKER_SUPERVISION.md)。Worker 不需要每天重启；
 计划维护应写入停止文件等待安全收尾，不能直接强杀进程。
 
-两个角色进程默认使用不同的 workerId、日志目录、失败证据目录和 Chrome Profile。每个角色
+三个角色进程默认使用不同的 workerId、日志目录、失败证据目录和 Chrome Profile。每个角色
 内部为豆包、DeepSeek、千问、元宝分别启动独立 Worker 子进程；四个平台各自轮询和执行
 stale recovery，单个平台并发固定为 1，某个平台恢复不再等待其他平台批次结束。跨进程使用
-MySQL `GET_LOCK` advisory lease：同一个平台同一时刻只能被一个 Worker 操作，批次结束后
-还会保持配置的最小间隔。两个 Worker 必须连接同一个 MySQL 实例，该保护才会生效。
+MySQL `GET_LOCK` advisory lease：同一 Role 的同一平台保持串行，不同 Role 可使用各自 Chrome
+并行执行；同一个 execution 仍使用全局执行锁防止重复处理。三个 Worker 必须连接同一个 MySQL
+实例，execution 级保护才会生效。
 
 #### 1. 启动两个独立 Chrome
 
@@ -633,7 +655,7 @@ mkdir -p /absolute/path/to/chrome-profiles/monitor
   --user-data-dir=/absolute/path/to/chrome-profiles/monitor
 ```
 
-不要让两个 Chrome 指向同一个 `--user-data-dir`。分别在两个 Chrome 中打开需要启用的
+不要让三个 Chrome 指向同一个 `--user-data-dir`。分别在三个 Chrome 中打开需要启用的
 平台标签页并完成登录。Worker 只连接已有 Chrome，不会替你启动 Chrome，也不会把一个
 Profile 分配给另一个 Worker。
 
@@ -664,12 +686,25 @@ RPA_MONITOR_DRY_RUN=true
 RPA_MONITOR_MAX_TASKS=1
 RPA_MONITOR_WEB_SEARCH_POLICY=REQUIRED
 
+RPA_STYLE_WORKER_ID=style-worker
+RPA_STYLE_CDP_ENDPOINT=http://127.0.0.1:9224
+RPA_STYLE_CHROME_PROFILE=/absolute/path/to/chrome-profiles/style
+RPA_STYLE_DRY_RUN=true
+RPA_STYLE_WEB_SEARCH_POLICY=REQUIRED
+
 ENTRY_MONITOR_ENABLED=false
 ENTRY_MONITOR_GRAY_PROJECT_IDS=
 ENTRY_MONITOR_PROJECT_CHUNK_SIZE=5
 ENTRY_MONITOR_CONVERSATION_MAX_QUESTIONS=10000
 ENTRY_MONITOR_CONVERSATION_MAX_DURATION_MS=86400000
 ENTRY_MONITOR_TIMEZONE=Asia/Shanghai
+
+CONTENT_STYLE_MONITOR_ENABLED=false
+CONTENT_STYLE_MONITOR_GRAY_PROJECT_IDS=
+CONTENT_STYLE_MONITOR_PROJECT_CHUNK_SIZE=5
+CONTENT_STYLE_MONITOR_CONVERSATION_MAX_QUESTIONS=10000
+CONTENT_STYLE_MONITOR_CONVERSATION_MAX_DURATION_MS=86400000
+CONTENT_STYLE_MONITOR_TIMEZONE=Asia/Shanghai
 
 RPA_WORKER_HEARTBEAT_MS=30000
 RPA_WORKER_STALE_AFTER_MS=300000
@@ -693,7 +728,7 @@ RPA_WORKER_DEEP_THINKING_UNSUPPORTED_POLICY=fail
 是首次任务失败后的退避基数，后续按已有 `fail_num` 指数增长，最长一小时。退避期间
 execution 仍保持处理态并持有 advisory lock，避免另一 Worker 立即重新领取。
 `POLL_INTERVAL_MS` 是空队列轮询间隔，默认 10 秒；`POLL_JITTER_MS` 默认增加最多 1 秒
-随机抖动，避免 diagnosis、monitor 或同类 Worker 同时查询数据库。数据库异常会在该间隔
+随机抖动，避免 diagnosis、monitor、style 或同类 Worker 同时查询数据库。数据库异常会在该间隔
 基础上指数退避，最高 5 分钟，不会形成报错忙循环。
 
 运行指标默认每 15 秒原子更新到各 Worker 独立的
@@ -704,12 +739,14 @@ execution 仍保持处理态并持有 advisory lock，避免另一 Worker 立即
 executionId、brandId、完整问题、回答、租户凭据或 URL，不能把这些高基数/敏感字段追加为
 监控标签。可用以下命令检查快照：
 
-快照中的 `businessTypes` 会把 `DIAGNOSIS`、`ARTICLE_PROBE`、`ENTRY_MONITOR` 的
+快照中的 `businessTypes` 会把 `DIAGNOSIS`、`ARTICLE_PROBE`、`ENTRY_MONITOR`、
+`CONTENT_STYLE_MONITOR` 的
 pending/processing/succeeded/finalFailed 分开，避免新旧 monitor 任务互相掩盖。
 
 ```bash
 cat rpa-runtime/diagnosis/metrics/doubao/worker-metrics.json
 cat rpa-runtime/monitor/metrics/doubao/worker-metrics.json
+cat rpa-runtime/style/metrics/doubao/worker-metrics.json
 ```
 
 正式 Worker 会把数据库任务的 `deep_thinking` 原值传到单题页面执行层。每题发送前，
@@ -730,7 +767,7 @@ cat rpa-runtime/monitor/metrics/doubao/worker-metrics.json
   仍会转为联网未确认技术错误，不能记作普通未曝光；
 - `DISABLED`：不点击联网开关，只记录能够只读识别到的页面状态。
 
-ARTICLE_PROBE 和 ENTRY_MONITOR 无条件使用 `REQUIRED`，即使 monitor 配置误写成其他值也不会降级。
+ARTICLE_PROBE、ENTRY_MONITOR 和 CONTENT_STYLE_MONITOR 无条件使用 `REQUIRED`，即使对应 Worker 配置误写成其他值也不会降级。
 DIAGNOSIS 默认 `PREFERRED`，可通过 `RPA_DIAGNOSIS_WEB_SEARCH_POLICY` 配置。平台明确不
 支持时使用稳定错误码 `WEB_SEARCH_UNSUPPORTED`；开关存在但无法确认时使用
 `WEB_SEARCH_UNVERIFIED`。两者都会暂停对应平台，避免继续产生不可解释的零引用结果。
@@ -744,16 +781,23 @@ research 不显式传 `--web-search-policy` 时继续保持历史宽松尝试行
 也不会自行补足每日 30 次。发送前使用 `Asia/Shanghai` 再次校验自然日；跨日且尚未发送
 的 execution 会安全释放，不会越界提问。
 
-对话键固定为租户 × 项目 × 平台 × 上海自然日，同项目当天的多个词条共用会话；不同项目
+对话键固定为业务类型 × 租户 × 项目 × 平台 × 上海自然日，同项目当天的多个词条共用会话；不同项目
 按 `ENTRY_MONITOR_PROJECT_CHUNK_SIZE` 分片后可交叉执行。单机灰度使用 monitor runtime 下
 的 `rpa_conversation_session` 数据库会话仓储保存 URL、题数和最后 execution，以支持
 A→B→A 恢复。平台 advisory lock
-使用 `geno-rpa-platform:${workerType}:${platformId}`，因此 diagnosis 与 monitor 的两个
-Chrome 可以并行，而同一 workerType 内同平台仍互斥。
+使用 `geno-rpa-platform:${workerRole}:${platformId}`，因此 diagnosis、monitor 与 style 的三个
+Chrome 可以并行，而同一 workerRole 内同平台仍互斥。
 
 结果仍只通过既有 Outbox 和事务写入 `rpa_answer`、`rpa_answer_reference` 及 execution
 完成状态。`CONFIRMED_EMPTY` 是合法零引用成功，`UNKNOWN` 必须失败；URL 标准化、目标 URL
 比较和 `probe_article_match` 仍全部由 Java 完成。
+
+#### CONTENT_STYLE_MONITOR 风格监测
+
+风格监测由独立 `style` Role 执行，只领取 `CONTENT_STYLE_MONITOR`，默认连接 9224。它复用
+monitor 的 execution context、回答/引用提取和结果写回能力，但拥有独立 Chrome、Profile、
+平台锁、Outbox、指标、日志、证据与停止文件。项目灰度仅使用
+`CONTENT_STYLE_MONITOR_GRAY_PROJECT_IDS`，对话与 ENTRY 通过 `business_type` 完全隔离。
 
 #### 3. 健康检查和 dry-run
 
@@ -762,6 +806,7 @@ Chrome 可以并行，而同一 workerType 内同平台仍互斥。
 ```bash
 npm run rpa:diagnosis:health
 npm run rpa:monitor:health
+npm run rpa:style:health
 ```
 
 普通启动默认也是 dry-run，只展示将选择的完整批次，不领取、不操作页面、不写结果：
@@ -769,9 +814,10 @@ npm run rpa:monitor:health
 ```bash
 npm run rpa:diagnosis
 npm run rpa:monitor
+npm run rpa:style
 ```
 
-dry-run 和健康检查始终只运行一次。显式关闭 dry-run 后，diagnosis 与 monitor 各自启动
+dry-run 和健康检查始终只运行一次。显式关闭 dry-run 后，diagnosis、monitor 与 style 各自启动
 四个常驻平台子进程；每个平台独立执行 Outbox 重放、僵尸恢复和待办查询，并且每轮只领取
 一个完整品牌批次。diagnosis 默认使用大小为 2 的数据库品牌窗口：按优先级和创建时间只开放
 最早的两个未完成品牌，即“当前品牌 + 最多领先一个品牌”。四个平台可以独立完成窗口内任务，
@@ -786,6 +832,7 @@ execution 成功且四个平台齐全后，窗口自动向前滑动；最终失�
 ```bash
 npm run rpa:diagnosis -- --dry-run=false --platforms=doubao --max-tasks=1
 npm run rpa:monitor -- --dry-run=false --platforms=doubao --max-tasks=1
+npm run rpa:style -- --dry-run=false --platforms=doubao --max-tasks=1
 ```
 
 只执行一轮后退出，用于灰度或测试：
@@ -793,13 +840,15 @@ npm run rpa:monitor -- --dry-run=false --platforms=doubao --max-tasks=1
 ```bash
 npm run rpa:diagnosis -- --dry-run=false --run-once=true --platforms=doubao --max-tasks=1
 npm run rpa:monitor -- --dry-run=false --run-once=true --platforms=doubao --max-tasks=1
+npm run rpa:style -- --dry-run=false --run-once=true --platforms=doubao --max-tasks=1
 ```
 
-确认后再分别启动两个 Worker；四平台运行示例：
+确认后再分别启动三个 Worker；四平台运行示例：
 
 ```bash
 npm run rpa:diagnosis -- --dry-run=false --platforms=doubao,deepseek,qianwen,yuanbao
 npm run rpa:monitor -- --dry-run=false --platforms=doubao,deepseek,qianwen,yuanbao
+npm run rpa:style -- --dry-run=false --platforms=doubao,deepseek,qianwen,yuanbao
 ```
 
 单题内核的技术重试次数是有限的；满足联网执行条件后的零引用不会重试。遇到 `CAPTCHA_REQUIRED`、
@@ -864,7 +913,7 @@ MySQL；数据库提交成功后删除对应文件。MySQL 断线、超时或事
 Worker 每次正式启动都在浏览器自检和领取新任务前优先重放 outbox；只要仍有数据库重放
 失败，本轮就不领取新任务。临时 `.tmp` 文件不会参与重放。
 
-回退时先安全停止两个 Worker，把两个 `DRY_RUN` 恢复为 `true`，再运行
+回退时先安全停止三个 Worker，把三个 `DRY_RUN` 恢复为 `true`，再运行
 健康检查或只读任务检查。该入口不修改 `brand_rpa_dispatch_task` 状态，也不改变原有
 `npm run crawl`；未开始的任务会主动释放，异常退出的处理中任务由上述安全僵尸策略恢复。
 

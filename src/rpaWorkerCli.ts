@@ -2,7 +2,7 @@ import { pathToFileURL } from "node:url";
 import { closeRpaDatabasePool } from "./rpaDatabase.js";
 import { parseRpaWorkerConfig } from "./rpaWorkerConfig.js";
 import { RpaWorkerService } from "./rpaWorkerService.js";
-import type { RpaWorkerType } from "./rpaTask.js";
+import type { RpaWorkerRole } from "./rpaTask.js";
 import type { PlatformId } from "./types.js";
 import {
   rpaConsoleError,
@@ -10,8 +10,8 @@ import {
 } from "./consolePrivacy.js";
 
 export async function runRpaWorkerCli(argv = process.argv.slice(2)): Promise<void> {
-  const { workerType, remainingArgs } = readWorkerType(argv);
-  const config = parseRpaWorkerConfig(workerType, remainingArgs);
+  const { workerRole, remainingArgs } = readWorkerType(argv);
+  const config = parseRpaWorkerConfig(workerRole, remainingArgs);
   const service = new RpaWorkerService(config);
   const requestStop = (signal: NodeJS.Signals): void => {
     service.requestStop(signal);
@@ -65,15 +65,18 @@ export async function runRpaWorkerCli(argv = process.argv.slice(2)): Promise<voi
 }
 
 export function readWorkerType(argv: readonly string[]): {
-  workerType: RpaWorkerType;
+  workerRole: RpaWorkerRole;
+  /** @deprecated Use workerRole. */
+  workerType: RpaWorkerRole;
   remainingArgs: string[];
 } {
   const workerArgument = argv.find((item) => item.startsWith("--worker="));
   const worker = workerArgument?.slice("--worker=".length);
-  if (worker !== "diagnosis" && worker !== "monitor") {
-    throw new Error("必须通过 --worker=diagnosis 或 --worker=monitor 指定 Worker。");
+  if (worker !== "diagnosis" && worker !== "monitor" && worker !== "style") {
+    throw new Error("必须通过 --worker=diagnosis、--worker=monitor 或 --worker=style 指定 Worker。");
   }
   return {
+    workerRole: worker,
     workerType: worker,
     remainingArgs: argv.filter((item) => item !== workerArgument)
   };

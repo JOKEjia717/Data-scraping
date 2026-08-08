@@ -88,15 +88,16 @@ import {
 import { checkDiskSpace } from "./runtimeSafety.js";
 import { assertPersistableReferenceResult } from "./referenceState.js";
 import {
-  assertEntryMonitorCollectionContext,
-  assertEntryMonitorTaskEligibleToday,
-  entryMonitorConversationKeyFor,
+  assertContextualMonitorCollectionContext,
+  assertContextualMonitorTaskEligibleToday,
+  contextualMonitorConversationKeyFor,
   getShanghaiDate,
-  serializeEntryMonitorConversationKey
+  serializeContextualMonitorConversationKey,
+  type ContextualMonitorCollectionTask
 } from "./entryMonitor.js";
 import {
-  MysqlEntryMonitorConversationRepository,
-  type EntryMonitorConversationRepository
+  MysqlContextualMonitorConversationRepository,
+  type ContextualMonitorConversationRepository
 } from "./entryMonitorConversationRepository.js";
 
 export interface PlannedRpaBatch {
@@ -144,7 +145,7 @@ export interface RpaWorkerSession {
   lastTaskStateMetricsAt?: number;
   filesystemDegraded: boolean;
   lockStateTrusted: boolean;
-  entryMonitorConversations?: EntryMonitorConversationRepository;
+  contextualMonitorConversations?: ContextualMonitorConversationRepository;
 }
 
 export function createRpaWorkerSession(config: RpaWorkerConfig): RpaWorkerSession {
@@ -152,7 +153,7 @@ export function createRpaWorkerSession(config: RpaWorkerConfig): RpaWorkerSessio
     logDirectory: config.logDirectory,
     fileName: `${safeRuntimeFileStem(config.workerId)}-repository.jsonl`
   });
-  const metrics = new MetricsRegistry(config.workerType, config.platforms);
+  const metrics = new MetricsRegistry(config.workerRole, config.platforms);
   const metricsPublisher = new MetricsSnapshotPublisher(
     metrics,
     new MetricsJsonSnapshotWriter(config.metricsDirectory),
@@ -200,8 +201,11 @@ export function createRpaWorkerSession(config: RpaWorkerConfig): RpaWorkerSessio
     filesystemDegraded: false,
     lockStateTrusted: true
   };
-  if (config.workerType === "monitor" && config.entryMonitorEnabled) {
-    session.entryMonitorConversations = new MysqlEntryMonitorConversationRepository();
+  if (
+    (config.workerRole === "monitor" && config.entryMonitorEnabled) ||
+    (config.workerRole === "style" && config.contentStyleMonitorEnabled)
+  ) {
+    session.contextualMonitorConversations = new MysqlContextualMonitorConversationRepository();
   }
   sessionReference = session;
   metricsPublisher.start();
@@ -233,7 +237,7 @@ class PlatformLeaseUnavailableError extends Error {
  */
 export async function planGreyRpaBatches(
   repository: RpaTaskRepository,
-  config: Pick<RpaWorkerConfig, "workerType" | "platforms" | "maxTasks" | "candidateLimit"> &
+  config: Pick<RpaWorkerConfig, "workerRole" | "platforms" | "maxTasks" | "candidateLimit"> &
     Partial<Pick<
       RpaWorkerConfig,
       | "grayBrandIds"
@@ -241,11 +245,13 @@ export async function planGreyRpaBatches(
       | "grayPercentage"
       | "entryMonitorGrayProjectIds"
       | "entryMonitorProjectChunkSize"
+      | "contentStyleMonitorGrayProjectIds"
+      | "contentStyleMonitorProjectChunkSize"
     >>,
   brandCohorts?: readonly RpaBrandCohort[]
 ): Promise<PlannedRpaBatch[]> {
   const enabledPlatforms = new Set(config.platforms);
-  const seeds = (await repository.findPendingCollectionTasks(config.workerType, {
+  const seeds = (await repository.findPendingCollectionTasks(config.workerRole, {
     limit: config.candidateLimit,
     ...(brandCohorts ? { brandCohorts } : {})
   })).filter((task) =>
@@ -259,10 +265,12 @@ export async function planGreyRpaBatches(
     const key = batchIdentity(seed);
     if (seen.has(key)) continue;
     seen.add(key);
-    const tasks = (await repository.findPendingBatchTasks(config.workerType, seed, {
+    const tasks = (await repository.findPendingBatchTasks(config.workerRole, seed, {
       limit: seed.businessType === "ENTRY_MONITOR"
         ? config.entryMonitorProjectChunkSize ?? 5
-        : 1_000
+        : seed.businessType === "CONTENT_STYLE_MONITOR"
+          ? config.contentStyleMonitorProjectChunkSize ?? 5
+          : 1_000
     })).filter((task) =>
       task.platformId === seed.platformId && taskInGrayScope(task, config)
     );
@@ -288,6 +296,7 @@ export function taskInGrayScope(
     | "grayBusinessTaskIds"
     | "grayPercentage"
     | "entryMonitorGrayProjectIds"
+    | "contentStyleMonitorGrayProjectIds"
   >>
 ): boolean {
   if (task.businessType === "ENTRY_MONITOR") {
@@ -298,12 +307,42 @@ export function taskInGrayScope(
     ) return false;
     return percentageScope(`${task.businessType}:${task.projectId}`, config.grayPercentage);
   }
+  if (task.businessType === "CONTENT_STYLE_MONITOR") {
+    if (!task.projectId) return false;
+    if (
+      config.contentStyleMonitorGrayProjectIds?.length &&
+      !config.contentStyleMonitorGrayProjectIds.includes(task.projectId)
+    ) return false;
+    return percentageScope(`${task.businessType}:${task.projectId}`, config.grayPercentage);
+  }
   if (config.grayBrandIds?.length && !config.grayBrandIds.includes(task.brandId)) return false;
   if (
     config.grayBusinessTaskIds?.length &&
     !config.grayBusinessTaskIds.includes(task.businessTaskId)
   ) return false;
   return percentageScope(`${task.businessTaskId}:${task.brandId}`, config.grayPercentage);
+}
+
+function isContextualMonitorCollectionTask(
+  task: CollectionTask
+): task is ContextualMonitorCollectionTask {
+  return task.businessType === "ENTRY_MONITOR" ||
+    task.businessType === "CONTENT_STYLE_MONITOR";
+}
+
+function contextualConversationLimits(
+  task: ContextualMonitorCollectionTask,
+  config: RpaWorkerConfig
+): { maxDurationMs: number; maxQuestions: number } {
+  return task.businessType === "CONTENT_STYLE_MONITOR"
+    ? {
+      maxDurationMs: config.contentStyleMonitorConversationMaxDurationMs,
+      maxQuestions: config.contentStyleMonitorConversationMaxQuestions
+    }
+    : {
+      maxDurationMs: config.entryMonitorConversationMaxDurationMs,
+      maxQuestions: config.entryMonitorConversationMaxQuestions
+    };
 }
 
 const BATCH_START_RESTART_THRESHOLD = 3;
@@ -368,11 +407,11 @@ export async function resolveBrandWindow(
   repository: Pick<RpaTaskRepository, "findBrandWindow">,
   config: Pick<
     RpaWorkerConfig,
-    "workerType" | "brandWindowSize" | "brandBarrierPlatforms"
+    "workerRole" | "brandWindowSize" | "brandBarrierPlatforms"
   >
 ): Promise<RpaBrandWindowEntry[] | undefined> {
   if (config.brandWindowSize === 0) return undefined;
-  return repository.findBrandWindow(config.workerType, {
+  return repository.findBrandWindow(config.workerRole, {
     size: config.brandWindowSize,
     expectedPlatforms: config.brandBarrierPlatforms
   });
@@ -551,7 +590,7 @@ export async function runRpaWorkerOnce(
     if (config.recoverStale) {
       const staleBefore = new Date(Date.now() - config.staleAfterMs);
       const recovered = await stateRepository.recoverStaleExecutions(
-        config.workerType,
+        config.workerRole,
         staleBefore,
         leases,
         { limit: config.candidateLimit }
@@ -576,7 +615,7 @@ export async function runRpaWorkerOnce(
     // resumes within one poll interval after the five-minute threshold.
     if (config.platforms.length === 1) {
       const platformId = config.platforms[0]!;
-      const state = (await taskRepository.countTaskStates(config.workerType))
+      const state = (await taskRepository.countTaskStates(config.workerRole))
         .find((item) => item.platformId === platformId);
       onProgress("platform-processing-checked");
       if ((state?.processing ?? 0) > 0) {
@@ -601,13 +640,17 @@ export async function runRpaWorkerOnce(
       return summary;
     }
 
-    if (session.entryMonitorConversations) {
-      await session.entryMonitorConversations.closeExpired(
+    if (session.contextualMonitorConversations) {
+      await session.contextualMonitorConversations.closeExpired(
+        config.workerRole === "style" ? "CONTENT_STYLE_MONITOR" : "ENTRY_MONITOR",
         getShanghaiDate()
       ).catch((error) => {
         rpaConsoleError({
           workerId: config.workerId,
-          event: "ENTRY_MONITOR_CONVERSATION_EXPIRY_FAILED",
+          event: "CONTEXTUAL_MONITOR_CONVERSATION_EXPIRY_FAILED",
+          batchProgress: `businessType=${config.workerRole === "style"
+            ? "CONTENT_STYLE_MONITOR"
+            : "ENTRY_MONITOR"}`,
           errorCode: "DATABASE_ERROR",
           error
         });
@@ -657,7 +700,7 @@ export async function runRpaWorkerOnce(
       stateRepository,
       leases,
       planned,
-      config.workerType,
+      config.workerRole,
       shouldStop,
       onProgress
     );
@@ -699,7 +742,7 @@ export async function runRpaWorkerOnce(
       evidenceStore,
       summary,
       metrics: session.metrics,
-      entryMonitorConversations: session.entryMonitorConversations,
+      contextualMonitorConversations: session.contextualMonitorConversations,
       onFilesystemDegraded(degraded) {
         session.filesystemDegraded = degraded;
       },
@@ -900,7 +943,7 @@ export async function runRpaWorkerHealthCheck(
   taskRepository = new RpaTaskRepository(),
   evidenceStore = new FailureEvidenceStore({ evidenceDirectory: config.evidenceDirectory })
 ): Promise<void> {
-  const tasks = await taskRepository.findPendingTasks(config.workerType, { limit: 1 });
+  const tasks = await taskRepository.findPendingTasks(config.workerRole, { limit: 1 });
   const selfCheck = await runBrowserSelfCheck({
     cdpEndpoint: config.cdpEndpoint,
     platforms: config.platforms.map((platformId) => PLATFORMS[platformId])
@@ -1034,7 +1077,7 @@ interface ExecuteClaimedInput {
   evidenceStore: FailureEvidenceStore;
   summary: RpaWorkerRunSummary;
   metrics: MetricsRegistry;
-  entryMonitorConversations?: EntryMonitorConversationRepository;
+  contextualMonitorConversations?: ContextualMonitorConversationRepository;
   onFilesystemDegraded: (degraded: boolean) => void;
   invalidateBrowserRuntime: () => Promise<void>;
   recoverPlatformPage: (platformId: PlatformId) => Promise<Page>;
@@ -1152,11 +1195,8 @@ async function executeClaimedBatches(input: ExecuteClaimedInput): Promise<void> 
       manager = createPageConversationManager(
         requirePage(input.pages, platformId),
         PLATFORMS[platformId],
-        task.businessType === "ENTRY_MONITOR"
-          ? {
-            maxDurationMs: config.entryMonitorConversationMaxDurationMs,
-            maxQuestions: config.entryMonitorConversationMaxQuestions
-          }
+        isContextualMonitorCollectionTask(task)
+          ? contextualConversationLimits(task, config)
           : {
             maxDurationMs: config.maxConversationDurationMs,
             maxQuestions: config.maxConversationQuestions
@@ -1179,11 +1219,11 @@ async function executeClaimedBatches(input: ExecuteClaimedInput): Promise<void> 
       async onBatchStart(batch) {
         batchStartStages.set(batch.id, "platform-lease");
         const firstTask = requireTask(taskById, batch.tasks[0]?.id);
-        if (firstTask.businessType === "ENTRY_MONITOR") {
-          assertEntryMonitorCollectionContext(firstTask);
-          assertEntryMonitorTaskEligibleToday(firstTask);
+        if (isContextualMonitorCollectionTask(firstTask)) {
+          assertContextualMonitorCollectionContext(firstTask);
+          assertContextualMonitorTaskEligibleToday(firstTask);
         }
-        const lockName = platformLeaseName(config.workerType, batch.platformId);
+        const lockName = platformLeaseName(config.workerRole, batch.platformId);
         const acquired = await waitForAdvisoryLease(input.leases, lockName, {
           waitMs: config.leaseWaitMs,
           pollMs: config.leasePollMs
@@ -1194,19 +1234,21 @@ async function executeClaimedBatches(input: ExecuteClaimedInput): Promise<void> 
         const task = firstTask;
         const context: ConversationOwnerContext = {
           batchId: batch.id,
+          businessType: task.businessType,
           tenantId: task.tenantKey,
           brandId: task.brandId,
           businessTaskId: task.businessTaskId,
           businessGroupId: task.businessGroupId,
           platformId: batch.platformId,
-          ...(task.businessType === "ENTRY_MONITOR"
+          ...(isContextualMonitorCollectionTask(task)
             ? {
               executionId: task.executionId,
               intentEntryId: task.intentEntryId,
               repetitionNo: task.repetitionNo,
               submissionState: "PREPARED",
-              conversationKey: serializeEntryMonitorConversationKey(
-                entryMonitorConversationKeyFor({
+              conversationKey: serializeContextualMonitorConversationKey(
+                contextualMonitorConversationKeyFor({
+                  businessType: task.businessType,
                   tenantId: task.tenantId!,
                   projectId: task.projectId!,
                   aiModelId: task.aiModelId,
@@ -1219,15 +1261,16 @@ async function executeClaimedBatches(input: ExecuteClaimedInput): Promise<void> 
         };
         const page = requirePage(input.pages, batch.platformId);
         const manager = conversationManagerFor(task, batch.platformId);
-        if (task.businessType === "ENTRY_MONITOR") {
-          assertEntryMonitorCollectionContext(task);
-          const repository = input.entryMonitorConversations;
+        if (isContextualMonitorCollectionTask(task)) {
+          assertContextualMonitorCollectionContext(task);
+          const repository = input.contextualMonitorConversations;
           if (!repository) {
-            throw Object.assign(new Error("ENTRY_MONITOR 会话仓储未启用。"), {
+            throw Object.assign(new Error(`${task.businessType} 会话仓储未启用。`), {
               errorCode: "INVALID_EXECUTION_CONTEXT"
             });
           }
-          const key = entryMonitorConversationKeyFor({
+          const key = contextualMonitorConversationKeyFor({
+            businessType: task.businessType,
             tenantId: task.tenantId,
             projectId: task.projectId,
             aiModelId: task.aiModelId,
@@ -1236,10 +1279,9 @@ async function executeClaimedBatches(input: ExecuteClaimedInput): Promise<void> 
           });
           const record = await repository.find(key);
           if (record?.status === "ACTIVE") {
-            const expiredByPolicy = record.questionCount >=
-                config.entryMonitorConversationMaxQuestions ||
-              Date.now() - Date.parse(record.createdAt) >=
-                config.entryMonitorConversationMaxDurationMs;
+            const limits = contextualConversationLimits(task, config);
+            const expiredByPolicy = record.questionCount >= limits.maxQuestions ||
+              Date.now() - Date.parse(record.createdAt) >= limits.maxDurationMs;
             if (expiredByPolicy) {
               await repository.markUnavailable(key, "conversation rotation limit reached");
             } else if (!isConversationUrlForPlatform(record.conversationUrl, batch.platformId)) {
@@ -1276,7 +1318,7 @@ async function executeClaimedBatches(input: ExecuteClaimedInput): Promise<void> 
                   record.lastExecutionId === task.executionId
                 ) {
                   throw Object.assign(
-                    new Error("ENTRY_MONITOR database owner matches execution but page owner is missing"),
+                    new Error(`${task.businessType} database owner matches execution but page owner is missing`),
                     { errorCode: "AMBIGUOUS_RECOVERY" }
                   );
                 }
@@ -1291,7 +1333,7 @@ async function executeClaimedBatches(input: ExecuteClaimedInput): Promise<void> 
                 const ownerSubmissionState = storedOwner?.submissionState ?? "PREPARED";
                 if (executionOwnerMatches && ownerSubmissionState === "PERSISTED") {
                   throw Object.assign(
-                    new Error("ENTRY_MONITOR page owner is already PERSISTED; refusing to execute again"),
+                    new Error(`${task.businessType} page owner is already PERSISTED; refusing to execute again`),
                     { errorCode: "AMBIGUOUS_RECOVERY" }
                   );
                 }
@@ -1312,17 +1354,18 @@ async function executeClaimedBatches(input: ExecuteClaimedInput): Promise<void> 
                   (ownerSubmissionState !== "PREPARED" || inspection.status !== "absent")
                 ) {
                   throw Object.assign(
-                    new Error("ENTRY_MONITOR 页面属于当前 execution，但无法明确恢复提交结果。"),
+                    new Error(`${task.businessType} 页面属于当前 execution，但无法明确恢复提交结果。`),
                     { errorCode: "AMBIGUOUS_RECOVERY" }
                   );
                 }
                 rpaConsoleInfo({
                   workerId: config.workerId,
-                  event: "ENTRY_MONITOR_CONVERSATION_RESTORED",
+                  event: "CONTEXTUAL_MONITOR_CONVERSATION_RESTORED",
                   executionId: task.executionId,
                   brandId: task.brandId,
                   platformId: batch.platformId,
-                  batchProgress: `conversationKey=${context.conversationKey}`
+                  batchProgress:
+                    `businessType=${task.businessType},conversationKey=${context.conversationKey}`
                 });
                 batchStartStages.delete(batch.id);
                 input.batchStartFailureCounts.delete(batch.platformId);
@@ -1344,7 +1387,7 @@ async function executeClaimedBatches(input: ExecuteClaimedInput): Promise<void> 
           batchStartStages.set(batch.id, "owner-storage");
           await repository.upsertActive({
             ...key,
-            conversationKey: serializeEntryMonitorConversationKey(key),
+            conversationKey: serializeContextualMonitorConversationKey(key),
             conversationUrl,
             status: "ACTIVE",
             questionCount: 0,
@@ -1460,16 +1503,17 @@ async function executeClaimedBatches(input: ExecuteClaimedInput): Promise<void> 
         const task = requireTask(taskById, batch.tasks[0]?.id);
         const manager = conversationManagerFor(task, batch.platformId);
         manager.finishBatch(batch.id, "completed");
-        if (task.businessType === "ENTRY_MONITOR") {
-          assertEntryMonitorCollectionContext(task);
-          const key = entryMonitorConversationKeyFor({
+        if (isContextualMonitorCollectionTask(task)) {
+          assertContextualMonitorCollectionContext(task);
+          const key = contextualMonitorConversationKeyFor({
+            businessType: task.businessType,
             tenantId: task.tenantId,
             projectId: task.projectId,
             aiModelId: task.aiModelId,
             platformId: batch.platformId,
             monitorDate: task.monitorDate
           });
-          const repository = input.entryMonitorConversations;
+          const repository = input.contextualMonitorConversations;
           if (repository) {
             const page = requirePage(input.pages, batch.platformId);
             if (isConversationUrlForPlatform(page.url(), batch.platformId)) {
@@ -1551,10 +1595,10 @@ async function executeClaimedBatches(input: ExecuteClaimedInput): Promise<void> 
     },
     executeTask: async (context) => {
       const task = requireTask(taskById, context.task.id);
-      if (task.businessType === "ENTRY_MONITOR") {
-        assertEntryMonitorCollectionContext(task);
+      if (isContextualMonitorCollectionTask(task)) {
+        assertContextualMonitorCollectionContext(task);
         // 候选查询后可能刚好跨过上海 00:00，点击发送前必须再次复查。
-        assertEntryMonitorTaskEligibleToday(task);
+        assertContextualMonitorTaskEligibleToday(task);
       }
       await ensureBatchLeaseOwnership(input, context.batch, task.executionId);
       const manager = conversationManagerFor(task, context.platformId);
@@ -1567,9 +1611,10 @@ async function executeClaimedBatches(input: ExecuteClaimedInput): Promise<void> 
         platformId: context.platformId
       }, lastQuestion.get(context.platformId) ?? "");
       const page = requirePage(input.pages, context.platformId);
-      if (task.businessType === "ENTRY_MONITOR") {
-        assertEntryMonitorCollectionContext(task);
-        const key = entryMonitorConversationKeyFor({
+      if (isContextualMonitorCollectionTask(task)) {
+        assertContextualMonitorCollectionContext(task);
+        const key = contextualMonitorConversationKeyFor({
+          businessType: task.businessType,
           tenantId: task.tenantId,
           projectId: task.projectId,
           aiModelId: task.aiModelId,
@@ -1578,12 +1623,13 @@ async function executeClaimedBatches(input: ExecuteClaimedInput): Promise<void> 
         });
         await storeConversationOwner(page, {
           batchId: context.batch.id,
+          businessType: task.businessType,
           tenantId: task.tenantId,
           brandId: task.brandId,
           businessTaskId: task.businessTaskId,
           businessGroupId: task.businessGroupId,
           platformId: context.platformId,
-          conversationKey: serializeEntryMonitorConversationKey(key),
+          conversationKey: serializeContextualMonitorConversationKey(key),
           executionId: task.executionId,
           intentEntryId: task.intentEntryId,
           repetitionNo: task.repetitionNo,
@@ -1591,11 +1637,11 @@ async function executeClaimedBatches(input: ExecuteClaimedInput): Promise<void> 
           ...await readEntryMonitorDomBaseline(page, context.platformId)
         });
         if (
-          input.entryMonitorConversations &&
+          input.contextualMonitorConversations &&
           isConversationUrlForPlatform(page.url(), context.platformId)
         ) {
-          await input.entryMonitorConversations.updateUrl(key, page.url());
-          await input.entryMonitorConversations.touch(key, new Date());
+          await input.contextualMonitorConversations.updateUrl(key, page.url());
+          await input.contextualMonitorConversations.touch(key, new Date());
         }
       }
       const preflight = await inspectPlatformPage(page, PLATFORMS[context.platformId], 2_000);
@@ -1632,7 +1678,7 @@ async function executeClaimedBatches(input: ExecuteClaimedInput): Promise<void> 
       const queueEntryOwnerState = (
         state: NonNullable<ConversationOwnerContext["submissionState"]>
       ): void => {
-        if (task.businessType !== "ENTRY_MONITOR") return;
+        if (!isContextualMonitorCollectionTask(task)) return;
         entryOwnerStateWrite = entryOwnerStateWrite.then(() =>
           updateConversationOwnerSubmissionState(page, task.executionId, state)
         );
@@ -1709,22 +1755,24 @@ async function executeClaimedBatches(input: ExecuteClaimedInput): Promise<void> 
         const persistenceError = persistence.error;
         const databasePersistenceError = persistence.status === "pending";
 
-        if (task.businessType === "ENTRY_MONITOR" && input.entryMonitorConversations) {
-          assertEntryMonitorCollectionContext(task);
-          const key = entryMonitorConversationKeyFor({
+        if (isContextualMonitorCollectionTask(task) && input.contextualMonitorConversations) {
+          assertContextualMonitorCollectionContext(task);
+          const key = contextualMonitorConversationKeyFor({
+            businessType: task.businessType,
             tenantId: task.tenantId,
             projectId: task.projectId,
             aiModelId: task.aiModelId,
             platformId: context.platformId,
             monitorDate: task.monitorDate
           });
-          await input.entryMonitorConversations.incrementQuestionCount(key, {
+          await input.contextualMonitorConversations.incrementQuestionCount(key, {
             executionId: task.executionId,
             workerId: config.workerId
           }, completedAt).catch((conversationError) => {
             rpaConsoleError({
               workerId: config.workerId,
-              event: "ENTRY_MONITOR_CONVERSATION_UPDATE_FAILED",
+              event: "CONTEXTUAL_MONITOR_CONVERSATION_UPDATE_FAILED",
+              batchProgress: `businessType=${task.businessType}`,
               executionId: task.executionId,
               platformId: context.platformId,
               errorCode: "DATABASE_ERROR",
@@ -1855,12 +1903,12 @@ async function executeClaimedBatches(input: ExecuteClaimedInput): Promise<void> 
           ...deepThinkingRuntimeForTask(task, config),
           ...taskWebSearchRuntime,
           allowUnverifiedZeroReferences,
-          ...(task.businessType === "ENTRY_MONITOR"
+          ...(isContextualMonitorCollectionTask(task)
             ? {
               beforeSubmit: async () => {
-                assertEntryMonitorCollectionContext(task);
+                assertContextualMonitorCollectionContext(task);
                 // This runs inside submitQuestion immediately before each actual click/Enter attempt.
-                assertEntryMonitorTaskEligibleToday(task);
+                assertContextualMonitorTaskEligibleToday(task);
                 submissionState = "uncertain";
                 queueEntryOwnerState("SUBMITTING");
                 await entryOwnerStateWrite;
@@ -2045,7 +2093,7 @@ async function executeClaimedBatches(input: ExecuteClaimedInput): Promise<void> 
         // 任务级重试闭环：先从心跳集合移除，退避期间继续持有 execution lock；
         // 条件 UPDATE 成功改变状态后再释放 lock，避免其他 Worker 同时重试。
         heartbeat.remove(task.executionId);
-        const terminalEntryMonitorFailure = task.businessType === "ENTRY_MONITOR" &&
+        const terminalEntryMonitorFailure = isContextualMonitorCollectionTask(task) &&
           (errorCode === "DATE_WINDOW_EXPIRED" || errorCode === "INVALID_EXECUTION_CONTEXT");
         const backoffMs = terminalEntryMonitorFailure
           ? 0
@@ -2251,7 +2299,7 @@ export async function claimCompleteBatches(
   stateRepository: RpaWorkerStateRepository,
   leases: AdvisoryLeaseCoordinator,
   batches: readonly PlannedRpaBatch[],
-  workerType: RpaWorkerConfig["workerType"],
+  workerType: RpaWorkerConfig["workerRole"],
   shouldStop: () => boolean = () => false,
   onProgress: (stage: string) => void = () => undefined
 ): Promise<PlannedRpaBatch[]> {
@@ -2347,7 +2395,7 @@ async function ensureBatchLeaseOwnership(
   batch: BrandBatch,
   executionId: string
 ): Promise<void> {
-  const platformLock = platformLeaseName(input.config.workerType, batch.platformId);
+  const platformLock = platformLeaseName(input.config.workerRole, batch.platformId);
   const executionLock = executionLeaseName(executionId);
   const platformOwned = await input.leases.tryAcquire(platformLock);
   if (!platformOwned) {
@@ -2439,7 +2487,7 @@ async function refreshWorkerMetrics(
   ) {
     // 无论成功失败都限频，避免数据库故障时指标查询形成额外忙循环。
     session.lastTaskStateMetricsAt = now;
-    const taskStates = await session.taskRepository.countTaskStates(config.workerType)
+    const taskStates = await session.taskRepository.countTaskStates(config.workerRole)
       .catch(() => undefined);
     if (taskStates) {
       session.metrics.replaceTaskStates(new Map(taskStates.map((state) => [
@@ -2454,7 +2502,7 @@ async function refreshWorkerMetrics(
     }
     const businessTypeCounter = session.taskRepository.countTaskStatesByBusinessType;
     const statesByBusinessType = typeof businessTypeCounter === "function"
-      ? await businessTypeCounter.call(session.taskRepository, config.workerType)
+      ? await businessTypeCounter.call(session.taskRepository, config.workerRole)
         .catch(() => undefined)
       : undefined;
     if (statesByBusinessType) {
@@ -2496,6 +2544,7 @@ const CONVERSATION_OWNER_STORAGE_KEY = "geno-rpa:conversation-owner:v1";
 
 interface ConversationOwnerContext {
   batchId: string;
+  businessType: CollectionTask["businessType"];
   tenantId: string;
   brandId: string;
   businessTaskId: string;
@@ -2534,6 +2583,7 @@ async function currentPageMatchesConversationOwner(
     try {
       const actual = JSON.parse(raw) as Record<string, unknown>;
       const fields = [
+        "businessType",
         "tenantId",
         "brandId",
         "businessTaskId",
@@ -2644,7 +2694,7 @@ async function updateConversationOwnerSubmissionState(
     nextState: submissionState
   }).catch(() => false);
   if (!updated) {
-    throw Object.assign(new Error("ENTRY_MONITOR 页面 owner 与 executionId 不一致。"), {
+    throw Object.assign(new Error("上下文监测页面 owner 与 executionId 不一致。"), {
       errorCode: "AMBIGUOUS_RECOVERY"
     });
   }
@@ -2687,9 +2737,10 @@ function structuredTaskLogContext(
     tenantId: task.tenantKey,
     submissionState
   };
-  if (task.businessType !== "ENTRY_MONITOR") return common;
-  assertEntryMonitorCollectionContext(task);
-  const key = entryMonitorConversationKeyFor({
+  if (!isContextualMonitorCollectionTask(task)) return common;
+  assertContextualMonitorCollectionContext(task);
+  const key = contextualMonitorConversationKeyFor({
+    businessType: task.businessType,
     tenantId: task.tenantId,
     projectId: task.projectId,
     aiModelId: task.aiModelId,
@@ -2702,7 +2753,7 @@ function structuredTaskLogContext(
     intentEntryId: task.intentEntryId,
     monitorDate: task.monitorDate,
     repetitionNo: task.repetitionNo,
-    conversationKey: serializeEntryMonitorConversationKey(key),
+    conversationKey: serializeContextualMonitorConversationKey(key),
     ...(isConversationUrlForPlatform(conversationUrl, platformId)
       ? { conversationUrl }
       : {})

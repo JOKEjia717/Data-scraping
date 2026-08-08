@@ -5,11 +5,16 @@ import type {
   PlatformId,
   WebSearchPolicy
 } from "./types.js";
-import type { RpaWorkerType } from "./rpaTask.js";
+import {
+  workerTypeForRole,
+  type RpaWorkerRole,
+  type RpaWorkerType
+} from "./rpaTask.js";
 
 export interface RpaWorkerConfig {
   deploymentEnvironment: "staging" | "production";
   allowProductionClaims: boolean;
+  workerRole: RpaWorkerRole;
   workerType: RpaWorkerType;
   workerId: string;
   cdpEndpoint: string;
@@ -75,22 +80,29 @@ export interface RpaWorkerConfig {
   entryMonitorConversationMaxDurationMs: number;
   entryMonitorConversationMaxQuestions: number;
   entryMonitorTimezone: "Asia/Shanghai";
-  /** 风格监测使用独立开关；context/会话合同未完成时必须保持 false。 */
+  /** 风格监测仅由独立 style Role 读取，并使用项目灰度门禁。 */
   contentStyleMonitorEnabled: boolean;
   contentStyleMonitorGrayProjectIds: string[];
+  contentStyleMonitorProjectChunkSize: number;
+  contentStyleMonitorConversationMaxDurationMs: number;
+  contentStyleMonitorConversationMaxQuestions: number;
+  contentStyleMonitorTimezone: "Asia/Shanghai";
   /** ARTICLE_PROBE 仅为存量兼容，可在存量清零后单独关闭。 */
   articleProbeLegacyEnabled: boolean;
 }
 
 export function parseRpaWorkerConfig(
-  workerType: RpaWorkerType,
+  workerRole: RpaWorkerRole,
   argv: readonly string[],
   environment: NodeJS.ProcessEnv = process.env,
   cwd = process.cwd()
 ): RpaWorkerConfig {
   const args = parseArgs(argv);
-  const prefix = workerType === "diagnosis" ? "RPA_DIAGNOSIS" : "RPA_MONITOR";
-  const role = workerType;
+  const prefix = workerRole === "diagnosis"
+    ? "RPA_DIAGNOSIS"
+    : workerRole === "monitor" ? "RPA_MONITOR" : "RPA_STYLE";
+  const role = workerRole;
+  const workerType = workerTypeForRole(workerRole);
   const configured = (suffix: string): string | undefined =>
     args.get(toCliName(suffix)) ?? environment[`${prefix}_${suffix}`] ??
     environment[`RPA_WORKER_${suffix}`];
@@ -127,7 +139,7 @@ export function parseRpaWorkerConfig(
     maxTasks,
     1_000
   );
-  const defaultPort = workerType === "diagnosis" ? 9222 : 9223;
+  const defaultPort = workerRole === "diagnosis" ? 9222 : workerRole === "monitor" ? 9223 : 9224;
   const runtimeRoot = path.resolve(cwd, "rpa-runtime", role);
   const config: RpaWorkerConfig = {
     deploymentEnvironment: deploymentEnvironment(
@@ -137,6 +149,7 @@ export function parseRpaWorkerConfig(
       configured("ALLOW_PRODUCTION_CLAIMS") ?? "false",
       "allow-production-claims"
     ),
+    workerRole,
     workerType,
     workerId: nonEmpty(configured("WORKER_ID") ?? `${role}-worker`, "worker-id"),
     cdpEndpoint: nonEmpty(
@@ -235,7 +248,7 @@ export function parseRpaWorkerConfig(
       100
     ),
     brandWindowSize: integer(
-      configured("BRAND_WINDOW_SIZE") ?? (workerType === "diagnosis" ? "2" : "0"),
+      configured("BRAND_WINDOW_SIZE") ?? (workerRole === "diagnosis" ? "2" : "0"),
       "brand-window-size",
       0,
       10
@@ -356,13 +369,13 @@ export function parseRpaWorkerConfig(
       2,
       10_000
     ),
-    entryMonitorEnabled: workerType === "monitor"
+    entryMonitorEnabled: workerRole === "monitor"
       ? booleanValue(entryConfigured("ENABLED") ?? "false", "entry-monitor-enabled")
       : false,
-    entryMonitorGrayProjectIds: workerType === "monitor"
+    entryMonitorGrayProjectIds: workerRole === "monitor"
       ? csvIds(entryConfigured("GRAY_PROJECT_IDS"))
       : [],
-    entryMonitorProjectChunkSize: workerType === "monitor"
+    entryMonitorProjectChunkSize: workerRole === "monitor"
       ? integer(
         entryConfigured("PROJECT_CHUNK_SIZE") ?? "5",
         "entry-monitor-project-chunk-size",
@@ -370,7 +383,7 @@ export function parseRpaWorkerConfig(
         1_000
       )
       : 5,
-    entryMonitorConversationMaxDurationMs: workerType === "monitor"
+    entryMonitorConversationMaxDurationMs: workerRole === "monitor"
       ? integer(
         entryConfigured("CONVERSATION_MAX_DURATION_MS") ?? "86400000",
         "entry-monitor-conversation-max-duration-ms",
@@ -378,7 +391,7 @@ export function parseRpaWorkerConfig(
         86_400_000
       )
       : 86_400_000,
-    entryMonitorConversationMaxQuestions: workerType === "monitor"
+    entryMonitorConversationMaxQuestions: workerRole === "monitor"
       ? integer(
         entryConfigured("CONVERSATION_MAX_QUESTIONS") ?? "10000",
         "entry-monitor-conversation-max-questions",
@@ -386,19 +399,46 @@ export function parseRpaWorkerConfig(
         10_000
       )
       : 10_000,
-    entryMonitorTimezone: workerType === "monitor"
+    entryMonitorTimezone: workerRole === "monitor"
       ? entryMonitorTimezone(entryConfigured("TIMEZONE") ?? "Asia/Shanghai")
       : "Asia/Shanghai",
-    contentStyleMonitorEnabled: workerType === "monitor"
+    contentStyleMonitorEnabled: workerRole === "style"
       ? booleanValue(
         contentStyleConfigured("ENABLED") ?? "false",
         "content-style-monitor-enabled"
       )
       : false,
-    contentStyleMonitorGrayProjectIds: workerType === "monitor"
+    contentStyleMonitorGrayProjectIds: workerRole === "style"
       ? csvIds(contentStyleConfigured("GRAY_PROJECT_IDS"))
       : [],
-    articleProbeLegacyEnabled: workerType === "monitor"
+    contentStyleMonitorProjectChunkSize: workerRole === "style"
+      ? integer(
+        contentStyleConfigured("PROJECT_CHUNK_SIZE") ?? "5",
+        "content-style-monitor-project-chunk-size",
+        1,
+        1_000
+      )
+      : 5,
+    contentStyleMonitorConversationMaxDurationMs: workerRole === "style"
+      ? integer(
+        contentStyleConfigured("CONVERSATION_MAX_DURATION_MS") ?? "86400000",
+        "content-style-monitor-conversation-max-duration-ms",
+        60_000,
+        86_400_000
+      )
+      : 86_400_000,
+    contentStyleMonitorConversationMaxQuestions: workerRole === "style"
+      ? integer(
+        contentStyleConfigured("CONVERSATION_MAX_QUESTIONS") ?? "10000",
+        "content-style-monitor-conversation-max-questions",
+        2,
+        10_000
+      )
+      : 10_000,
+    contentStyleMonitorTimezone: workerRole === "style"
+      ? entryMonitorTimezone(contentStyleConfigured("TIMEZONE") ?? "Asia/Shanghai")
+      : "Asia/Shanghai",
+    articleProbeLegacyEnabled: workerRole === "monitor"
       ? booleanValue(
         args.get("article-probe-legacy-enabled") ??
           environment.ARTICLE_PROBE_LEGACY_ENABLED ?? "true",
@@ -424,9 +464,6 @@ export function parseRpaWorkerConfig(
     if (config.contentStyleMonitorGrayProjectIds.length === 0) {
       throw new Error("启用 CONTENT_STYLE_MONITOR 时必须配置灰度项目白名单。");
     }
-    throw new Error(
-      "CONTENT_STYLE_MONITOR 的通用 execution context 尚未完成，当前版本禁止领取。"
-    );
   }
   if (
     config.deploymentEnvironment === "production" &&
@@ -437,7 +474,7 @@ export function parseRpaWorkerConfig(
       "production 环境领取任务必须显式设置 RPA_WORKER_ALLOW_PRODUCTION_CLAIMS=true。"
     );
   }
-  validateDistinctWorkerResources(config, environment);
+  validateDistinctWorkerResources(config, environment, cwd);
   return config;
 }
 
@@ -483,33 +520,85 @@ function entryMonitorTimezone(value: string): "Asia/Shanghai" {
   throw new Error("entry-monitor-timezone 目前只允许 Asia/Shanghai。");
 }
 
-function validateDistinctWorkerResources(
+export function validateDistinctWorkerResources(
   config: RpaWorkerConfig,
-  environment: NodeJS.ProcessEnv
+  environment: NodeJS.ProcessEnv,
+  cwd = process.cwd()
 ): void {
-  const otherPrefix = config.workerType === "diagnosis" ? "RPA_MONITOR" : "RPA_DIAGNOSIS";
-  const otherWorkerId = environment[`${otherPrefix}_WORKER_ID`]?.trim();
-  if (otherWorkerId && otherWorkerId === config.workerId) {
-    throw new Error("diagnosis 与 monitor 的 workerId 不能相同。");
-  }
-  const otherEndpoint = environment[`${otherPrefix}_CDP_ENDPOINT`]?.trim();
-  if (otherEndpoint && otherEndpoint === config.cdpEndpoint) {
-    throw new Error("diagnosis 与 monitor 的 CDP endpoint 不能相同。");
-  }
-  const otherProfile = environment[`${otherPrefix}_CHROME_PROFILE`]?.trim();
-  if (
-    otherProfile &&
-    path.resolve(otherProfile) === config.chromeProfileDirectory
-  ) {
-    throw new Error("diagnosis 与 monitor 的 Chrome Profile 不能相同。");
-  }
-  const otherOutbox = environment[`${otherPrefix}_OUTBOX_DIR`]?.trim();
-  if (otherOutbox && path.resolve(otherOutbox) === config.outboxDirectory) {
-    throw new Error("diagnosis 与 monitor 的 Result Outbox 目录不能相同。");
-  }
-  const otherMetrics = environment[`${otherPrefix}_METRICS_DIR`]?.trim();
-  if (otherMetrics && path.resolve(otherMetrics) === config.metricsDirectory) {
-    throw new Error("diagnosis 与 monitor 的指标目录不能相同。");
+  const prefixes: Record<RpaWorkerRole, string> = {
+    diagnosis: "RPA_DIAGNOSIS",
+    monitor: "RPA_MONITOR",
+    style: "RPA_STYLE"
+  };
+  const ports: Record<RpaWorkerRole, number> = {
+    diagnosis: 9222,
+    monitor: 9223,
+    style: 9224
+  };
+  const commonValue = (suffix: string): string | undefined =>
+    environment[`RPA_WORKER_${suffix}`]?.trim() || undefined;
+  const valueFor = (role: RpaWorkerRole, suffix: string, fallback: string): string =>
+    environment[`${prefixes[role]}_${suffix}`]?.trim() || commonValue(suffix) || fallback;
+  const resourcesFor = (role: RpaWorkerRole) => {
+    const runtimeRoot = path.join(cwd, "rpa-runtime", role);
+    return {
+      workerId: valueFor(role, "WORKER_ID", `${role}-worker`),
+      cdpEndpoint: valueFor(role, "CDP_ENDPOINT", `http://127.0.0.1:${ports[role]}`),
+      chromeProfileDirectory: path.resolve(valueFor(
+        role, "CHROME_PROFILE", path.join(cwd, ".chrome-profiles", role)
+      )),
+      logDirectory: path.resolve(valueFor(role, "LOG_DIR", path.join(runtimeRoot, "logs"))),
+      evidenceDirectory: path.resolve(valueFor(
+        role, "EVIDENCE_DIR", path.join(runtimeRoot, "evidence")
+      )),
+      outboxDirectory: path.resolve(valueFor(
+        role, "OUTBOX_DIR", path.join(runtimeRoot, "outbox")
+      )),
+      metricsDirectory: path.resolve(valueFor(
+        role, "METRICS_DIR", path.join(runtimeRoot, "metrics")
+      )),
+      shutdownFile: path.resolve(valueFor(
+        role, "SHUTDOWN_FILE", path.join(runtimeRoot, "stop.request")
+      ))
+    };
+  };
+  const currentResources = {
+    workerId: config.workerId,
+    cdpEndpoint: config.cdpEndpoint,
+    chromeProfileDirectory: config.chromeProfileDirectory,
+    logDirectory: config.logDirectory,
+    evidenceDirectory: config.evidenceDirectory,
+    outboxDirectory: config.outboxDirectory,
+    metricsDirectory: config.metricsDirectory,
+    shutdownFile: config.shutdownFile
+  };
+  const resourceLabels: Record<keyof typeof currentResources, string> = {
+    workerId: "workerId ",
+    cdpEndpoint: "CDP endpoint ",
+    chromeProfileDirectory: "Chrome Profile ",
+    logDirectory: "日志目录",
+    evidenceDirectory: "证据目录",
+    outboxDirectory: "Result Outbox 目录",
+    metricsDirectory: "指标目录",
+    shutdownFile: "Shutdown/Control 路径"
+  };
+  const roles = ["diagnosis", "monitor", "style"] as const;
+  const allResources = new Map(roles.map((role) => [role, resourcesFor(role)]));
+  allResources.set(config.workerRole, currentResources);
+  for (let leftIndex = 0; leftIndex < roles.length; leftIndex += 1) {
+    for (let rightIndex = leftIndex + 1; rightIndex < roles.length; rightIndex += 1) {
+      const leftRole = roles[leftIndex]!;
+      const rightRole = roles[rightIndex]!;
+      const left = allResources.get(leftRole)!;
+      const right = allResources.get(rightRole)!;
+      for (const key of Object.keys(currentResources) as Array<keyof typeof currentResources>) {
+        if (left[key] === right[key]) {
+          throw new Error(
+            `${leftRole} 与 ${rightRole} 的 ${resourceLabels[key]}不能相同。`
+          );
+        }
+      }
+    }
   }
 }
 

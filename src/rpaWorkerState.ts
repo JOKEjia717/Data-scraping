@@ -17,7 +17,7 @@ import {
 } from "./rpaTaskRepository.js";
 import {
   type RpaBusinessType,
-  type RpaWorkerType
+  type RpaWorkerRole
 } from "./rpaTask.js";
 import type { PlatformId } from "./types.js";
 
@@ -237,7 +237,7 @@ WHERE id IN (${ids.map(() => "?").join(", ")})
   }
 
   async findStaleExecutions(
-    workerType: RpaWorkerType,
+    workerType: RpaWorkerRole,
     staleBefore: Date,
     limit = 100
   ): Promise<StaleExecution[]> {
@@ -261,7 +261,7 @@ WHERE id IN (${ids.map(() => "?").join(", ")})
   }
 
   async recoverStaleExecutions(
-    workerType: RpaWorkerType,
+    workerType: RpaWorkerRole,
     staleBefore: Date,
     leases: AdvisoryLeaseCoordinator,
     options: { limit?: number; dryRun?: boolean } = {}
@@ -299,8 +299,13 @@ WHERE id IN (${ids.map(() => "?").join(", ")})
     return { candidates, recoveredExecutionIds, skippedLockedExecutionIds };
   }
 
-  private businessTypes(workerType: RpaWorkerType): readonly RpaBusinessType[] {
+  private businessTypes(workerType: RpaWorkerRole): readonly RpaBusinessType[] {
     if (workerType === "diagnosis") return ["DIAGNOSIS"];
+    if (workerType === "style") {
+      return this.options.contentStyleMonitorEnabled === true
+        ? ["CONTENT_STYLE_MONITOR"]
+        : [];
+    }
     const types: RpaBusinessType[] = [];
     if (this.options.articleProbeLegacyEnabled !== false) types.push("ARTICLE_PROBE");
     if (this.options.entryMonitorEnabled === true) types.push("ENTRY_MONITOR");
@@ -398,9 +403,9 @@ export function executionLeaseName(executionId: string): string {
 }
 
 export function platformLeaseName(platformId: PlatformId): string;
-export function platformLeaseName(workerType: RpaWorkerType, platformId: PlatformId): string;
+export function platformLeaseName(workerType: RpaWorkerRole, platformId: PlatformId): string;
 export function platformLeaseName(
-  workerTypeOrPlatform: RpaWorkerType | PlatformId,
+  workerTypeOrPlatform: RpaWorkerRole | PlatformId,
   maybePlatform?: PlatformId
 ): string {
   if (maybePlatform === undefined) {

@@ -9,11 +9,11 @@ import {
 } from "./rpaWorkerFleet.js";
 
 export async function runRpaWorkerFleetCli(argv = process.argv.slice(2)): Promise<void> {
-  const { workerType, remainingArgs } = readWorkerType(argv);
-  const config = parseRpaWorkerConfig(workerType, remainingArgs);
+  const { workerRole, remainingArgs } = readWorkerType(argv);
+  const config = parseRpaWorkerConfig(workerRole, remainingArgs);
   if (!config.dryRun) await assertLegacyOutboxEmpty(config.outboxDirectory);
-  const specs = platformWorkerLaunchSpecs(workerType, config, remainingArgs);
-  const fleet = new RpaWorkerFleet(workerType, config, specs);
+  const specs = platformWorkerLaunchSpecs(workerRole, config, remainingArgs);
+  const fleet = new RpaWorkerFleet(workerRole, config, specs);
   const requestStop = (signal: NodeJS.Signals): void => fleet.requestStop(signal);
   process.on("SIGINT", requestStop);
   process.on("SIGTERM", requestStop);

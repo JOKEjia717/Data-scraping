@@ -26,6 +26,7 @@ import {
   type CollectionTask,
   type RpaBusinessType,
   type RpaTask,
+  type RpaWorkerRole,
   type RpaWorkerType
 } from "./rpaTask.js";
 import type { PlatformId } from "./types.js";
@@ -80,6 +81,7 @@ export interface RpaTaskRepositoryOptions {
 }
 
 export interface RpaTaskRepositoryRuntimeConfig {
+  workerRole: RpaWorkerRole;
   workerType: RpaWorkerType;
   databaseRetryScheduleEnabled: boolean;
   providerRoutingEnabled: boolean;
@@ -95,7 +97,7 @@ export interface RpaTaskRepositoryRuntimeConfig {
 export function createRpaTaskRepositoryOptions(
   config: RpaTaskRepositoryRuntimeConfig
 ): RpaTaskRepositoryOptions {
-  const entryMonitorEnabled = config.workerType === "monitor" && config.entryMonitorEnabled;
+  const entryMonitorEnabled = config.workerRole === "monitor" && config.entryMonitorEnabled;
   return {
     retryScheduleEnabled: config.databaseRetryScheduleEnabled,
     ...(config.providerRoutingEnabled
@@ -105,13 +107,13 @@ export function createRpaTaskRepositoryOptions(
     entryMonitorGrayProjectIds: entryMonitorEnabled
       ? [...config.entryMonitorGrayProjectIds]
       : [],
-    contentStyleMonitorEnabled: config.workerType === "monitor" &&
+    contentStyleMonitorEnabled: config.workerRole === "style" &&
       config.contentStyleMonitorEnabled,
-    contentStyleMonitorGrayProjectIds: config.workerType === "monitor" &&
+    contentStyleMonitorGrayProjectIds: config.workerRole === "style" &&
       config.contentStyleMonitorEnabled
       ? [...config.contentStyleMonitorGrayProjectIds]
       : [],
-    articleProbeLegacyEnabled: config.workerType === "monitor" &&
+    articleProbeLegacyEnabled: config.workerRole === "monitor" &&
       config.articleProbeLegacyEnabled
   };
 }
@@ -248,7 +250,7 @@ export class RpaTaskRepository {
 
   /** Each protocol type is queried independently; feature flags decide monitor eligibility. */
   async findPendingTasks(
-    workerType: RpaWorkerType,
+    workerType: RpaWorkerRole,
     options: RpaTaskQueryOptions = {}
   ): Promise<RpaTask[]> {
     const limit = normalizeLimit(options.limit);
@@ -256,8 +258,8 @@ export class RpaTaskRepository {
     const brandCohorts = normalizeBrandCohorts(options.brandCohorts);
     if (options.brandCohorts && brandCohorts.length === 0) return [];
     const tasks: RpaTask[] = [];
-    const queryLegacyProbe = workerType !== "monitor" ||
-      this.options.articleProbeLegacyEnabled !== false;
+    const queryLegacyProbe = workerType === "diagnosis" ||
+      (workerType === "monitor" && this.options.articleProbeLegacyEnabled !== false);
     if (queryLegacyProbe) {
       const rows = await this.client.queryRows<RpaTaskRow>(
         pendingQueryFor(
@@ -286,7 +288,7 @@ export class RpaTaskRepository {
       });
     }
 
-    if (workerType === "monitor") {
+    if (workerType !== "diagnosis") {
       const contextualTypes: Array<{
         businessType: "ENTRY_MONITOR" | "CONTENT_STYLE_MONITOR";
         enabled: boolean;
@@ -294,12 +296,12 @@ export class RpaTaskRepository {
       }> = [
         {
           businessType: "ENTRY_MONITOR",
-          enabled: this.options.entryMonitorEnabled === true,
+          enabled: workerType === "monitor" && this.options.entryMonitorEnabled === true,
           projectIds: this.options.entryMonitorGrayProjectIds
         },
         {
           businessType: "CONTENT_STYLE_MONITOR",
-          enabled: this.options.contentStyleMonitorEnabled === true,
+          enabled: workerType === "style" && this.options.contentStyleMonitorEnabled === true,
           projectIds: this.options.contentStyleMonitorGrayProjectIds
         }
       ];
@@ -341,7 +343,7 @@ export class RpaTaskRepository {
   }
 
   async findPendingCollectionTasks(
-    workerType: RpaWorkerType,
+    workerType: RpaWorkerRole,
     options: RpaTaskQueryOptions = {}
   ): Promise<CollectionTask[]> {
     return (await this.findPendingTasks(workerType, options)).map(toCollectionTask);
@@ -353,7 +355,7 @@ export class RpaTaskRepository {
    * to be present, so a missing/final-failed platform keeps the barrier closed.
    */
   async findBrandWindow(
-    workerType: RpaWorkerType,
+    workerType: RpaWorkerRole,
     options: RpaBrandWindowOptions
   ): Promise<RpaBrandWindowEntry[]> {
     const size = normalizeWindowSize(options.size);
@@ -391,7 +393,7 @@ export class RpaTaskRepository {
    * 读取种子任务所属的完整品牌/业务/平台批次，避免灰度数量上限把批次从中间截断。
    */
   async findPendingBatchTasks(
-    workerType: RpaWorkerType,
+    workerType: RpaWorkerRole,
     seed: RpaBatchSeed,
     options: RpaTaskQueryOptions = { limit: 1_000 }
   ): Promise<CollectionTask[]> {
@@ -439,14 +441,14 @@ export class RpaTaskRepository {
    * 条件更新同时要求 status=0、task_status=0 且业务类型属于当前 Worker。只有
    * affectedRows=1 才表示本 Worker 成功领取；并发竞争失败返回 false。
    */
-  async claimTask(workerType: RpaWorkerType, executionId: string): Promise<boolean>;
+  async claimTask(workerType: RpaWorkerRole, executionId: string): Promise<boolean>;
   async claimTask(
-    workerType: RpaWorkerType,
+    workerType: RpaWorkerRole,
     businessType: RpaBusinessType,
     executionId: string
   ): Promise<boolean>;
   async claimTask(
-    workerType: RpaWorkerType,
+    workerType: RpaWorkerRole,
     businessTypeOrExecutionId: RpaBusinessType | string,
     maybeExecutionId?: string
   ): Promise<boolean> {
@@ -483,7 +485,7 @@ export class RpaTaskRepository {
 
   /** 查询一小批候选并逐条条件领取，返回首个赢得竞争的 CollectionTask。 */
   async claimNextTask(
-    workerType: RpaWorkerType,
+    workerType: RpaWorkerRole,
     options: RpaTaskQueryOptions = {}
   ): Promise<CollectionTask | undefined> {
     const candidates = await this.findPendingTasks(workerType, options);
@@ -509,7 +511,7 @@ export class RpaTaskRepository {
    * 指标只读聚合。调用方必须把失败视为指标不可用，不能据此改变任务流程。
    * 仅统计 execution 自身的双状态，不修改 dispatch 状态。
    */
-  async countTaskStates(workerType: RpaWorkerType): Promise<RpaTaskStateCount[]> {
+  async countTaskStates(workerType: RpaWorkerRole): Promise<RpaTaskStateCount[]> {
     const businessTypes = this.enabledBusinessTypes(workerType);
     if (businessTypes.length === 0) return [];
     const baseSql = TASK_STATE_COUNT_SQL.replace(
@@ -551,7 +553,7 @@ export class RpaTaskRepository {
   }
 
   async countTaskStatesByBusinessType(
-    workerType: RpaWorkerType
+    workerType: RpaWorkerRole
   ): Promise<RpaBusinessTaskStateCount[]> {
     const businessTypes = this.enabledBusinessTypes(workerType);
     if (businessTypes.length === 0) return [];
@@ -603,20 +605,22 @@ export class RpaTaskRepository {
     await this.audit?.write(event).catch(() => undefined);
   }
 
-  private enabledBusinessTypes(workerType: RpaWorkerType): RpaBusinessType[] {
+  private enabledBusinessTypes(workerType: RpaWorkerRole): RpaBusinessType[] {
     if (workerType === "diagnosis") return ["DIAGNOSIS"];
+    if (workerType === "style") {
+      return this.options.contentStyleMonitorEnabled === true
+        ? ["CONTENT_STYLE_MONITOR"]
+        : [];
+    }
     const types: RpaBusinessType[] = [];
     if (this.options.articleProbeLegacyEnabled !== false) types.push("ARTICLE_PROBE");
     if (this.options.entryMonitorEnabled === true) types.push("ENTRY_MONITOR");
-    if (this.options.contentStyleMonitorEnabled === true) {
-      types.push("CONTENT_STYLE_MONITOR");
-    }
     return types;
   }
 
   private async mapCandidate(
     row: RpaTaskRow,
-    workerType: RpaWorkerType,
+    workerType: RpaWorkerRole,
     expectedBusinessType: RpaBusinessType
   ): Promise<RpaTask | undefined> {
     try {
@@ -833,7 +837,7 @@ function contextualMonitorBatchQueryFor(
 }
 
 function pendingBatchQueryFor(
-  workerType: RpaWorkerType,
+  workerType: RpaWorkerRole,
   retryScheduleEnabled = false,
   providerRoutingEnabled = false
 ): string {
@@ -1005,7 +1009,7 @@ export function mapRpaTaskRow(
 }
 
 function pendingQueryFor(
-  workerType: RpaWorkerType,
+  workerType: RpaWorkerRole,
   retryScheduleEnabled = false,
   providerRoutingEnabled = false,
   brandCohortCount = 0
@@ -1095,7 +1099,7 @@ ORDER BY cohort.priority ASC, cohort.createdAt ASC, cohort.sortId ASC
 LIMIT ?`;
 
 function brandWindowQueryFor(
-  workerType: RpaWorkerType,
+  workerType: RpaWorkerRole,
   providerRoutingEnabled: boolean,
   expectedPlatforms: readonly PlatformId[]
 ): string {

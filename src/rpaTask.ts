@@ -9,6 +9,7 @@ export type RpaBusinessType =
 export type ContextualMonitorBusinessType =
   | "ENTRY_MONITOR"
   | "CONTENT_STYLE_MONITOR";
+export type RpaWorkerRole = "diagnosis" | "monitor" | "style";
 export type RpaWorkerType = "diagnosis" | "monitor";
 
 interface BaseRpaTask {
@@ -86,24 +87,36 @@ export interface CollectionTask extends BaseRpaTask {
   repetitionNo?: number;
 }
 
-export function businessTypesForWorker(
-  workerType: RpaWorkerType
+export function workerTypeForRole(role: RpaWorkerRole): RpaWorkerType {
+  return role === "diagnosis" ? "diagnosis" : "monitor";
+}
+
+export function businessTypesForWorkerRole(
+  role: RpaWorkerRole
 ): readonly RpaBusinessType[] {
-  return workerType === "diagnosis"
-    ? ["DIAGNOSIS"]
-    : ["ARTICLE_PROBE", "ENTRY_MONITOR", "CONTENT_STYLE_MONITOR"];
+  if (role === "diagnosis") return ["DIAGNOSIS"];
+  if (role === "monitor") return ["ARTICLE_PROBE", "ENTRY_MONITOR"];
+  return ["CONTENT_STYLE_MONITOR"];
+}
+
+/** @deprecated Prefer businessTypesForWorkerRole so style never shares monitor eligibility. */
+export function businessTypesForWorker(
+  role: RpaWorkerRole
+): readonly RpaBusinessType[] {
+  return businessTypesForWorkerRole(role);
 }
 
 export function isBusinessTypeAllowedForWorker(
-  workerType: RpaWorkerType,
+  role: RpaWorkerRole,
   businessType: RpaBusinessType
 ): boolean {
-  return businessTypesForWorker(workerType).includes(businessType);
+  return businessTypesForWorkerRole(role).includes(businessType);
 }
 
 /** @deprecated 新代码应使用 businessTypesForWorker 并携带任务真实 businessType。 */
-export function businessTypeForWorker(workerType: RpaWorkerType): RpaBusinessType {
-  return workerType === "diagnosis" ? "DIAGNOSIS" : "ARTICLE_PROBE";
+export function businessTypeForWorker(role: RpaWorkerRole): RpaBusinessType {
+  if (role === "diagnosis") return "DIAGNOSIS";
+  return role === "style" ? "CONTENT_STYLE_MONITOR" : "ARTICLE_PROBE";
 }
 
 export function toCollectionTask(task: RpaTask): CollectionTask {

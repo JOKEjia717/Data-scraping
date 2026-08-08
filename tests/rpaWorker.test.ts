@@ -221,11 +221,15 @@ function task(
   };
 }
 
-test("diagnosis 与 monitor 默认使用独立 endpoint、workerId、目录和 Profile", () => {
+test("diagnosis、monitor 与 style 默认使用独立 endpoint、workerId、目录和 Profile", () => {
   const diagnosis = parseRpaWorkerConfig("diagnosis", [], {}, "/workspace");
   const monitor = parseRpaWorkerConfig("monitor", [], {}, "/workspace");
+  const style = parseRpaWorkerConfig("style", [], {}, "/workspace");
   assert.equal(diagnosis.cdpEndpoint, "http://127.0.0.1:9222");
   assert.equal(monitor.cdpEndpoint, "http://127.0.0.1:9223");
+  assert.equal(style.cdpEndpoint, "http://127.0.0.1:9224");
+  assert.equal(style.workerRole, "style");
+  assert.equal(style.workerType, "monitor");
   assert.equal(monitor.entryMonitorEnabled, false);
   assert.notEqual(diagnosis.workerId, monitor.workerId);
   assert.notEqual(diagnosis.logDirectory, monitor.logDirectory);
@@ -233,6 +237,8 @@ test("diagnosis 与 monitor 默认使用独立 endpoint、workerId、目录和 P
   assert.notEqual(diagnosis.outboxDirectory, monitor.outboxDirectory);
   assert.notEqual(diagnosis.metricsDirectory, monitor.metricsDirectory);
   assert.notEqual(diagnosis.chromeProfileDirectory, monitor.chromeProfileDirectory);
+  assert.notEqual(style.chromeProfileDirectory, monitor.chromeProfileDirectory);
+  assert.notEqual(style.outboxDirectory, monitor.outboxDirectory);
   assert.equal(diagnosis.dryRun, true);
   assert.equal(diagnosis.maxTasks, 1);
   assert.equal(diagnosis.maxAttempts, 3);
@@ -296,6 +302,21 @@ test("灰度配置支持关闭 dry-run 和只启用一个平台", () => {
     }, "/workspace"),
     /Outbox 目录不能相同/
   );
+  for (const [suffix, expected] of [
+    ["WORKER_ID", /workerId 不能相同/],
+    ["CDP_ENDPOINT", /CDP endpoint 不能相同/],
+    ["CHROME_PROFILE", /Chrome Profile 不能相同/],
+    ["LOG_DIR", /日志目录不能相同/],
+    ["EVIDENCE_DIR", /证据目录不能相同/],
+    ["OUTBOX_DIR", /Result Outbox 目录不能相同/],
+    ["METRICS_DIR", /指标目录不能相同/],
+    ["SHUTDOWN_FILE", /Shutdown\/Control 路径不能相同/]
+  ] as const) {
+    assert.throws(() => parseRpaWorkerConfig("style", [], {
+      [`RPA_STYLE_${suffix}`]: "/shared/resource",
+      [`RPA_MONITOR_${suffix}`]: "/shared/resource"
+    }, "/workspace"), expected);
+  }
 });
 
 test("生产领取必须双重显式授权，灰度白名单和比例按完整业务批次稳定生效", () => {
@@ -387,7 +408,7 @@ test("灰度任务上限不会截断第一个完整品牌批次", async () => {
   } as unknown as RpaTaskRepository;
 
   const planned = await planGreyRpaBatches(repository, {
-    workerType: "diagnosis",
+    workerRole: "diagnosis",
     platforms: ["doubao"],
     maxTasks: 1,
     candidateLimit: 100
@@ -563,6 +584,54 @@ test("僵尸恢复跳过仍持有 execution 锁的其他 Worker", async () => {
   assert.deepEqual(leases.releases, [executionLeaseName("21")]);
 });
 
+test("CONTENT_STYLE_MONITOR 按独立项目切片配置规划批次", async () => {
+  const styleTasks = Array.from({ length: 7 }, (_, index): CollectionTask => ({
+    ...task(String(100 + index), "style-project"),
+    executionId: String(100 + index),
+    id: String(100 + index),
+    businessType: "CONTENT_STYLE_MONITOR",
+    tenantId: "tenant-a",
+    tenantKey: "tenant-a",
+    projectId: "5",
+    intentEntryId: String(800 + index),
+    monitorDate: "2026-08-08",
+    repetitionNo: index + 1,
+    brandId: "5",
+    aiModelId: "1",
+    platformId: "doubao",
+    businessGroupId: JSON.stringify([
+      "tenant-a", "CONTENT_STYLE_MONITOR", "5", "1", "2026-08-08"
+    ])
+  }));
+  const requestedLimits: number[] = [];
+  const repository = {
+    async findPendingCollectionTasks() { return [styleTasks[0]!]; },
+    async findPendingBatchTasks(
+      _workerRole: string,
+      _seed: unknown,
+      options: { limit?: number }
+    ) {
+      const limit = options.limit ?? 1_000;
+      requestedLimits.push(limit);
+      return styleTasks.slice(0, limit);
+    }
+  } as unknown as RpaTaskRepository;
+
+  const planned = await planGreyRpaBatches(repository, {
+    workerRole: "style",
+    platforms: ["doubao"],
+    maxTasks: 20,
+    candidateLimit: 100,
+    contentStyleMonitorGrayProjectIds: ["5"],
+    contentStyleMonitorProjectChunkSize: 3
+  });
+
+  assert.deepEqual(requestedLimits, [3]);
+  assert.equal(planned[0]?.tasks.length, 3);
+  assert.ok(planned[0]?.tasks.every(({ businessType }) =>
+    businessType === "CONTENT_STYLE_MONITOR"));
+});
+
 test("monitor 开启新业务后僵尸查询与恢复同时覆盖新旧 monitor 类型", async () => {
   const client = new RecordingClient();
   client.queryResults = [[{
@@ -590,6 +659,33 @@ test("monitor 开启新业务后僵尸查询与恢复同时覆盖新旧 monitor 
   ]);
 });
 
+test("style 僵尸恢复只覆盖 CONTENT_STYLE_MONITOR", async () => {
+  const client = new RecordingClient();
+  client.queryResults = [[{
+    executionId: "41",
+    modifiedAt: "2026-08-03T00:00:00.000Z"
+  }]];
+  client.updateResults = [1];
+  const repository = new RpaWorkerStateRepository(client, {
+    entryMonitorEnabled: true,
+    contentStyleMonitorEnabled: true,
+    articleProbeLegacyEnabled: true
+  });
+  const cutoff = new Date("2026-08-03T01:00:00.000Z");
+  const result = await repository.recoverStaleExecutions(
+    "style",
+    cutoff,
+    new FakeLeases()
+  );
+  assert.deepEqual(result.recoveredExecutionIds, ["41"]);
+  assert.deepEqual(client.queries[0]!.parameters, [
+    "CONTENT_STYLE_MONITOR", cutoff, 100
+  ]);
+  assert.deepEqual(client.updates[0]!.parameters, [
+    "41", cutoff, "CONTENT_STYLE_MONITOR"
+  ]);
+});
+
 test("ENTRY_MONITOR 配置只由 monitor 解析，错误配置不阻止 diagnosis 启动", () => {
   const monitor = parseRpaWorkerConfig("monitor", [], {
     ENTRY_MONITOR_ENABLED: "true",
@@ -611,19 +707,41 @@ test("ENTRY_MONITOR 配置只由 monitor 解析，错误配置不阻止 diagnosi
   }, "/workspace"));
 });
 
-test("CONTENT_STYLE_MONITOR context 未落库前即使误开配置也拒绝启动", () => {
-  assert.throws(
-    () => parseRpaWorkerConfig("monitor", [], {
-      RPA_WORKER_PROVIDER_ROUTING_ENABLED: "true",
-      CONTENT_STYLE_MONITOR_ENABLED: "true",
-      CONTENT_STYLE_MONITOR_GRAY_PROJECT_IDS: "5"
-    }),
-    /通用 execution context 尚未完成/
-  );
+test("CONTENT_STYLE_MONITOR 只由 style 解析并保留安全门禁", () => {
+  const style = parseRpaWorkerConfig("style", [], {
+    RPA_WORKER_PROVIDER_ROUTING_ENABLED: "true",
+    CONTENT_STYLE_MONITOR_ENABLED: "true",
+    CONTENT_STYLE_MONITOR_GRAY_PROJECT_IDS: "5",
+    CONTENT_STYLE_MONITOR_PROJECT_CHUNK_SIZE: "7"
+  });
+  assert.equal(style.contentStyleMonitorEnabled, true);
+  assert.deepEqual(style.contentStyleMonitorGrayProjectIds, ["5"]);
+  assert.equal(style.contentStyleMonitorProjectChunkSize, 7);
+  assert.equal(taskInGrayScope({
+    brandId: "ignored",
+    businessTaskId: "ignored",
+    businessType: "CONTENT_STYLE_MONITOR",
+    projectId: "5"
+  }, style), true);
+  assert.equal(taskInGrayScope({
+    brandId: "5",
+    businessTaskId: "5",
+    businessType: "CONTENT_STYLE_MONITOR",
+    projectId: "6"
+  }, style), false);
+  const monitor = parseRpaWorkerConfig("monitor", [], {
+    CONTENT_STYLE_MONITOR_ENABLED: "true",
+    CONTENT_STYLE_MONITOR_GRAY_PROJECT_IDS: "5"
+  });
+  assert.equal(monitor.contentStyleMonitorEnabled, false);
   const diagnosis = parseRpaWorkerConfig("diagnosis", [], {
     CONTENT_STYLE_MONITOR_ENABLED: "not-a-boolean"
   });
   assert.equal(diagnosis.contentStyleMonitorEnabled, false);
+  assert.throws(() => parseRpaWorkerConfig("style", [], {
+    CONTENT_STYLE_MONITOR_ENABLED: "true",
+    CONTENT_STYLE_MONITOR_GRAY_PROJECT_IDS: "5"
+  }), /provider-routing-enabled/);
 });
 
 test("品牌窗口默认限制为两个未完成品牌，并以四个平台作为完成屏障", async () => {
@@ -796,6 +914,10 @@ test("跨进程平台租约使用两个 Worker 共享的稳定名称并有限等
   assert.equal(
     platformLeaseName("monitor", "doubao"),
     "geno-rpa-platform:monitor:doubao"
+  );
+  assert.equal(
+    platformLeaseName("style", "doubao"),
+    "geno-rpa-platform:style:doubao"
   );
   const leases = new FakeLeases();
   leases.responses = [false, false, true];

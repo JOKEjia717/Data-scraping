@@ -56,6 +56,16 @@ test("四个平台生成互相隔离的 workerId、Outbox、指标目录和单�
   }
 });
 
+test("style Fleet 子进程保持 style Role 并使用独立运行目录", () => {
+  const config = parseRpaWorkerConfig("style", ["--platforms=doubao"], {}, "/workspace");
+  const [spec] = platformWorkerLaunchSpecs("style", config, ["--platforms=doubao"]);
+  assert.ok(spec);
+  assert.ok(spec!.argv.includes("--worker=style"));
+  assert.equal(spec!.workerId, "style-worker-doubao");
+  assert.match(spec!.outboxDirectory, /rpa-runtime[\\/]style[\\/]outbox/);
+  assert.match(spec!.metricsDirectory, /rpa-runtime[\\/]style[\\/]metrics/);
+});
+
 test("单个平台异常只重启该平台，排空信号通过 IPC 安全通知所有存活平台", async () => {
   const config = parseRpaWorkerConfig("diagnosis", [
     "--dry-run=false",

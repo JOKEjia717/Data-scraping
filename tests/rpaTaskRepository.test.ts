@@ -505,6 +505,7 @@ test("仓储验证 CLI 默认只读，领取必须显式开启", () => {
     logDirectory: "rpa-task-logs"
   });
   assert.equal(parseCheckOptions(["--claim=true"]).claim, true);
+  assert.equal(parseCheckOptions(["--worker=style"]).workerType, "style");
 });
 
 test("check CLI uses the formal monitor repository configuration", () => {
@@ -543,6 +544,27 @@ test("check CLI uses the formal monitor repository configuration", () => {
     contentStyleMonitorEnabled: false,
     contentStyleMonitorGrayProjectIds: [],
     articleProbeLegacyEnabled: true
+  });
+
+  const style = resolveCheckRpaTaskRepositoryOptions(
+    "style",
+    ["--worker=style"],
+    {
+      RPA_WORKER_PROVIDER_ROUTING_ENABLED: "true",
+      RPA_WORKER_PROVIDER: "NEW_RPA",
+      CONTENT_STYLE_MONITOR_ENABLED: "true",
+      CONTENT_STYLE_MONITOR_GRAY_PROJECT_IDS: "5"
+    },
+    "/workspace"
+  );
+  assert.deepEqual(style, {
+    retryScheduleEnabled: false,
+    workerProvider: "NEW_RPA",
+    entryMonitorEnabled: false,
+    entryMonitorGrayProjectIds: [],
+    contentStyleMonitorEnabled: true,
+    contentStyleMonitorGrayProjectIds: ["5"],
+    articleProbeLegacyEnabled: false
   });
 });
 
@@ -650,6 +672,40 @@ test("ENTRY_MONITOR 批次按项目、租户、平台和上海自然日读取并
   assert.doesNotMatch(client.queries[0]!.sql, /probe_article_task/);
 });
 
+test("style 只查询 CONTENT_STYLE_MONITOR，monitor 即使误传开关也不会查询风格任务", async () => {
+  const styleRow = row({
+    businessType: "CONTENT_STYLE_MONITOR",
+    brandId: undefined,
+    projectId: "7001",
+    intentEntryId: "8001",
+    monitorDate: "2026-08-06",
+    repetitionNo: 1,
+    aiModelId: "1",
+    aiModelName: "豆包"
+  });
+  const styleClient = new RecordingSqlClient([[styleRow]]);
+  const styleRepository = new RpaTaskRepository(styleClient, undefined, {
+    contentStyleMonitorEnabled: true,
+    contentStyleMonitorGrayProjectIds: ["7001"],
+    workerProvider: "NEW_RPA",
+    now: () => new Date("2026-08-05T16:00:00.000Z")
+  });
+  const tasks = await styleRepository.findPendingCollectionTasks("style", { limit: 5 });
+  assert.deepEqual(tasks.map(({ businessType }) => businessType), ["CONTENT_STYLE_MONITOR"]);
+  assert.deepEqual(styleClient.queries[0]!.parameters, [
+    "CONTENT_STYLE_MONITOR", "NEW_RPA", "2026-08-06", "7001", 5
+  ]);
+
+  const monitorClient = new RecordingSqlClient();
+  const monitorRepository = new RpaTaskRepository(monitorClient, undefined, {
+    articleProbeLegacyEnabled: false,
+    contentStyleMonitorEnabled: true,
+    contentStyleMonitorGrayProjectIds: ["7001"]
+  });
+  assert.deepEqual(await monitorRepository.findPendingTasks("monitor"), []);
+  assert.equal(monitorClient.queries.length, 0);
+});
+
 test("原子领取携带真实业务类型并拒绝 Worker 越界", async () => {
   const client = new RecordingSqlClient([], [1]);
   const repository = new RpaTaskRepository(client, undefined, {
@@ -664,6 +720,14 @@ test("原子领取携带真实业务类型并拒绝 Worker 越界", async () => 
   ]);
   await assert.rejects(
     () => repository.claimTask("diagnosis", "ENTRY_MONITOR", "9002"),
+    /worker business type mismatch/
+  );
+  await assert.rejects(
+    () => repository.claimTask("monitor", "CONTENT_STYLE_MONITOR", "9003"),
+    /worker business type mismatch/
+  );
+  await assert.rejects(
+    () => repository.claimTask("style", "ENTRY_MONITOR", "9004"),
     /worker business type mismatch/
   );
   assert.equal(client.updates.length, 1);

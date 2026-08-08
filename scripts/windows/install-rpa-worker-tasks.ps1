@@ -1,14 +1,14 @@
 [CmdletBinding()]
 param(
-  [ValidateSet("diagnosis", "monitor", "both")]
-  [string]$Worker = "both"
+  [ValidateSet("diagnosis", "monitor", "style", "all")]
+  [string]$Worker = "all"
 )
 
 $ErrorActionPreference = "Stop"
 $repositoryRoot = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
 $launcher = Join-Path $PSScriptRoot "run-rpa-worker.ps1"
 $currentUser = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
-$workers = if ($Worker -eq "both") { @("diagnosis", "monitor") } else { @($Worker) }
+$workers = if ($Worker -eq "all") { @("diagnosis", "monitor", "style") } else { @($Worker) }
 
 foreach ($workerName in $workers) {
   $displayName = (Get-Culture).TextInfo.ToTitleCase($workerName)

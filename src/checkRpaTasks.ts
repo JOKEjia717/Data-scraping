@@ -14,10 +14,10 @@ import {
   rpaConsoleError,
   rpaConsoleInfo
 } from "./consolePrivacy.js";
-import type { RpaWorkerType } from "./rpaTask.js";
+import type { RpaWorkerRole } from "./rpaTask.js";
 
 interface CheckOptions {
-  workerType: RpaWorkerType;
+  workerType: RpaWorkerRole;
   limit: number;
   claim: boolean;
   logDirectory: string;
@@ -86,7 +86,7 @@ export async function checkRpaTasks(argv = process.argv.slice(2)): Promise<void>
 }
 
 export function resolveCheckRpaTaskRepositoryOptions(
-  workerType: RpaWorkerType,
+  workerType: RpaWorkerRole,
   argv: readonly string[],
   environment: NodeJS.ProcessEnv = process.env,
   cwd = process.cwd()
@@ -103,8 +103,8 @@ export function parseCheckOptions(argv: readonly string[]): CheckOptions {
     args.set(key, rest.join("=") || "true");
   }
   const worker = args.get("worker") ?? "diagnosis";
-  if (worker !== "diagnosis" && worker !== "monitor") {
-    throw new Error("--worker 只能是 diagnosis 或 monitor。 ");
+  if (worker !== "diagnosis" && worker !== "monitor" && worker !== "style") {
+    throw new Error("--worker 只能是 diagnosis、monitor 或 style。 ");
   }
   const limit = Number(args.get("limit") ?? 10);
   if (!Number.isSafeInteger(limit) || limit <= 0 || limit > 1_000) {

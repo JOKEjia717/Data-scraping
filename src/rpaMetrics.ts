@@ -1,7 +1,7 @@
 import { mkdir, open, rename } from "node:fs/promises";
 import path from "node:path";
 import type { PlatformHealthStatus } from "./platformExecution.js";
-import type { RpaBusinessType, RpaWorkerType } from "./rpaTask.js";
+import type { RpaBusinessType, RpaWorkerRole } from "./rpaTask.js";
 import type { PlatformId } from "./types.js";
 
 export interface TaskStateMetrics {
@@ -37,7 +37,7 @@ export interface PlatformMetricsSnapshot {
 export interface RpaMetricsSnapshot {
   schemaVersion: 1;
   generatedAt: string;
-  workerType: RpaWorkerType;
+  workerType: RpaWorkerRole;
   workerHeartbeatAt: string;
   outboxPending: number;
   outboxCorrupted: number;
@@ -100,7 +100,7 @@ export class MetricsRegistry {
   private businessTypeProtocol = emptyBusinessTypeProtocolMetrics();
 
   constructor(
-    readonly workerType: RpaWorkerType,
+    readonly workerType: RpaWorkerRole,
     platforms: readonly PlatformId[],
     private readonly now: () => Date = () => new Date()
   ) {

@@ -1,7 +1,7 @@
 /** RPA 仓储查询/领取的本地 JSONL 审计；不记录 keyword 或数据库凭据。 */
 import { promises as fs } from "node:fs";
 import path from "node:path";
-import type { RpaBusinessType, RpaWorkerType } from "./rpaTask.js";
+import type { RpaBusinessType, RpaWorkerRole } from "./rpaTask.js";
 
 export interface RpaTaskAuditEvent {
   timestamp: string;
@@ -12,7 +12,7 @@ export interface RpaTaskAuditEvent {
     | "INVALID_EXECUTION_CONTEXT"
     | "LEGACY_BUSINESS_TYPE_FALLBACK"
     | "BUSINESS_TYPE_MISMATCH";
-  workerType: RpaWorkerType;
+  workerType: RpaWorkerRole;
   businessType: RpaBusinessType;
   candidateCount?: number;
   executionId?: string;

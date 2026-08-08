@@ -1,15 +1,16 @@
 # Windows Worker 守护与安全重启
 
-Worker 不需要每天重启。正常做法是让 diagnosis、monitor 各自常驻；只有进程异常退出时由任务计划程序自动拉起，计划维护时先排空再停止。
+Worker 不需要每天重启。正常做法是让 diagnosis、monitor、style 各自常驻；只有进程异常退出时由任务计划程序自动拉起，计划维护时先排空再停止。
 
 ## 首次安装
 
-先确认 `.env` 中两个 Worker 已配置，Chrome 9222/9223 使用不同 Profile，四个平台均已登录。随后在 PowerShell 中运行：
+先确认 `.env` 中三个 Worker 已配置，Chrome 9222/9223/9224 使用不同 Profile，四个平台均已登录。随后在 PowerShell 中运行：
 
 ```powershell
-powershell.exe -ExecutionPolicy Bypass -File .\scripts\windows\install-rpa-worker-tasks.ps1 -Worker both
+powershell.exe -ExecutionPolicy Bypass -File .\scripts\windows\install-rpa-worker-tasks.ps1 -Worker all
 Start-ScheduledTask -TaskName "Geno RPA Diagnosis"
 Start-ScheduledTask -TaskName "Geno RPA Monitor"
+Start-ScheduledTask -TaskName "Geno RPA Style"
 ```
 
 任务使用当前交互式 Windows 用户运行。每个角色进程会启动豆包、DeepSeek、千问、元宝四个独立子进程；每个平台独立轮询、独立执行 stale recovery，某个平台退出后默认 5 秒只拉起该平台。角色进程异常退出时，任务计划程序再于一分钟后拉起整个角色。正常排空退出返回 0，不会触发失败重启。
@@ -22,7 +23,7 @@ Start-ScheduledTask -TaskName "Geno RPA Monitor"
 powershell.exe -ExecutionPolicy Bypass -File .\scripts\windows\request-rpa-worker-stop.ps1 -Worker diagnosis
 ```
 
-请求 monitor 安全停止时把参数改为 `monitor`。Worker 看到 `rpa-runtime/<worker>/stop.request` 后停止领取新批次，正在执行的题先安全收尾；未提交的已领取任务会恢复为 pending，心跳和 advisory lock 最后释放。等待日志出现 `WORKER_SUMMARY` 且进程退出后再维护，不要使用 `Stop-Process -Force`。
+请求 monitor 或 style 安全停止时把参数改为对应 Role。Worker 看到 `rpa-runtime/<worker>/stop.request` 后停止领取新批次，正在执行的题先安全收尾；未提交的已领取任务会恢复为 pending，心跳和 advisory lock 最后释放。等待日志出现 `WORKER_SUMMARY` 且进程退出后再维护，不要使用 `Stop-Process -Force`。
 
 恢复运行前删除停止文件，再启动对应任务：
 

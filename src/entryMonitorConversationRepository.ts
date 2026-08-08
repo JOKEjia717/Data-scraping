@@ -1,6 +1,6 @@
 import {
-  serializeEntryMonitorConversationKey,
-  type EntryMonitorConversationKey
+  serializeContextualMonitorConversationKey,
+  type ContextualMonitorConversationKey
 } from "./entryMonitor.js";
 import {
   MysqlRpaSqlClient,
@@ -9,7 +9,7 @@ import {
 
 export type EntryMonitorConversationStatus = "ACTIVE" | "UNAVAILABLE" | "CLOSED";
 
-export interface EntryMonitorConversation extends EntryMonitorConversationKey {
+export interface EntryMonitorConversation extends ContextualMonitorConversationKey {
   conversationKey: string;
   conversationUrl: string;
   status: EntryMonitorConversationStatus;
@@ -26,23 +26,26 @@ export interface EntryMonitorConversationOwnership {
   workerId: string;
 }
 
-export interface EntryMonitorConversationRepository {
-  find(key: EntryMonitorConversationKey): Promise<EntryMonitorConversation | undefined>;
+export interface ContextualMonitorConversationRepository {
+  find(key: ContextualMonitorConversationKey): Promise<EntryMonitorConversation | undefined>;
   upsertActive(record: EntryMonitorConversation): Promise<void>;
-  updateUrl(key: EntryMonitorConversationKey, url: string): Promise<void>;
+  updateUrl(key: ContextualMonitorConversationKey, url: string): Promise<void>;
   touch(
-    key: EntryMonitorConversationKey,
+    key: ContextualMonitorConversationKey,
     usedAt: Date,
     ownership?: EntryMonitorConversationOwnership
   ): Promise<void>;
   incrementQuestionCount(
-    key: EntryMonitorConversationKey,
+    key: ContextualMonitorConversationKey,
     ownership: EntryMonitorConversationOwnership,
     usedAt: Date
   ): Promise<void>;
-  markUnavailable(key: EntryMonitorConversationKey, reason: string): Promise<void>;
-  closeExpired(beforeDate: string): Promise<number>;
+  markUnavailable(key: ContextualMonitorConversationKey, reason: string): Promise<void>;
+  closeExpired(businessType: ContextualMonitorConversationKey["businessType"], beforeDate: string): Promise<number>;
 }
+
+/** @deprecated Use ContextualMonitorConversationRepository. */
+export type EntryMonitorConversationRepository = ContextualMonitorConversationRepository;
 
 interface EntryMonitorConversationRow {
   tenantId: unknown;
@@ -75,7 +78,7 @@ SELECT
   create_time AS createdAt
 FROM rpa_conversation_session
 WHERE tenant_id = ?
-  AND business_type = 'ENTRY_MONITOR'
+  AND business_type = ?
   AND project_id = ?
   AND ai_model_id = ?
   AND conversation_date = ?
@@ -99,7 +102,7 @@ INSERT INTO rpa_conversation_session (
   updater,
   deleted,
   tenant_id
-) VALUES ('ENTRY_MONITOR', ?, ?, ?, ?, 'ACTIVE', ?, ?, ?, ?, NULL, ?, ?, 0, ?)
+) VALUES (?, ?, ?, ?, ?, 'ACTIVE', ?, ?, ?, ?, NULL, ?, ?, 0, ?)
 ON DUPLICATE KEY UPDATE
   conversation_url = VALUES(conversation_url),
   status = 'ACTIVE',
@@ -119,7 +122,7 @@ SET conversation_url = ?,
     failure_reason = NULL,
     update_time = CURRENT_TIMESTAMP
 WHERE tenant_id = ?
-  AND business_type = 'ENTRY_MONITOR'
+  AND business_type = ?
   AND project_id = ?
   AND ai_model_id = ?
   AND conversation_date = ?
@@ -133,7 +136,7 @@ SET last_used_at = ?,
     updater = COALESCE(?, updater),
     update_time = CURRENT_TIMESTAMP
 WHERE tenant_id = ?
-  AND business_type = 'ENTRY_MONITOR'
+  AND business_type = ?
   AND project_id = ?
   AND ai_model_id = ?
   AND conversation_date = ?
@@ -148,7 +151,7 @@ SET question_count = question_count + IF(last_execution_id = ?, 0, 1),
     updater = ?,
     update_time = CURRENT_TIMESTAMP
 WHERE tenant_id = ?
-  AND business_type = 'ENTRY_MONITOR'
+  AND business_type = ?
   AND project_id = ?
   AND ai_model_id = ?
   AND conversation_date = ?
@@ -161,7 +164,7 @@ SET status = 'UNAVAILABLE',
     failure_reason = ?,
     update_time = CURRENT_TIMESTAMP
 WHERE tenant_id = ?
-  AND business_type = 'ENTRY_MONITOR'
+  AND business_type = ?
   AND project_id = ?
   AND ai_model_id = ?
   AND conversation_date = ?
@@ -172,28 +175,31 @@ UPDATE rpa_conversation_session
 SET status = 'CLOSED',
     failure_reason = COALESCE(failure_reason, 'Shanghai date expired'),
     update_time = CURRENT_TIMESTAMP
-WHERE business_type = 'ENTRY_MONITOR'
+WHERE business_type = ?
   AND conversation_date < ?
   AND status = 'ACTIVE'
   AND deleted = 0`;
 
-/** Database-backed ENTRY_MONITOR session ownership; never read by DIAGNOSIS. */
-export class MysqlEntryMonitorConversationRepository
-implements EntryMonitorConversationRepository {
+/** Database-backed contextual monitor ownership; never read by DIAGNOSIS. */
+export class MysqlContextualMonitorConversationRepository
+implements ContextualMonitorConversationRepository {
   constructor(private readonly client: RpaSqlClient = new MysqlRpaSqlClient()) {}
 
-  async find(key: EntryMonitorConversationKey): Promise<EntryMonitorConversation | undefined> {
+  async find(key: ContextualMonitorConversationKey): Promise<EntryMonitorConversation | undefined> {
     const normalized = normalizeKey(key);
     const rows = await this.client.queryRows<EntryMonitorConversationRow>(
       FIND_SQL,
       keyParameters(normalized)
     );
-    return rows[0] ? mapRow(rows[0], normalized.platformId) : undefined;
+    return rows[0]
+      ? mapRow(rows[0], normalized.platformId, normalized.businessType)
+      : undefined;
   }
 
   async upsertActive(record: EntryMonitorConversation): Promise<void> {
     const normalized = normalizeRecord(record);
     await this.client.executeUpdate(UPSERT_ACTIVE_SQL, [
+      normalized.businessType,
       normalized.projectId,
       normalized.aiModelId,
       normalized.monitorDate,
@@ -202,13 +208,13 @@ implements EntryMonitorConversationRepository {
       normalized.lastExecutionId ?? null,
       normalized.ownerWorkerId ?? null,
       mysqlDateTime(new Date(normalized.lastUsedAt), "lastUsedAt"),
-      normalized.ownerWorkerId ?? "ENTRY_MONITOR",
-      normalized.ownerWorkerId ?? "ENTRY_MONITOR",
+      normalized.ownerWorkerId ?? normalized.businessType,
+      normalized.ownerWorkerId ?? normalized.businessType,
       normalized.tenantId
     ]);
   }
 
-  async updateUrl(key: EntryMonitorConversationKey, url: string): Promise<void> {
+  async updateUrl(key: ContextualMonitorConversationKey, url: string): Promise<void> {
     const normalized = normalizeKey(key);
     await requireUpdated(this.client.executeUpdate(UPDATE_URL_SQL, [
       safeHttpUrl(url),
@@ -217,7 +223,7 @@ implements EntryMonitorConversationRepository {
   }
 
   async touch(
-    key: EntryMonitorConversationKey,
+    key: ContextualMonitorConversationKey,
     usedAt: Date,
     ownership?: EntryMonitorConversationOwnership
   ): Promise<void> {
@@ -233,7 +239,7 @@ implements EntryMonitorConversationRepository {
   }
 
   async incrementQuestionCount(
-    key: EntryMonitorConversationKey,
+    key: ContextualMonitorConversationKey,
     ownership: EntryMonitorConversationOwnership,
     usedAt: Date
   ): Promise<void> {
@@ -249,7 +255,7 @@ implements EntryMonitorConversationRepository {
     ]), normalized, "incrementQuestionCount");
   }
 
-  async markUnavailable(key: EntryMonitorConversationKey, reason: string): Promise<void> {
+  async markUnavailable(key: ContextualMonitorConversationKey, reason: string): Promise<void> {
     const normalized = normalizeKey(key);
     await requireUpdated(this.client.executeUpdate(MARK_UNAVAILABLE_SQL, [
       nonEmpty(reason, "reason").slice(0, 1_000),
@@ -257,20 +263,32 @@ implements EntryMonitorConversationRepository {
     ]), normalized, "markUnavailable");
   }
 
-  closeExpired(beforeDate: string): Promise<number> {
-    return this.client.executeUpdate(CLOSE_EXPIRED_SQL, [monitorDate(beforeDate)]);
+  closeExpired(
+    businessType: ContextualMonitorConversationKey["businessType"],
+    beforeDate: string
+  ): Promise<number> {
+    return this.client.executeUpdate(CLOSE_EXPIRED_SQL, [
+      contextualBusinessType(businessType),
+      monitorDate(beforeDate)
+    ]);
   }
 }
 
-function keyParameters(key: EntryMonitorConversationKey): string[] {
-  return [key.tenantId, key.projectId, key.aiModelId, key.monitorDate];
+/** Backward-compatible constructor name for existing ENTRY integrations. */
+export const MysqlEntryMonitorConversationRepository =
+  MysqlContextualMonitorConversationRepository;
+
+function keyParameters(key: ContextualMonitorConversationKey): string[] {
+  return [key.tenantId, key.businessType, key.projectId, key.aiModelId, key.monitorDate];
 }
 
 function mapRow(
   row: EntryMonitorConversationRow,
-  platformId: EntryMonitorConversationKey["platformId"]
+  platformId: ContextualMonitorConversationKey["platformId"],
+  businessType: ContextualMonitorConversationKey["businessType"]
 ): EntryMonitorConversation {
   const key = normalizeKey({
+    businessType,
     tenantId: databaseId(row.tenantId, "tenantId"),
     projectId: databaseId(row.projectId, "projectId"),
     aiModelId: databaseId(row.aiModelId, "aiModelId"),
@@ -279,14 +297,14 @@ function mapRow(
   });
   const status = row.status;
   if (status !== "ACTIVE" && status !== "UNAVAILABLE" && status !== "CLOSED") {
-    throw new Error(`Invalid ENTRY_MONITOR conversation status: ${String(status)}`);
+    throw new Error(`Invalid contextual monitor conversation status: ${String(status)}`);
   }
   const conversationUrl = typeof row.conversationUrl === "string" && row.conversationUrl.trim()
     ? safeHttpUrl(row.conversationUrl)
     : "";
   return {
     ...key,
-    conversationKey: serializeEntryMonitorConversationKey(key),
+    conversationKey: serializeContextualMonitorConversationKey(key),
     conversationUrl,
     status,
     questionCount: nonNegativeInteger(row.questionCount, "questionCount"),
@@ -310,7 +328,7 @@ function normalizeRecord(record: EntryMonitorConversation): EntryMonitorConversa
   const key = normalizeKey(record);
   const normalized: EntryMonitorConversation = {
     ...key,
-    conversationKey: serializeEntryMonitorConversationKey(key),
+    conversationKey: serializeContextualMonitorConversationKey(key),
     conversationUrl: safeHttpUrl(record.conversationUrl),
     status: "ACTIVE",
     questionCount: nonNegativeInteger(record.questionCount, "questionCount"),
@@ -318,7 +336,7 @@ function normalizeRecord(record: EntryMonitorConversation): EntryMonitorConversa
     lastUsedAt: validDate(new Date(record.lastUsedAt), "lastUsedAt").toISOString()
   };
   if (record.conversationKey !== normalized.conversationKey) {
-    throw new Error("ENTRY_MONITOR conversationKey does not match its ownership fields");
+    throw new Error(`${key.businessType} conversationKey does not match its ownership fields`);
   }
   if (record.lastExecutionId !== undefined) {
     normalized.lastExecutionId = databaseId(record.lastExecutionId, "lastExecutionId");
@@ -329,8 +347,9 @@ function normalizeRecord(record: EntryMonitorConversation): EntryMonitorConversa
   return normalized;
 }
 
-function normalizeKey(key: EntryMonitorConversationKey): EntryMonitorConversationKey {
+function normalizeKey(key: ContextualMonitorConversationKey): ContextualMonitorConversationKey {
   return {
+    businessType: contextualBusinessType(key.businessType),
     tenantId: databaseId(key.tenantId, "tenantId"),
     projectId: databaseId(key.projectId, "projectId"),
     aiModelId: databaseId(key.aiModelId, "aiModelId"),
@@ -350,13 +369,13 @@ function normalizeOwnership(
 
 async function requireUpdated(
   result: Promise<number>,
-  key: EntryMonitorConversationKey,
+  key: ContextualMonitorConversationKey,
   operation: string
 ): Promise<void> {
   if (await result !== 1) {
     throw new Error(
-      `ENTRY_MONITOR conversation ${operation} did not update one row: ` +
-      serializeEntryMonitorConversationKey(key)
+      `${key.businessType} conversation ${operation} did not update one row: ` +
+      serializeContextualMonitorConversationKey(key)
     );
   }
 }
@@ -407,6 +426,13 @@ function monitorDate(value: string): string {
     throw new Error("monitorDate must use YYYY-MM-DD");
   }
   return value;
+}
+
+function contextualBusinessType(
+  value: string
+): ContextualMonitorConversationKey["businessType"] {
+  if (value === "ENTRY_MONITOR" || value === "CONTENT_STYLE_MONITOR") return value;
+  throw new Error("businessType must be ENTRY_MONITOR or CONTENT_STYLE_MONITOR");
 }
 
 function nonNegativeInteger(value: unknown, field: string): number {
