@@ -5,7 +5,17 @@ playwright-report/
 test-results/
 rpa-task-logs/
 rpa-runtime/
+# RPA 运行时生成的 DOM/失败证据截图，禁止提交到代码仓库
+rpa-runtime/**/evidence/**/*.png
+rpa-runtime/**/evidence/**/*.jpg
+rpa-runtime/**/evidence/**/*.jpeg
+rpa-runtime/**/evidence/**/*.webp
 .chrome-profiles/
+.chrome-tmp*/
+cdp-*.cjs
+*.log
+test-script.js
+dashboard/.tmp_*
 .env
 .env.*
 !.env.example

@@ -1,5 +1,0 @@
-[RPA] {"workerId":"diagnosis-worker","batchProgress":"WORKER_START: dryRun=false,runOnce=false,maxTasks=32,maxAttempts=3"}
-[RPA] {"workerId":"diagnosis-worker","platformId":"yuanbao","batchProgress":"PLATFORM_ENABLED"}
-[RPA] {"workerId":"diagnosis-worker","batchProgress":"HEALTH_CHECK: pendingSample=1,cdp=READY"}
-[RPA] {"workerId":"diagnosis-worker","platformId":"yuanbao","batchProgress":"PLATFORM_HEALTH","errorCode":"READY"}
-[RPA] {"workerId":"diagnosis-worker","batchProgress":"WORKER_SUMMARY: batches=0,selected=0,completed=0,failed=0,cycles=1"}

@@ -179,7 +179,7 @@ const App = {
       nowTs: Date.now(),
       sidebarOpen: false,           // 移动端抽屉开合
       firstLoad: true,              // 首屏加载骨架屏
-      selectedTab: 0,               // 板块看板当前选中的 Tab：1=运行中 0=待运行 2=已运行 3=失败（默认待运行，内容最丰富）
+      selectedTab: 2,               // 板块看板当前选中的 Tab：1=运行中 0=待运行 2=已运行 3=失败（默认已运行，品牌最多、首屏即有多个可点开的卡片）
       notifOpen: false,              // 通知面板开合
       refsSearch: "",
       refsPlat: "",
