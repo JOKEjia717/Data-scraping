@@ -14,8 +14,14 @@ import {
   type DatabaseRunFailure
 } from "./databasePersistence.js";
 import { safeErrorSummary } from "./consolePrivacy.js";
+import { isResearchStopRequested } from "./workerControl.js";
 
 async function main(): Promise<void> {
+  // 运营台暂停：研究爬取被关闭时，启动即优雅跳过，不占用浏览器资源。
+  if (isResearchStopRequested()) {
+    console.log("[研究爬取] 运营台已暂停（rpa-runtime/research/stop.request 存在），跳过本次执行。");
+    return;
+  }
   const options = await parseCli(process.argv.slice(2));
   if (options.mode === "business" && !options.questionFile) {
     throw new Error("business 模式必须通过 --questions 指定品牌批次 JSON 文件。");

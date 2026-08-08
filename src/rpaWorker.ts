@@ -25,6 +25,7 @@ import {
 } from "./platformExecution.js";
 import { JsonlRpaTaskAuditLogger } from "./rpaTaskAudit.js";
 import {
+  createRpaTaskRepositoryOptions,
   RpaTaskRepository,
   type RpaBrandCohort,
   type RpaBrandWindowEntry
@@ -168,18 +169,17 @@ export function createRpaWorkerSession(config: RpaWorkerConfig): RpaWorkerSessio
   });
   const session: RpaWorkerSession = {
     audit,
-    taskRepository: new RpaTaskRepository(undefined, audit, {
-      retryScheduleEnabled: config.databaseRetryScheduleEnabled,
-      ...(config.providerRoutingEnabled
-        ? { workerProvider: config.workerProvider }
-        : {}),
-      entryMonitorEnabled: config.entryMonitorEnabled,
-      entryMonitorGrayProjectIds: config.entryMonitorGrayProjectIds
-    }),
+    taskRepository: new RpaTaskRepository(
+      undefined,
+      audit,
+      createRpaTaskRepositoryOptions(config)
+    ),
     resultRepository: new RpaResultRepository(),
     resultOutbox: new ResultOutbox({ directory: config.outboxDirectory }),
     stateRepository: new RpaWorkerStateRepository(undefined, {
-      entryMonitorEnabled: config.entryMonitorEnabled
+      entryMonitorEnabled: config.entryMonitorEnabled,
+      contentStyleMonitorEnabled: config.contentStyleMonitorEnabled,
+      articleProbeLegacyEnabled: config.articleProbeLegacyEnabled
     }),
     leases,
     logger: new StructuredTaskLogger({
@@ -1662,6 +1662,7 @@ async function executeClaimedBatches(input: ExecuteClaimedInput): Promise<void> 
         const result = {
           executionId: task.executionId,
           dispatchTaskId: task.dispatchTaskId,
+          businessType: task.businessType,
           keyword: task.keyword,
           answerContent,
           responseDurationSeconds: Math.ceil((completedAt.getTime() - startedAt) / 1_000),
@@ -2478,6 +2479,11 @@ async function refreshWorkerMetrics(
       }
       session.metrics.replaceBusinessTypeTaskStates(totals);
     }
+    const protocolCounter = session.taskRepository.countBusinessTypeProtocolAnomalies;
+    const protocolCounts = typeof protocolCounter === "function"
+      ? await protocolCounter.call(session.taskRepository).catch(() => undefined)
+      : undefined;
+    if (protocolCounts) session.metrics.replaceBusinessTypeProtocol(protocolCounts);
   }
   const outboxEntries = await session.resultOutbox.list().catch(() => undefined);
   if (outboxEntries) session.metrics.setOutboxPending(outboxEntries.length);

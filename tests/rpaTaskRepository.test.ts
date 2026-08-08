@@ -4,7 +4,10 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import type { Pool } from "mysql2/promise";
-import { parseCheckOptions } from "../src/checkRpaTasks.js";
+import {
+  parseCheckOptions,
+  resolveCheckRpaTaskRepositoryOptions
+} from "../src/checkRpaTasks.js";
 import {
   acquireRpaPoolConnection,
   readRpaDatabaseConfig
@@ -14,6 +17,7 @@ import {
   MysqlRpaSqlClient,
   RpaTaskRepository,
   mapRpaTaskRow,
+  resolveExecutionBusinessType,
   type RpaSqlClient,
   type RpaSqlParameter,
   type RpaTaskRow
@@ -50,11 +54,15 @@ class RecordingSqlClient implements RpaSqlClient {
   }
 }
 
-function row(overrides: Partial<RpaTaskRow> = {}): RpaTaskRow {
+function row(
+  overrides: Partial<RpaTaskRow> & { businessType?: unknown } = {}
+): RpaTaskRow {
+  const { businessType = "DIAGNOSIS", ...rest } = overrides;
   return {
     executionId: "90071992547409931",
     dispatchTaskId: "2080238709516197889",
-    businessType: "DIAGNOSIS",
+    executionBusinessType: businessType,
+    dispatchBusinessType: businessType,
     businessTaskId: "3001",
     tenantKey: "tenant-a",
     brandId: "7001",
@@ -65,9 +73,63 @@ function row(overrides: Partial<RpaTaskRow> = {}): RpaTaskRow {
     failCount: 0,
     priority: 0,
     createdAt: "2026-08-03T00:00:00.000Z",
-    ...overrides
+    ...rest
   };
 }
+
+test("execution business_type 只允许四种协议值，空值仅回退真实 dispatch", () => {
+  for (const businessType of [
+    "DIAGNOSIS", "CONTENT_STYLE_MONITOR", "ENTRY_MONITOR", "ARTICLE_PROBE"
+  ] as const) {
+    assert.equal(resolveExecutionBusinessType(businessType, businessType), businessType);
+  }
+  assert.equal(resolveExecutionBusinessType(null, "ARTICLE_PROBE"), "ARTICLE_PROBE");
+  assert.equal(resolveExecutionBusinessType("  ", "DIAGNOSIS"), "DIAGNOSIS");
+  assert.throws(
+    () => resolveExecutionBusinessType(null, "UNKNOWN"),
+    /business_type/
+  );
+  assert.throws(
+    () => resolveExecutionBusinessType("ENTRY_MONITOR", "ARTICLE_PROBE"),
+    (error: unknown) =>
+      (error as { errorCode?: unknown }).errorCode === "BUSINESS_TYPE_MISMATCH"
+  );
+});
+
+test("ARTICLE_PROBE legacy 开关关闭后 monitor 不再查询存量队列", async () => {
+  const client = new RecordingSqlClient();
+  const repository = new RpaTaskRepository(client, undefined, {
+    articleProbeLegacyEnabled: false
+  });
+  assert.deepEqual(await repository.findPendingTasks("monitor"), []);
+  assert.equal(client.queries.length, 0);
+});
+
+test("business_type 协议异常指标同时暴露空值、冲突、孤儿和 context 缺失", async () => {
+  const client = new RecordingSqlClient([[
+    {
+      nullExecutionType: "12",
+      mismatch: "0",
+      unknown: "0",
+      orphan: "12",
+      legacyFallback: "0",
+      invalidContext: "5115",
+      articleProbeLegacy: "7"
+    }
+  ]]);
+  const repository = new RpaTaskRepository(client);
+  assert.deepEqual(await repository.countBusinessTypeProtocolAnomalies(), {
+    nullExecutionType: 12,
+    mismatch: 0,
+    unknown: 0,
+    orphan: 12,
+    legacyFallback: 0,
+    invalidContext: 5115,
+    articleProbeLegacy: 7
+  });
+  assert.match(client.queries[0]!.sql, /ctx\.business_type = e\.business_type/);
+  assert.deepEqual(client.queries[0]!.parameters, []);
+});
 
 test("diagnosis 查询只读 DIAGNOSIS，并从 diagnosis_task.profile_id 解析品牌", async () => {
   const client = new RecordingSqlClient([[row()]]);
@@ -229,7 +291,8 @@ test("领取使用双状态条件更新且绝不更新 dispatch 完成状态", a
   assert.match(update.sql, /WHERE e\.id = \?/);
   assert.match(update.sql, /e\.status = 0/);
   assert.match(update.sql, /e\.task_status = 0/);
-  assert.match(update.sql, /d\.business_type = \?/);
+  assert.match(update.sql, /e\.business_type = \?/);
+  assert.match(update.sql, /d\.business_type = e\.business_type/);
   assert.doesNotMatch(update.sql, /SET[\s\S]*d\.status/);
   assert.doesNotMatch(update.sql, /UPDATE brand_rpa_dispatch_task/);
   assert.deepEqual(update.parameters, ["9001", "DIAGNOSIS"]);
@@ -310,7 +373,8 @@ test("任务状态指标按业务类型只读聚合并按平台合并", async ()
   }]);
   assert.deepEqual(client.queries[0]?.parameters, ["DIAGNOSIS"]);
   assert.match(client.queries[0]!.sql, /SUM\(CASE WHEN e\.status = 0/);
-  assert.match(client.queries[0]!.sql, /d\.business_type = \?/);
+  assert.match(client.queries[0]!.sql, /e\.business_type = \?/);
+  assert.match(client.queries[0]!.sql, /d\.business_type = e\.business_type/);
   assert.doesNotMatch(client.queries[0]!.sql, /^\s*(UPDATE|INSERT|DELETE)\b/i);
 });
 
@@ -443,6 +507,68 @@ test("仓储验证 CLI 默认只读，领取必须显式开启", () => {
   assert.equal(parseCheckOptions(["--claim=true"]).claim, true);
 });
 
+test("check CLI uses the formal monitor repository configuration", () => {
+  const disabled = resolveCheckRpaTaskRepositoryOptions(
+    "monitor",
+    ["--worker=monitor"],
+    {},
+    "/workspace"
+  );
+  assert.deepEqual(disabled, {
+    retryScheduleEnabled: false,
+    entryMonitorEnabled: false,
+    entryMonitorGrayProjectIds: [],
+    contentStyleMonitorEnabled: false,
+    contentStyleMonitorGrayProjectIds: [],
+    articleProbeLegacyEnabled: true
+  });
+
+  const enabled = resolveCheckRpaTaskRepositoryOptions(
+    "monitor",
+    ["--worker=monitor"],
+    {
+      RPA_WORKER_DATABASE_RETRY_SCHEDULE_ENABLED: "true",
+      RPA_WORKER_PROVIDER_ROUTING_ENABLED: "true",
+      RPA_WORKER_PROVIDER: "NEW_RPA",
+      ENTRY_MONITOR_ENABLED: "true",
+      ENTRY_MONITOR_GRAY_PROJECT_IDS: "5,7"
+    },
+    "/workspace"
+  );
+  assert.deepEqual(enabled, {
+    retryScheduleEnabled: true,
+    workerProvider: "NEW_RPA",
+    entryMonitorEnabled: true,
+    entryMonitorGrayProjectIds: ["5", "7"],
+    contentStyleMonitorEnabled: false,
+    contentStyleMonitorGrayProjectIds: [],
+    articleProbeLegacyEnabled: true
+  });
+});
+
+test("check CLI keeps ENTRY_MONITOR disabled for diagnosis", () => {
+  const options = resolveCheckRpaTaskRepositoryOptions(
+    "diagnosis",
+    ["--worker=diagnosis"],
+    {
+      RPA_WORKER_PROVIDER_ROUTING_ENABLED: "true",
+      RPA_WORKER_PROVIDER: "NEW_RPA",
+      ENTRY_MONITOR_ENABLED: "true",
+      ENTRY_MONITOR_GRAY_PROJECT_IDS: "5"
+    },
+    "/workspace"
+  );
+  assert.deepEqual(options, {
+    retryScheduleEnabled: false,
+    workerProvider: "NEW_RPA",
+    entryMonitorEnabled: false,
+    entryMonitorGrayProjectIds: [],
+    contentStyleMonitorEnabled: false,
+    contentStyleMonitorGrayProjectIds: [],
+    articleProbeLegacyEnabled: false
+  });
+});
+
 test("monitor 开关启用后同时读取 ARTICLE_PROBE 与 ENTRY_MONITOR execution", async () => {
   const entryRow = row({
     executionId: "90071992547409939",
@@ -477,7 +603,9 @@ test("monitor 开关启用后同时读取 ARTICLE_PROBE 与 ENTRY_MONITOR execut
   assert.match(entryQuery.sql, /FROM rpa_task_execution AS e/);
   assert.match(entryQuery.sql, /INNER JOIN rpa_task_execution_context AS ctx/);
   assert.match(entryQuery.sql, /ctx\.deleted = 0/);
-  assert.match(entryQuery.sql, /ctx\.business_type = 'ENTRY_MONITOR'/);
+  assert.match(entryQuery.sql, /ctx\.business_type = e\.business_type/);
+  assert.match(entryQuery.sql, /e\.business_type = \?/);
+  assert.match(entryQuery.sql, /d\.business_type = e\.business_type/);
   assert.match(entryQuery.sql, /ctx\.business_task_id = d\.business_task_id/);
   assert.match(entryQuery.sql, /ctx\.ai_model_id = e\.ai_model_id/);
   assert.match(entryQuery.sql, /ctx\.monitor_date = \?/);
@@ -595,8 +723,8 @@ test("monitor 指标可按 ARTICLE_PROBE 与 ENTRY_MONITOR 分开聚合", async 
     { businessType: "ARTICLE_PROBE", pending: 2 },
     { businessType: "ENTRY_MONITOR", pending: 30 }
   ]);
-  assert.match(client.queries[0]!.sql, /d\.business_type IN \(\?, \?\)/);
-  assert.match(client.queries[0]!.sql, /GROUP BY d\.business_type/);
+  assert.match(client.queries[0]!.sql, /e\.business_type IN \(\?, \?\)/);
+  assert.match(client.queries[0]!.sql, /GROUP BY e\.business_type/);
   assert.deepEqual(client.queries[0]!.parameters, [
     "ARTICLE_PROBE", "ENTRY_MONITOR", "NEW_RPA"
   ]);

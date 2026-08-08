@@ -5,12 +5,20 @@ import type { RpaBusinessType, RpaWorkerType } from "./rpaTask.js";
 
 export interface RpaTaskAuditEvent {
   timestamp: string;
-  event: "PENDING_QUERY" | "CLAIM_ATTEMPT" | "INVALID_EXECUTION_CONTEXT";
+  event:
+    | "PENDING_QUERY"
+    | "CLAIM_ATTEMPT"
+    | "CLAIM_SKIPPED_PAUSED"
+    | "INVALID_EXECUTION_CONTEXT"
+    | "LEGACY_BUSINESS_TYPE_FALLBACK"
+    | "BUSINESS_TYPE_MISMATCH";
   workerType: RpaWorkerType;
   businessType: RpaBusinessType;
   candidateCount?: number;
   executionId?: string;
   claimed?: boolean;
+  executionBusinessType?: RpaBusinessType;
+  dispatchBusinessType?: RpaBusinessType;
 }
 
 export interface RpaTaskAuditSink {

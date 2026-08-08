@@ -132,13 +132,13 @@ test("四个平台使用独立队列和独立 ConversationManager", async () => 
   for (const platformId of platformIds) assert.equal(createCounts.get(platformId), 2);
 });
 
-test("只接受 DIAGNOSIS 和 ARTICLE_PROBE，并保留 keyword 原文", () => {
+test("只接受四种协议 business type，并保留 keyword 原文", () => {
   assert.throws(
     () => normalizeMockRpaTasks([{
       ...mockTask("invalid", "A", "task-A", "问题"),
       businessType: "OTHER"
     }]),
-    /只能是 DIAGNOSIS 或 ARTICLE_PROBE/
+    /DIAGNOSIS、CONTENT_STYLE_MONITOR、ENTRY_MONITOR 或 ARTICLE_PROBE/
   );
   const keyword = "  原样发送，保留两侧空格  ";
   const [task] = normalizeMockRpaTasks([{

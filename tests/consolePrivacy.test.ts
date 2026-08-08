@@ -9,7 +9,8 @@ import {
   privacyDebugLog,
   rpaConsoleError,
   runWithConsolePrivacy,
-  safeExecutionId
+  safeExecutionId,
+  safeProjectId
 } from "../src/consolePrivacy.js";
 import { extractReferences } from "../src/extractReferences.js";
 import { StructuredTaskLogger } from "../src/workerObservability.js";
@@ -106,6 +107,7 @@ test("正式 RPA 控制台只输出白名单字段并遮蔽 execution、问题�
     rpaConsoleError({
       workerId: "diagnosis-worker",
       event: "TASK_FAILED",
+      businessType: "DIAGNOSIS",
       executionId,
       brandId: "brand-a",
       platformId: "doubao",
@@ -129,6 +131,7 @@ test("正式 RPA 控制台只输出白名单字段并遮蔽 execution、问题�
   assert.deepEqual(Object.keys(parsed).sort(), [
     "batchProgress",
     "brandId",
+    "businessType",
     "errorCode",
     "errorSummary",
     "executionId",
@@ -184,4 +187,22 @@ test("结构化 JSONL 对问题和错误中的 password、token、code、key、s
   const record = JSON.parse(output) as { actualQuestion: string; errorMessage: string };
   assert.ok(record.actualQuestion.length <= 180);
   assert.ok(record.errorMessage.length <= 180);
+});
+
+test("ENTRY_MONITOR console output hashes project identifiers", () => {
+  const captured = captureConsole();
+  try {
+    rpaConsoleError({
+      workerId: "monitor-task-check",
+      event: "PENDING_TASK",
+      businessType: "ENTRY_MONITOR",
+      projectId: "5"
+    });
+  } finally {
+    captured.restore();
+  }
+  const output = captured.lines.join("\n");
+  const parsed = JSON.parse(output.replace(/^\[RPA\] /, "")) as Record<string, unknown>;
+  assert.equal(parsed.projectId, safeProjectId("5"));
+  assert.equal(parsed.projectId === "5", false);
 });

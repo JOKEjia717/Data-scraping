@@ -11,7 +11,7 @@ import {
   type RowDataPacket
 } from "mysql2/promise";
 import { getRpaDatabasePool } from "./rpaDatabase.js";
-import type { RpaTask } from "./rpaTask.js";
+import type { RpaBusinessType, RpaTask } from "./rpaTask.js";
 import type { RpaSqlParameter } from "./rpaTaskRepository.js";
 import type { CollectionResult } from "./mockRpaWorker.js";
 import type { ReferenceRecord } from "./types.js";
@@ -20,6 +20,7 @@ import type { WorkerErrorCode } from "./browserDiagnostics.js";
 export interface RpaCollectionResult {
   executionId: string;
   dispatchTaskId: string;
+  businessType: RpaBusinessType;
   keyword: string;
   answerContent: string;
   responseDurationSeconds: number;
@@ -144,6 +145,7 @@ class MysqlRpaResultTransaction implements RpaResultTransaction {
 interface ExecutionWriteRow {
   executionId: unknown;
   dispatchTaskId: unknown;
+  businessType: unknown;
   keyword: unknown;
   status: unknown;
   taskStatus: unknown;
@@ -315,7 +317,7 @@ export class RpaResultRepository {
 
 /** 将当前统一 CollectionResult 与领取到的 RpaTask 转成数据库写入模型。 */
 export function toRpaCollectionResult(
-  task: Pick<RpaTask, "executionId" | "dispatchTaskId" | "keyword">,
+  task: Pick<RpaTask, "executionId" | "dispatchTaskId" | "businessType" | "keyword">,
   result: Pick<
     CollectionResult,
     "executionId" | "status" | "answer" | "durationMs" | "completedAt" | "references" |
@@ -331,6 +333,7 @@ export function toRpaCollectionResult(
   return normalizeRpaCollectionResult({
     executionId: task.executionId,
     dispatchTaskId: task.dispatchTaskId,
+    businessType: task.businessType,
     keyword: task.keyword,
     answerContent: result.answer,
     responseDurationSeconds: Math.ceil(result.durationMs / 1_000),
@@ -347,6 +350,7 @@ export const LOCK_EXECUTION_SQL = `
 SELECT
   id AS executionId,
   task_id AS dispatchTaskId,
+  business_type AS businessType,
   keyword,
   status,
   task_status AS taskStatus,
@@ -501,6 +505,7 @@ interface NormalizedRpaCollectionResult extends Omit<RpaCollectionResult, "colle
 interface NormalizedExecutionWriteRow {
   executionId: string;
   dispatchTaskId: string;
+  businessType?: RpaBusinessType;
   keyword: string;
   status: number;
   taskStatus: number;
@@ -512,6 +517,7 @@ function normalizeRpaCollectionResult(
 ): NormalizedRpaCollectionResult {
   const executionId = requireId(input.executionId, "executionId");
   const dispatchTaskId = requireId(input.dispatchTaskId, "dispatchTaskId");
+  const businessType = requireBusinessType(input.businessType);
   const keyword = requireBoundedText(input.keyword, "keyword", 1_000, true);
   const answerContent = requireBoundedText(
     input.answerContent,
@@ -536,6 +542,7 @@ function normalizeRpaCollectionResult(
   return {
     executionId,
     dispatchTaskId,
+    businessType,
     keyword,
     answerContent,
     responseDurationSeconds: input.responseDurationSeconds,
@@ -558,6 +565,9 @@ function normalizeExecutionRow(row: ExecutionWriteRow): NormalizedExecutionWrite
   return {
     executionId: databaseId(row.executionId, "executionId"),
     dispatchTaskId: databaseId(row.dispatchTaskId, "dispatchTaskId"),
+    ...(row.businessType == null || String(row.businessType).trim() === ""
+      ? {}
+      : { businessType: requireBusinessType(row.businessType) }),
     keyword: requireBoundedText(row.keyword, "execution.keyword", 1_000, true),
     status: databaseState(row.status, "status"),
     taskStatus: databaseState(row.taskStatus, "taskStatus"),
@@ -596,6 +606,15 @@ function assertExecutionCanComplete(
   }
   if (execution.dispatchTaskId !== result.dispatchTaskId) {
     throw new Error("CollectionResult 的 dispatchTaskId 与 execution.task_id 不一致。");
+  }
+  if (execution.businessType && execution.businessType !== result.businessType) {
+    throw Object.assign(
+      new Error(
+        `CollectionResult businessType 与 execution 不一致：` +
+        `${result.businessType} != ${execution.businessType}`
+      ),
+      { errorCode: "BUSINESS_TYPE_MISMATCH" as const }
+    );
   }
   if (execution.keyword !== result.keyword) {
     throw new Error("CollectionResult 的 keyword 与 execution 原问题不一致。");
@@ -646,6 +665,16 @@ function databaseId(value: unknown, field: string): string {
 
 function requireId(value: string, field: string): string {
   return databaseId(value, field);
+}
+
+function requireBusinessType(value: unknown): RpaBusinessType {
+  if (
+    value === "DIAGNOSIS" ||
+    value === "CONTENT_STYLE_MONITOR" ||
+    value === "ENTRY_MONITOR" ||
+    value === "ARTICLE_PROBE"
+  ) return value;
+  throw new Error(`不支持的结果 business_type：${String(value)}`);
 }
 
 function nonNegativeAttempt(value: number, field: string): number {

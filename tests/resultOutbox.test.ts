@@ -22,6 +22,7 @@ function successfulResult(executionId = "10001"): RpaCollectionResult {
   return {
     executionId,
     dispatchTaskId: "90001",
+    businessType: "DIAGNOSIS",
     keyword: "这个问题不允许出现在文件名中 / ../ ?",
     answerContent: "已经成功采集的回答",
     responseDurationSeconds: 12,
@@ -83,6 +84,7 @@ test("采集成功但数据库失败时保留完整 Outbox，且不调用技术�
   assert.equal(retryExecutionCalls, 0);
   const entries = await outbox.list();
   assert.equal(entries.length, 1);
+  assert.equal(entries[0]!.businessType, "DIAGNOSIS");
   assert.equal(entries[0]!.answerContent, "已经成功采集的回答");
   assert.equal(entries[0]!.references.length, 1);
   assert.equal(entries[0]!.webSearchRequested, true);

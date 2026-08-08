@@ -1,7 +1,14 @@
 /** geno-digital-api RPA 执行记录在爬虫侧的稳定任务模型。 */
 import type { PlatformId } from "./types.js";
 
-export type RpaBusinessType = "DIAGNOSIS" | "ARTICLE_PROBE" | "ENTRY_MONITOR";
+export type RpaBusinessType =
+  | "DIAGNOSIS"
+  | "CONTENT_STYLE_MONITOR"
+  | "ENTRY_MONITOR"
+  | "ARTICLE_PROBE";
+export type ContextualMonitorBusinessType =
+  | "ENTRY_MONITOR"
+  | "CONTENT_STYLE_MONITOR";
 export type RpaWorkerType = "diagnosis" | "monitor";
 
 interface BaseRpaTask {
@@ -44,7 +51,21 @@ export interface EntryMonitorRpaTask extends BaseRpaTask {
   repetitionNo: number;
 }
 
-export type RpaTask = DiagnosisRpaTask | ArticleProbeRpaTask | EntryMonitorRpaTask;
+/** CONTENT_STYLE_MONITOR uses the same immutable execution-context contract as ENTRY. */
+export interface ContentStyleMonitorRpaTask extends BaseRpaTask {
+  businessType: "CONTENT_STYLE_MONITOR";
+  tenantId: string;
+  projectId: string;
+  intentEntryId: string;
+  monitorDate: string;
+  repetitionNo: number;
+}
+
+export type RpaTask =
+  | DiagnosisRpaTask
+  | ContentStyleMonitorRpaTask
+  | EntryMonitorRpaTask
+  | ArticleProbeRpaTask;
 
 /** 可直接进入 BrandBatchScheduler 和 business 单题执行器的任务。 */
 export interface CollectionTask extends BaseRpaTask {
@@ -70,7 +91,7 @@ export function businessTypesForWorker(
 ): readonly RpaBusinessType[] {
   return workerType === "diagnosis"
     ? ["DIAGNOSIS"]
-    : ["ARTICLE_PROBE", "ENTRY_MONITOR"];
+    : ["ARTICLE_PROBE", "ENTRY_MONITOR", "CONTENT_STYLE_MONITOR"];
 }
 
 export function isBusinessTypeAllowedForWorker(
@@ -87,8 +108,9 @@ export function businessTypeForWorker(workerType: RpaWorkerType): RpaBusinessTyp
 
 export function toCollectionTask(task: RpaTask): CollectionTask {
   const platformId = resolveRpaPlatform(task.aiModelId, task.aiModelName);
-  const brandId = task.businessType === "ENTRY_MONITOR" ? task.projectId : task.brandId;
-  const businessGroupId = task.businessType === "ENTRY_MONITOR"
+  const contextualMonitor = isContextualMonitorTask(task);
+  const brandId = contextualMonitor ? task.projectId : task.brandId;
+  const businessGroupId = contextualMonitor
     ? JSON.stringify([
       task.tenantId,
       task.businessType,
@@ -114,6 +136,13 @@ export function toCollectionTask(task: RpaTask): CollectionTask {
 
 export function isEntryMonitorTask(task: RpaTask): task is EntryMonitorRpaTask {
   return task.businessType === "ENTRY_MONITOR";
+}
+
+export function isContextualMonitorTask(
+  task: RpaTask
+): task is EntryMonitorRpaTask | ContentStyleMonitorRpaTask {
+  return task.businessType === "ENTRY_MONITOR" ||
+    task.businessType === "CONTENT_STYLE_MONITOR";
 }
 
 /** 与 geno-digital-api AiEngineEnum 的 1/2/3/4 映射保持一致。 */

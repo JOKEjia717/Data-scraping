@@ -2,6 +2,7 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash } from "node:crypto";
 import type { CollectionMode, PlatformId } from "./types.js";
+import type { RpaBusinessType } from "./rpaTask.js";
 
 export interface CollectionConsoleContext {
   mode: CollectionMode;
@@ -11,8 +12,10 @@ export interface CollectionConsoleContext {
 export interface RpaConsoleRecord {
   workerId: string;
   event: string;
+  businessType?: RpaBusinessType;
   executionId?: string;
   brandId?: string;
+  projectId?: string;
   platformId?: PlatformId;
   batchProgress?: string;
   errorCode?: string;
@@ -41,8 +44,11 @@ export function privacyDebugLog(...values: unknown[]): void {
 }
 
 export function safeExecutionId(value: string): string {
-  const digest = createHash("sha256").update(String(value)).digest("hex").slice(0, 12);
-  return `exec_${digest}`;
+  return safeOpaqueId(value, "exec");
+}
+
+export function safeProjectId(value: string): string {
+  return safeOpaqueId(value, "project");
 }
 
 /** 错误摘要脱敏、URL 查询参数遮蔽、单行限长，并可移除当前任务问题原文。 */
@@ -100,12 +106,18 @@ function writeRpaConsole(
     .join(": ");
   const output = {
     workerId: safeIdentifier(record.workerId),
+    ...(record.businessType === undefined
+      ? {}
+      : { businessType: safeEvent(record.businessType) }),
     ...(record.executionId === undefined
       ? {}
       : { executionId: safeExecutionId(record.executionId) }),
     ...(record.brandId === undefined
       ? {}
       : { brandId: safeIdentifier(record.brandId) }),
+    ...(record.projectId === undefined
+      ? {}
+      : { projectId: safeProjectId(record.projectId) }),
     ...(record.platformId === undefined ? {} : { platformId: record.platformId }),
     batchProgress: limit(sanitizeSensitiveText(progress), MAX_PROGRESS_CHARS),
     ...(record.errorCode === undefined
@@ -128,6 +140,11 @@ function sanitizeSensitiveText(value: string): string {
     .replace(/\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/gi, "[REDACTED_EMAIL]")
     .replace(/(?<!\d)1[3-9]\d{9}(?!\d)/g, "[REDACTED_PHONE]")
     .replace(/\u0000/g, "");
+}
+
+function safeOpaqueId(value: string, prefix: string): string {
+  const digest = createHash("sha256").update(String(value)).digest("hex").slice(0, 12);
+  return `${prefix}_${digest}`;
 }
 
 function readAttachedSecrets(error: unknown): readonly string[] {

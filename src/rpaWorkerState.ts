@@ -16,8 +16,6 @@ import {
   type RpaSqlParameter
 } from "./rpaTaskRepository.js";
 import {
-  businessTypeForWorker,
-  businessTypesForWorker,
   type RpaBusinessType,
   type RpaWorkerType
 } from "./rpaTask.js";
@@ -197,7 +195,11 @@ export class MysqlAdvisoryLeaseCoordinator implements AdvisoryLeaseCoordinator {
 export class RpaWorkerStateRepository {
   constructor(
     private readonly client: RpaSqlClient = new MysqlRpaSqlClient(),
-    private readonly options: { entryMonitorEnabled?: boolean } = {}
+    private readonly options: {
+      entryMonitorEnabled?: boolean;
+      contentStyleMonitorEnabled?: boolean;
+      articleProbeLegacyEnabled?: boolean;
+    } = {}
   ) {}
 
   async heartbeat(executionIds: readonly string[]): Promise<number> {
@@ -243,6 +245,7 @@ WHERE id IN (${ids.map(() => "?").join(", ")})
       throw new Error("僵尸任务查询 limit 必须为 1 到 1000。");
     }
     const businessTypes = this.businessTypes(workerType);
+    if (businessTypes.length === 0) return [];
     const rows = await this.client.queryRows<{
       executionId: unknown;
       modifiedAt: unknown;
@@ -297,9 +300,14 @@ WHERE id IN (${ids.map(() => "?").join(", ")})
   }
 
   private businessTypes(workerType: RpaWorkerType): readonly RpaBusinessType[] {
-    return workerType === "monitor" && this.options.entryMonitorEnabled === true
-      ? businessTypesForWorker(workerType)
-      : [businessTypeForWorker(workerType)];
+    if (workerType === "diagnosis") return ["DIAGNOSIS"];
+    const types: RpaBusinessType[] = [];
+    if (this.options.articleProbeLegacyEnabled !== false) types.push("ARTICLE_PROBE");
+    if (this.options.entryMonitorEnabled === true) types.push("ENTRY_MONITOR");
+    if (this.options.contentStyleMonitorEnabled === true) {
+      types.push("CONTENT_STYLE_MONITOR");
+    }
+    return types;
   }
 }
 
@@ -413,7 +421,8 @@ WHERE e.status = 1
   AND e.task_status = 1
   AND e.answer_id IS NULL
   AND e.deleted = 0
-  AND d.business_type = ?
+  AND e.business_type = ?
+  AND d.business_type = e.business_type
   -- mysql2 按 UTC 序列化 Date，但业务库的 DATETIME/CURRENT_TIMESTAMP 使用
   -- 数据库本地时区。先按数据库当前 UTC 偏移换算截止时间，避免 +08:00
   -- 环境下僵尸任务要多等 8 小时才会被发现。
@@ -445,26 +454,26 @@ WHERE e.id = ?
     TIMESTAMPDIFF(SECOND, UTC_TIMESTAMP(), CURRENT_TIMESTAMP()),
     ?
   )
-  AND d.business_type = ?`;
-
-export const MONITOR_STALE_EXECUTIONS_SQL = STALE_EXECUTIONS_SQL.replace(
-  "d.business_type = ?",
-  "d.business_type IN (?, ?)"
-);
-
-export const RECOVER_MONITOR_STALE_EXECUTION_SQL = RECOVER_STALE_EXECUTION_SQL.replace(
-  "d.business_type = ?",
-  "d.business_type IN (?, ?)"
-);
+  AND e.business_type = ?
+  AND d.business_type = e.business_type`;
 
 function staleExecutionsQueryFor(businessTypes: readonly RpaBusinessType[]): string {
-  return businessTypes.length === 1 ? STALE_EXECUTIONS_SQL : MONITOR_STALE_EXECUTIONS_SQL;
+  return withBusinessTypePredicate(STALE_EXECUTIONS_SQL, businessTypes.length);
 }
 
 function recoverStaleExecutionQueryFor(businessTypes: readonly RpaBusinessType[]): string {
-  return businessTypes.length === 1
-    ? RECOVER_STALE_EXECUTION_SQL
-    : RECOVER_MONITOR_STALE_EXECUTION_SQL;
+  return withBusinessTypePredicate(RECOVER_STALE_EXECUTION_SQL, businessTypes.length);
+}
+
+function withBusinessTypePredicate(sql: string, count: number): string {
+  if (!Number.isSafeInteger(count) || count < 1) {
+    throw new Error("stale recovery requires at least one enabled business type");
+  }
+  if (count === 1) return sql;
+  return sql.replace(
+    "e.business_type = ?",
+    `e.business_type IN (${Array.from({ length: count }, () => "?").join(", ")})`
+  );
 }
 
 function normalizeIds(values: readonly string[]): string[] {

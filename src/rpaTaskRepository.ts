@@ -29,6 +29,7 @@ import {
   type RpaWorkerType
 } from "./rpaTask.js";
 import type { PlatformId } from "./types.js";
+import { isBusinessTypePaused } from "./workerControl.js";
 
 export interface RpaTaskQueryOptions {
   limit?: number;
@@ -72,7 +73,47 @@ export interface RpaTaskRepositoryOptions {
   workerProvider?: string;
   entryMonitorEnabled?: boolean;
   entryMonitorGrayProjectIds?: readonly string[];
+  contentStyleMonitorEnabled?: boolean;
+  contentStyleMonitorGrayProjectIds?: readonly string[];
+  articleProbeLegacyEnabled?: boolean;
   now?: () => Date;
+}
+
+export interface RpaTaskRepositoryRuntimeConfig {
+  workerType: RpaWorkerType;
+  databaseRetryScheduleEnabled: boolean;
+  providerRoutingEnabled: boolean;
+  workerProvider: string;
+  entryMonitorEnabled: boolean;
+  entryMonitorGrayProjectIds: readonly string[];
+  contentStyleMonitorEnabled: boolean;
+  contentStyleMonitorGrayProjectIds: readonly string[];
+  articleProbeLegacyEnabled: boolean;
+}
+
+/** Formal workers and read-only tooling must construct the queue repository identically. */
+export function createRpaTaskRepositoryOptions(
+  config: RpaTaskRepositoryRuntimeConfig
+): RpaTaskRepositoryOptions {
+  const entryMonitorEnabled = config.workerType === "monitor" && config.entryMonitorEnabled;
+  return {
+    retryScheduleEnabled: config.databaseRetryScheduleEnabled,
+    ...(config.providerRoutingEnabled
+      ? { workerProvider: config.workerProvider }
+      : {}),
+    entryMonitorEnabled,
+    entryMonitorGrayProjectIds: entryMonitorEnabled
+      ? [...config.entryMonitorGrayProjectIds]
+      : [],
+    contentStyleMonitorEnabled: config.workerType === "monitor" &&
+      config.contentStyleMonitorEnabled,
+    contentStyleMonitorGrayProjectIds: config.workerType === "monitor" &&
+      config.contentStyleMonitorEnabled
+      ? [...config.contentStyleMonitorGrayProjectIds]
+      : [],
+    articleProbeLegacyEnabled: config.workerType === "monitor" &&
+      config.articleProbeLegacyEnabled
+  };
 }
 
 export type RpaSqlParameter = string | number | boolean | null | Date | Buffer;
@@ -85,7 +126,8 @@ export interface RpaSqlClient {
 export interface RpaTaskRow {
   executionId: unknown;
   dispatchTaskId: unknown;
-  businessType: unknown;
+  executionBusinessType: unknown;
+  dispatchBusinessType: unknown;
   businessTaskId: unknown;
   tenantKey: unknown;
   brandId: unknown;
@@ -112,6 +154,16 @@ export interface RpaTaskStateCount {
 
 export interface RpaBusinessTaskStateCount extends RpaTaskStateCount {
   businessType: RpaBusinessType;
+}
+
+export interface RpaBusinessTypeProtocolCounts {
+  nullExecutionType: number;
+  mismatch: number;
+  unknown: number;
+  orphan: number;
+  legacyFallback: number;
+  invalidContext: number;
+  articleProbeLegacy: number;
 }
 
 interface RpaTaskStateCountRow {
@@ -194,7 +246,7 @@ export class RpaTaskRepository {
     private readonly options: RpaTaskRepositoryOptions = {}
   ) {}
 
-  /** diagnosis 只查 DIAGNOSIS；monitor 兼容 ARTICLE_PROBE 并按开关查询 ENTRY_MONITOR。 */
+  /** Each protocol type is queried independently; feature flags decide monitor eligibility. */
   async findPendingTasks(
     workerType: RpaWorkerType,
     options: RpaTaskQueryOptions = {}
@@ -203,74 +255,89 @@ export class RpaTaskRepository {
     const businessType = businessTypeForWorker(workerType);
     const brandCohorts = normalizeBrandCohorts(options.brandCohorts);
     if (options.brandCohorts && brandCohorts.length === 0) return [];
-    const rows = await this.client.queryRows<RpaTaskRow>(
-      pendingQueryFor(
+    const tasks: RpaTask[] = [];
+    const queryLegacyProbe = workerType !== "monitor" ||
+      this.options.articleProbeLegacyEnabled !== false;
+    if (queryLegacyProbe) {
+      const rows = await this.client.queryRows<RpaTaskRow>(
+        pendingQueryFor(
+          workerType,
+          this.options.retryScheduleEnabled === true,
+          this.options.workerProvider !== undefined,
+          brandCohorts.length
+        ),
+        [
+          businessType,
+          ...(this.options.workerProvider ? [this.options.workerProvider] : []),
+          ...brandCohorts.flatMap((cohort) => [cohort.businessTaskId, cohort.tenantKey]),
+          limit
+        ]
+      );
+      for (const row of rows) {
+        const task = await this.mapCandidate(row, workerType, businessType);
+        if (task) tasks.push(task);
+      }
+      await this.safeAudit({
+        timestamp: new Date().toISOString(),
+        event: "PENDING_QUERY",
         workerType,
-        this.options.retryScheduleEnabled === true,
-        this.options.workerProvider !== undefined,
-        brandCohorts.length
-      ),
-      [
         businessType,
-        ...(this.options.workerProvider ? [this.options.workerProvider] : []),
-        ...brandCohorts.flatMap((cohort) => [cohort.businessTaskId, cohort.tenantKey]),
-        limit
-      ]
-    );
-    const tasks = rows.map((row) => mapRpaTaskRow(row, businessType));
-    await this.safeAudit({
-      timestamp: new Date().toISOString(),
-      event: "PENDING_QUERY",
-      workerType,
-      businessType,
-      candidateCount: tasks.length
-    });
-    if (workerType !== "monitor" || this.options.entryMonitorEnabled !== true) {
-      return tasks;
+        candidateCount: rows.length
+      });
     }
 
-    const projectIds = normalizeProjectIds(this.options.entryMonitorGrayProjectIds);
-    const entryRows = await this.client.queryRows<RpaTaskRow>(
-      entryMonitorPendingQueryFor(
-        this.options.retryScheduleEnabled === true,
-        this.options.workerProvider !== undefined,
-        projectIds.length
-      ),
-      [
-        "ENTRY_MONITOR",
-        ...(this.options.workerProvider ? [this.options.workerProvider] : []),
-        getShanghaiDate((this.options.now ?? (() => new Date()))()),
-        ...projectIds,
-        limit
-      ]
-    );
-    const entryTasks: RpaTask[] = [];
-    for (const row of entryRows) {
-      try {
-        entryTasks.push(mapRpaTaskRow(row, "ENTRY_MONITOR"));
-      } catch (error) {
-        if ((error as { errorCode?: unknown })?.errorCode !== "INVALID_EXECUTION_CONTEXT") {
-          throw error;
+    if (workerType === "monitor") {
+      const contextualTypes: Array<{
+        businessType: "ENTRY_MONITOR" | "CONTENT_STYLE_MONITOR";
+        enabled: boolean;
+        projectIds: readonly string[] | undefined;
+      }> = [
+        {
+          businessType: "ENTRY_MONITOR",
+          enabled: this.options.entryMonitorEnabled === true,
+          projectIds: this.options.entryMonitorGrayProjectIds
+        },
+        {
+          businessType: "CONTENT_STYLE_MONITOR",
+          enabled: this.options.contentStyleMonitorEnabled === true,
+          projectIds: this.options.contentStyleMonitorGrayProjectIds
+        }
+      ];
+      for (const contextual of contextualTypes) {
+        if (!contextual.enabled) continue;
+        const projectIds = normalizeProjectIds(contextual.projectIds);
+        const rows = await this.client.queryRows<RpaTaskRow>(
+          contextualMonitorPendingQueryFor(
+            this.options.retryScheduleEnabled === true,
+            this.options.workerProvider !== undefined,
+            projectIds.length
+          ),
+          [
+            contextual.businessType,
+            ...(this.options.workerProvider ? [this.options.workerProvider] : []),
+            getShanghaiDate((this.options.now ?? (() => new Date()))()),
+            ...projectIds,
+            limit
+          ]
+        );
+        let candidateCount = 0;
+        for (const row of rows) {
+          const task = await this.mapCandidate(row, workerType, contextual.businessType);
+          if (task) {
+            tasks.push(task);
+            candidateCount += 1;
+          }
         }
         await this.safeAudit({
           timestamp: new Date().toISOString(),
-          event: "INVALID_EXECUTION_CONTEXT",
+          event: "PENDING_QUERY",
           workerType,
-          businessType: "ENTRY_MONITOR",
-          ...(optionalDatabaseId(row.executionId) === undefined
-            ? {}
-            : { executionId: optionalDatabaseId(row.executionId) })
+          businessType: contextual.businessType,
+          candidateCount
         });
       }
     }
-    await this.safeAudit({
-      timestamp: new Date().toISOString(),
-      event: "PENDING_QUERY",
-      workerType,
-      businessType: "ENTRY_MONITOR",
-      candidateCount: entryTasks.length
-    });
-    return [...tasks, ...entryTasks].sort(compareTasks).slice(0, limit);
+    return tasks.sort(compareTasks).slice(0, limit);
   }
 
   async findPendingCollectionTasks(
@@ -332,9 +399,9 @@ export class RpaTaskRepository {
     if (!isBusinessTypeAllowedForWorker(workerType, businessType)) {
       throw new Error("worker business type mismatch");
     }
-    if (businessType === "ENTRY_MONITOR") {
+    if (businessType === "ENTRY_MONITOR" || businessType === "CONTENT_STYLE_MONITOR") {
       const rows = await this.client.queryRows<RpaTaskRow>(
-        entryMonitorBatchQueryFor(
+        contextualMonitorBatchQueryFor(
           this.options.retryScheduleEnabled === true,
           this.options.workerProvider !== undefined
         ),
@@ -421,6 +488,16 @@ export class RpaTaskRepository {
   ): Promise<CollectionTask | undefined> {
     const candidates = await this.findPendingTasks(workerType, options);
     for (const task of candidates) {
+      // 运营台暂停：该业务类型的控制文件存在时，跳过认领但保留进程常驻。
+      if (isBusinessTypePaused(workerType, task.businessType)) {
+        await this.safeAudit({
+          timestamp: new Date().toISOString(),
+          event: "CLAIM_SKIPPED_PAUSED",
+          workerType,
+          businessType: task.businessType
+        });
+        continue;
+      }
       if (await this.claimTask(workerType, task.businessType, task.executionId)) {
         return toCollectionTask(task);
       }
@@ -433,14 +510,12 @@ export class RpaTaskRepository {
    * 仅统计 execution 自身的双状态，不修改 dispatch 状态。
    */
   async countTaskStates(workerType: RpaWorkerType): Promise<RpaTaskStateCount[]> {
-    const includeEntryMonitor = workerType === "monitor" &&
-      this.options.entryMonitorEnabled === true;
-    const businessTypes = includeEntryMonitor
-      ? businessTypesForWorker(workerType)
-      : [businessTypeForWorker(workerType)];
-    const baseSql = includeEntryMonitor
-      ? TASK_STATE_COUNT_SQL.replace("d.business_type = ?", "d.business_type IN (?, ?)")
-      : TASK_STATE_COUNT_SQL;
+    const businessTypes = this.enabledBusinessTypes(workerType);
+    if (businessTypes.length === 0) return [];
+    const baseSql = TASK_STATE_COUNT_SQL.replace(
+      "e.business_type = ?",
+      sqlBusinessTypePredicate("e.business_type", businessTypes.length)
+    );
     const rows = await this.client.queryRows<RpaTaskStateCountRow>(
       this.options.workerProvider
         ? baseSql.replace(
@@ -478,17 +553,16 @@ export class RpaTaskRepository {
   async countTaskStatesByBusinessType(
     workerType: RpaWorkerType
   ): Promise<RpaBusinessTaskStateCount[]> {
-    const businessTypes = workerType === "monitor" && this.options.entryMonitorEnabled === true
-      ? businessTypesForWorker(workerType)
-      : [businessTypeForWorker(workerType)];
+    const businessTypes = this.enabledBusinessTypes(workerType);
+    if (businessTypes.length === 0) return [];
     let sql = BUSINESS_TYPE_TASK_STATE_COUNT_SQL.replace(
       "%BUSINESS_FILTER%",
-      businessTypes.length === 1 ? "d.business_type = ?" : "d.business_type IN (?, ?)"
+      sqlBusinessTypePredicate("e.business_type", businessTypes.length)
     );
     if (this.options.workerProvider) {
       sql = sql.replace(
-        "GROUP BY d.business_type",
-        "AND d.worker_provider = ? AND e.worker_provider = d.worker_provider\nGROUP BY d.business_type"
+        "GROUP BY e.business_type",
+        "AND d.worker_provider = ? AND e.worker_provider = d.worker_provider\nGROUP BY e.business_type"
       );
     }
     const rows = await this.client.queryRows<RpaTaskStateCountRow>(sql, [
@@ -508,9 +582,71 @@ export class RpaTaskRepository {
     }));
   }
 
+  async countBusinessTypeProtocolAnomalies(): Promise<RpaBusinessTypeProtocolCounts> {
+    const [row] = await this.client.queryRows<Record<string, unknown>>(
+      BUSINESS_TYPE_PROTOCOL_COUNT_SQL,
+      []
+    );
+    return {
+      nullExecutionType: nonNegativeInteger(row?.nullExecutionType ?? 0, "nullExecutionType"),
+      mismatch: nonNegativeInteger(row?.mismatch ?? 0, "mismatch"),
+      unknown: nonNegativeInteger(row?.unknown ?? 0, "unknown"),
+      orphan: nonNegativeInteger(row?.orphan ?? 0, "orphan"),
+      legacyFallback: nonNegativeInteger(row?.legacyFallback ?? 0, "legacyFallback"),
+      invalidContext: nonNegativeInteger(row?.invalidContext ?? 0, "invalidContext"),
+      articleProbeLegacy: nonNegativeInteger(row?.articleProbeLegacy ?? 0, "articleProbeLegacy")
+    };
+  }
+
   private async safeAudit(event: Parameters<RpaTaskAuditSink["write"]>[0]): Promise<void> {
     // 审计磁盘故障不能改变数据库领取结果，也不能诱发同一任务再次领取。
     await this.audit?.write(event).catch(() => undefined);
+  }
+
+  private enabledBusinessTypes(workerType: RpaWorkerType): RpaBusinessType[] {
+    if (workerType === "diagnosis") return ["DIAGNOSIS"];
+    const types: RpaBusinessType[] = [];
+    if (this.options.articleProbeLegacyEnabled !== false) types.push("ARTICLE_PROBE");
+    if (this.options.entryMonitorEnabled === true) types.push("ENTRY_MONITOR");
+    if (this.options.contentStyleMonitorEnabled === true) {
+      types.push("CONTENT_STYLE_MONITOR");
+    }
+    return types;
+  }
+
+  private async mapCandidate(
+    row: RpaTaskRow,
+    workerType: RpaWorkerType,
+    expectedBusinessType: RpaBusinessType
+  ): Promise<RpaTask | undefined> {
+    try {
+      const task = mapRpaTaskRow(row, expectedBusinessType);
+      if (isBlankBusinessType(row.executionBusinessType)) {
+        await this.safeAudit({
+          timestamp: new Date().toISOString(),
+          event: "LEGACY_BUSINESS_TYPE_FALLBACK",
+          workerType,
+          businessType: task.businessType,
+          dispatchBusinessType: task.businessType,
+          ...(optionalDatabaseId(row.executionId) ?
+            { executionId: optionalDatabaseId(row.executionId) } : {})
+        });
+      }
+      return task;
+    } catch (error) {
+      const errorCode = (error as { errorCode?: unknown })?.errorCode;
+      if (errorCode !== "INVALID_EXECUTION_CONTEXT" &&
+          errorCode !== "BUSINESS_TYPE_MISMATCH") throw error;
+      await this.safeAudit({
+        timestamp: new Date().toISOString(),
+        event: errorCode,
+        workerType,
+        businessType: expectedBusinessType,
+        ...(optionalDatabaseId(row.executionId) ?
+          { executionId: optionalDatabaseId(row.executionId) } : {})
+      });
+      return undefined;
+    }
   }
 }
 
@@ -518,7 +654,8 @@ const COMMON_SELECT = `
 SELECT
   e.id AS executionId,
   e.task_id AS dispatchTaskId,
-  d.business_type AS businessType,
+  e.business_type AS executionBusinessType,
+  d.business_type AS dispatchBusinessType,
   d.business_task_id AS businessTaskId,
   d.tenant_key AS tenantKey,
   %BRAND_COLUMN% AS brandId,
@@ -538,7 +675,8 @@ INNER JOIN brand_rpa_dispatch_task AS d
 WHERE e.status = 0
   AND e.task_status = 0
   AND e.deleted = 0
-  AND d.business_type = ?
+  AND e.business_type = ?
+  AND d.business_type = e.business_type
   -- 同一业务任务/租户/平台仍有 processing 时，不允许跳过中断题领取后续题。
   -- stale recovery 将中断题恢复为 pending 后，完整剩余批次才会重新进入候选集。
   AND NOT EXISTS (
@@ -551,6 +689,7 @@ WHERE e.status = 0
       AND active_e.task_status = 1
       AND active_e.answer_id IS NULL
       AND active_e.deleted = 0
+      AND active_e.business_type = active_d.business_type
       AND active_d.business_type = d.business_type
       AND active_d.business_task_id = d.business_task_id
       AND active_d.tenant_key = d.tenant_key
@@ -578,11 +717,12 @@ const MONITOR_PENDING_SQL = COMMON_SELECT
   );
 
 /** ENTRY_MONITOR 只以 execution 为候选队列，并只关联 dispatch 与通用上下文。 */
-const ENTRY_MONITOR_PENDING_SQL = `
+const CONTEXTUAL_MONITOR_PENDING_SQL = `
 SELECT
   e.id AS executionId,
   e.task_id AS dispatchTaskId,
-  d.business_type AS businessType,
+  e.business_type AS executionBusinessType,
+  d.business_type AS dispatchBusinessType,
   d.business_task_id AS businessTaskId,
   d.tenant_key AS tenantKey,
   e.keyword AS keyword,
@@ -604,13 +744,14 @@ INNER JOIN brand_rpa_dispatch_task AS d
 INNER JOIN rpa_task_execution_context AS ctx
   ON ctx.execution_id = e.id
   AND ctx.deleted = 0
-  AND ctx.business_type = 'ENTRY_MONITOR'
+  AND ctx.business_type = e.business_type
   AND ctx.business_task_id = d.business_task_id
   AND ctx.ai_model_id = e.ai_model_id
 WHERE e.status = 0
   AND e.task_status = 0
   AND e.deleted = 0
-  AND d.business_type = ?
+  AND e.business_type = ?
+  AND d.business_type = e.business_type
   AND ctx.monitor_date = ?
   AND NOT EXISTS (
     SELECT 1
@@ -621,13 +762,14 @@ WHERE e.status = 0
     INNER JOIN rpa_task_execution_context AS active_ctx
       ON active_ctx.execution_id = active_e.id
       AND active_ctx.deleted = 0
-      AND active_ctx.business_type = 'ENTRY_MONITOR'
+      AND active_ctx.business_type = active_e.business_type
       AND active_ctx.business_task_id = active_d.business_task_id
       AND active_ctx.ai_model_id = active_e.ai_model_id
     WHERE active_e.status = 1
       AND active_e.task_status = 1
       AND active_e.answer_id IS NULL
       AND active_e.deleted = 0
+      AND active_e.business_type = active_d.business_type
       AND active_d.business_type = d.business_type
       AND active_d.tenant_key = d.tenant_key
       AND active_ctx.project_id = ctx.project_id
@@ -637,12 +779,12 @@ WHERE e.status = 0
 ORDER BY e.priority ASC, e.create_time ASC, e.id ASC
 LIMIT ?`;
 
-function entryMonitorPendingQueryFor(
+function contextualMonitorPendingQueryFor(
   retryScheduleEnabled: boolean,
   providerRoutingEnabled: boolean,
   projectCount: number
 ): string {
-  let sql = ENTRY_MONITOR_PENDING_SQL;
+  let sql = CONTEXTUAL_MONITOR_PENDING_SQL;
   if (providerRoutingEnabled) {
     sql = sql.replace(
       "AND ctx.monitor_date = ?",
@@ -664,11 +806,11 @@ function entryMonitorPendingQueryFor(
   return sql;
 }
 
-function entryMonitorBatchQueryFor(
+function contextualMonitorBatchQueryFor(
   retryScheduleEnabled: boolean,
   providerRoutingEnabled: boolean
 ): string {
-  let sql = entryMonitorPendingQueryFor(false, false, 0).replace(
+  let sql = contextualMonitorPendingQueryFor(false, false, 0).replace(
     "AND ctx.monitor_date = ?",
     `AND ctx.project_id = ?
   AND d.tenant_key = ?
@@ -733,7 +875,8 @@ WHERE e.id = ?
   AND e.status = 0
   AND e.task_status = 0
   AND e.deleted = 0
-  AND d.business_type = ?`;
+  AND e.business_type = ?
+  AND d.business_type = e.business_type`;
 
 export const CLAIM_SCHEDULED_TASK_SQL = `${CLAIM_TASK_SQL}
   AND (e.next_retry_at IS NULL OR e.next_retry_at <= CURRENT_TIMESTAMP)`;
@@ -762,12 +905,13 @@ INNER JOIN brand_rpa_dispatch_task AS d
   ON d.id = e.task_id
   AND d.deleted = 0
 WHERE e.deleted = 0
-  AND d.business_type = ?
+  AND e.business_type = ?
+  AND d.business_type = e.business_type
 GROUP BY e.ai_model_id, e.ai_model_name`;
 
 export const BUSINESS_TYPE_TASK_STATE_COUNT_SQL = `
 SELECT
-  d.business_type AS businessType,
+  e.business_type AS businessType,
   e.ai_model_id AS aiModelId,
   e.ai_model_name AS aiModelName,
   SUM(CASE WHEN e.status = 0 AND e.task_status = 0 THEN 1 ELSE 0 END) AS pending,
@@ -780,13 +924,42 @@ INNER JOIN brand_rpa_dispatch_task AS d
   AND d.deleted = 0
 WHERE e.deleted = 0
   AND %BUSINESS_FILTER%
-GROUP BY d.business_type, e.ai_model_id, e.ai_model_name`;
+  AND d.business_type = e.business_type
+GROUP BY e.business_type, e.ai_model_id, e.ai_model_name`;
+
+export const BUSINESS_TYPE_PROTOCOL_COUNT_SQL = `
+SELECT
+  SUM(e.business_type IS NULL OR TRIM(e.business_type) = '') AS nullExecutionType,
+  SUM(d.id IS NOT NULL AND e.business_type IS NOT NULL AND TRIM(e.business_type) <> ''
+      AND e.business_type <> d.business_type) AS mismatch,
+  SUM(e.business_type IS NOT NULL AND TRIM(e.business_type) <> ''
+      AND e.business_type NOT IN ('DIAGNOSIS','CONTENT_STYLE_MONITOR','ENTRY_MONITOR','ARTICLE_PROBE')) AS unknown,
+  SUM(d.id IS NULL) AS orphan,
+  SUM(d.id IS NOT NULL AND (e.business_type IS NULL OR TRIM(e.business_type) = '')
+      AND d.business_type IN ('DIAGNOSIS','CONTENT_STYLE_MONITOR','ENTRY_MONITOR','ARTICLE_PROBE')) AS legacyFallback,
+  SUM(e.business_type IN ('ENTRY_MONITOR','CONTENT_STYLE_MONITOR') AND ctx.execution_id IS NULL) AS invalidContext,
+  SUM(e.business_type = 'ARTICLE_PROBE'
+      OR ((e.business_type IS NULL OR TRIM(e.business_type) = '') AND d.business_type = 'ARTICLE_PROBE')) AS articleProbeLegacy
+FROM rpa_task_execution AS e
+LEFT JOIN brand_rpa_dispatch_task AS d
+  ON d.id = e.task_id
+ AND d.deleted = 0
+LEFT JOIN rpa_task_execution_context AS ctx
+  ON ctx.execution_id = e.id
+ AND ctx.deleted = 0
+ AND ctx.business_type = e.business_type
+ AND ctx.business_task_id = d.business_task_id
+ AND ctx.ai_model_id = e.ai_model_id
+WHERE e.deleted = 0`;
 
 export function mapRpaTaskRow(
   row: RpaTaskRow,
   expectedBusinessType?: RpaBusinessType
 ): RpaTask {
-  const businessType = requireBusinessType(row.businessType);
+  const businessType = resolveExecutionBusinessType(
+    row.executionBusinessType,
+    row.dispatchBusinessType
+  );
   if (expectedBusinessType && businessType !== expectedBusinessType) {
     throw new Error(
       `RPA 查询返回了错误业务类型：期望 ${expectedBusinessType}，实际 ${businessType}`
@@ -805,7 +978,7 @@ export function mapRpaTaskRow(
     priority: nonNegativeInteger(row.priority, "priority"),
     createdAt: databaseDate(row.createdAt, "createdAt")
   };
-  if (businessType === "ENTRY_MONITOR") {
+  if (businessType === "ENTRY_MONITOR" || businessType === "CONTENT_STYLE_MONITOR") {
     try {
       const tenantId = common.tenantKey;
       return {
@@ -819,7 +992,7 @@ export function mapRpaTaskRow(
       };
     } catch (error) {
       throw Object.assign(
-        new Error(`ENTRY_MONITOR execution context 无效：${formatError(error)}`),
+        new Error(`${businessType} execution context 无效：${formatError(error)}`),
         { errorCode: "INVALID_EXECUTION_CONTEXT" as const }
       );
     }
@@ -885,7 +1058,8 @@ INNER JOIN brand_rpa_dispatch_task AS d
   AND d.status = 'DISPATCHED'
 %BUSINESS_JOIN%
 WHERE e.deleted = 0
-  AND d.business_type = ?
+  AND e.business_type = ?
+  AND d.business_type = e.business_type
 %PROVIDER_FILTER%
 GROUP BY d.tenant_key, d.business_task_id, %BRAND_COLUMN%
 ),
@@ -1004,10 +1178,43 @@ function normalizeBrandCohorts(
 function requireBusinessType(value: unknown): RpaBusinessType {
   if (
     value === "DIAGNOSIS" ||
+    value === "CONTENT_STYLE_MONITOR" ||
     value === "ARTICLE_PROBE" ||
     value === "ENTRY_MONITOR"
   ) return value;
   throw new Error(`不支持的 RPA business_type：${String(value)}`);
+}
+
+export function resolveExecutionBusinessType(
+  executionType: unknown,
+  dispatchType: unknown
+): RpaBusinessType {
+  const normalizedDispatch = requireBusinessType(dispatchType);
+  if (isBlankBusinessType(executionType)) return normalizedDispatch;
+  const normalizedExecution = requireBusinessType(executionType);
+  if (normalizedExecution !== normalizedDispatch) {
+    throw Object.assign(
+      new Error(
+        `execution 与 dispatch 的 business_type 不一致：` +
+        `${normalizedExecution} != ${normalizedDispatch}`
+      ),
+      { errorCode: "BUSINESS_TYPE_MISMATCH" as const }
+    );
+  }
+  return normalizedExecution;
+}
+
+function isBlankBusinessType(value: unknown): boolean {
+  return value == null || String(value).trim() === "";
+}
+
+function sqlBusinessTypePredicate(column: string, count: number): string {
+  if (!Number.isSafeInteger(count) || count < 1) {
+    throw new Error("business type predicate requires at least one type");
+  }
+  return count === 1
+    ? `${column} = ?`
+    : `${column} IN (${Array.from({ length: count }, () => "?").join(", ")})`;
 }
 
 function normalizeProjectIds(values: readonly string[] | undefined): string[] {

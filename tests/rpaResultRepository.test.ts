@@ -83,6 +83,7 @@ function executionRow(overrides: Record<string, unknown> = {}): Record<string, u
   return {
     executionId: "501",
     dispatchTaskId: "9001",
+    businessType: "DIAGNOSIS",
     keyword: "原样业务问题",
     status: 1,
     taskStatus: 1,
@@ -97,6 +98,7 @@ function successfulResult(
   return {
     executionId: "501",
     dispatchTaskId: "9001",
+    businessType: "DIAGNOSIS",
     keyword: "原样业务问题",
     answerContent: "最终回答正文",
     responseDurationSeconds: 12,
@@ -146,6 +148,19 @@ test("成功结果严格按回答、引用、answer_id、完成状态顺序提�
   assert.match(writes[3]!.sql!, /SET\s+status = 2,\s+task_status = 2/s);
   assert.doesNotMatch(writes.map(({ sql }) => sql ?? "").join("\n"), /brand_rpa_dispatch_task/);
   assert.equal(database.transaction.operations.at(-1)?.kind, "release");
+});
+
+test("结果 businessType 与 execution 不一致时回滚且不写回答", async () => {
+  const transaction = new FakeTransaction();
+  transaction.queryResults = [[executionRow({ businessType: "ENTRY_MONITOR" })], []];
+  const repository = new RpaResultRepository(new FakeDatabase(transaction));
+  await assert.rejects(
+    () => repository.saveSuccess(successfulResult({ businessType: "DIAGNOSIS" })),
+    (error: unknown) =>
+      (error as { errorCode?: unknown }).errorCode === "BUSINESS_TYPE_MISMATCH"
+  );
+  assert.equal(transaction.operations.some(({ kind }) => kind === "insert"), false);
+  assert.equal(transaction.operations.some(({ kind }) => kind === "rollback"), true);
 });
 
 test("零引用仍插入成功回答且不执行引用 INSERT", async () => {
@@ -341,6 +356,7 @@ test("统一 CollectionResult 映射回答字段、秒级耗时和采集时间",
   const mapped = toRpaCollectionResult({
     executionId: "501",
     dispatchTaskId: "9001",
+    businessType: "DIAGNOSIS",
     keyword: "原样业务问题"
   }, collectionResult);
   assert.equal(mapped.answerContent, "采集回答");

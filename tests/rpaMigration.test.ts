@@ -54,3 +54,23 @@ test("provider migration 默认 LEGACY，切换脚本显式迁移待处理任务
     false
   );
 });
+
+test("business_type 第一阶段迁移可重复执行、只回填空值且不提前改为 NOT NULL", async () => {
+  const up = await readFile(
+    path.resolve("migrations/20260808_rpa_execution_business_type.up.sql"),
+    "utf8"
+  );
+  const down = await readFile(
+    path.resolve("migrations/20260808_rpa_execution_business_type.down.sql"),
+    "utf8"
+  );
+  assert.match(up, /information_schema\.COLUMNS/);
+  assert.match(up, /information_schema\.STATISTICS/);
+  assert.match(up, /WHERE e\.business_type IS NULL/);
+  assert.doesNotMatch(up, /MODIFY COLUMN business_type varchar\(64\) NOT NULL/);
+  assert.match(up, /e\.business_type <> d\.business_type/);
+  assert.match(up, /LEFT JOIN brand_rpa_dispatch_task/);
+  assert.match(up, /idx_rpa_execution_business_queue/);
+  assert.match(down, /DROP INDEX idx_rpa_execution_business_queue/);
+  assert.match(down, /DROP COLUMN business_type/);
+});

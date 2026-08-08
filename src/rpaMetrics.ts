@@ -43,6 +43,7 @@ export interface RpaMetricsSnapshot {
   outboxCorrupted: number;
   diskFreeBytes: number | null;
   businessTypes: Partial<Record<RpaBusinessType, TaskStateMetrics>>;
+  businessTypeProtocol: BusinessTypeProtocolMetrics;
   totals: {
     taskStates: TaskStateMetrics;
     taskWait: DurationMetrics;
@@ -55,6 +56,16 @@ export interface RpaMetricsSnapshot {
     failedBrandBatchDuration: DurationMetrics;
   };
   platforms: PlatformMetricsSnapshot[];
+}
+
+export interface BusinessTypeProtocolMetrics {
+  nullExecutionType: number;
+  mismatch: number;
+  unknown: number;
+  orphan: number;
+  legacyFallback: number;
+  invalidContext: number;
+  articleProbeLegacy: number;
 }
 
 interface MutableDurationMetrics {
@@ -86,6 +97,7 @@ export class MetricsRegistry {
   private diskFreeBytes: number | null = null;
   private heartbeatAt: Date;
   private readonly businessTypeTaskStates = new Map<RpaBusinessType, TaskStateMetrics>();
+  private businessTypeProtocol = emptyBusinessTypeProtocolMetrics();
 
   constructor(
     readonly workerType: RpaWorkerType,
@@ -128,6 +140,18 @@ export class MetricsRegistry {
     for (const [businessType, taskStates] of states) {
       this.businessTypeTaskStates.set(businessType, normalizeTaskStates(taskStates));
     }
+  }
+
+  replaceBusinessTypeProtocol(metrics: Readonly<BusinessTypeProtocolMetrics>): void {
+    this.businessTypeProtocol = {
+      nullExecutionType: nonNegativeInteger(metrics.nullExecutionType, "nullExecutionType"),
+      mismatch: nonNegativeInteger(metrics.mismatch, "businessTypeMismatch"),
+      unknown: nonNegativeInteger(metrics.unknown, "unknownBusinessType"),
+      orphan: nonNegativeInteger(metrics.orphan, "orphanExecution"),
+      legacyFallback: nonNegativeInteger(metrics.legacyFallback, "legacyFallback"),
+      invalidContext: nonNegativeInteger(metrics.invalidContext, "invalidExecutionContext"),
+      articleProbeLegacy: nonNegativeInteger(metrics.articleProbeLegacy, "articleProbeLegacy")
+    };
   }
 
   transitionBusinessTypeTaskState(
@@ -211,6 +235,7 @@ export class MetricsRegistry {
           { ...states }
         ])
       ),
+      businessTypeProtocol: { ...this.businessTypeProtocol },
       totals: {
         taskStates: sumTaskStates(platforms.map(({ taskStates }) => taskStates)),
         taskWait: sumDurations(platforms.map(({ taskWait }) => taskWait)),
@@ -235,6 +260,18 @@ export class MetricsRegistry {
     if (!metrics) throw new Error(`指标未注册平台：${platform}`);
     return metrics;
   }
+}
+
+function emptyBusinessTypeProtocolMetrics(): BusinessTypeProtocolMetrics {
+  return {
+    nullExecutionType: 0,
+    mismatch: 0,
+    unknown: 0,
+    orphan: 0,
+    legacyFallback: 0,
+    invalidContext: 0,
+    articleProbeLegacy: 0
+  };
 }
 
 /** 使用临时文件 + rename 原子更新固定 JSON 快照。 */

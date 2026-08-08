@@ -41,7 +41,9 @@ export function webSearchPolicyForBusinessType(
   businessType: RpaBusinessType,
   diagnosisPolicy: WebSearchPolicy
 ): WebSearchPolicy {
-  return businessType === "ARTICLE_PROBE" || businessType === "ENTRY_MONITOR"
+  return businessType === "ARTICLE_PROBE" ||
+    businessType === "ENTRY_MONITOR" ||
+    businessType === "CONTENT_STYLE_MONITOR"
     ? "REQUIRED"
     : diagnosisPolicy;
 }

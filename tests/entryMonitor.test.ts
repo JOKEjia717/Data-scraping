@@ -56,9 +56,11 @@ test("上海自然日不受 UTC 日期边界影响，且只允许当日 ENTRY_MO
   assert.equal(isEntryMonitorTaskEligibleToday(entryTask(), beforeShanghaiMidnight), false);
 });
 
-test("diagnosis 保持单类型，monitor 同时兼容 ARTICLE_PROBE 和 ENTRY_MONITOR", () => {
+test("diagnosis 保持单类型，monitor 协议识别三种监测类型", () => {
   assert.deepEqual(businessTypesForWorker("diagnosis"), ["DIAGNOSIS"]);
-  assert.deepEqual(businessTypesForWorker("monitor"), ["ARTICLE_PROBE", "ENTRY_MONITOR"]);
+  assert.deepEqual(businessTypesForWorker("monitor"), [
+    "ARTICLE_PROBE", "ENTRY_MONITOR", "CONTENT_STYLE_MONITOR"
+  ]);
   assert.equal(isBusinessTypeAllowedForWorker("diagnosis", "ENTRY_MONITOR"), false);
   assert.equal(isBusinessTypeAllowedForWorker("monitor", "DIAGNOSIS"), false);
   const collection = toCollectionTask(entryTask());

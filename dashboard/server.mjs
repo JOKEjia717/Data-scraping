@@ -495,6 +495,89 @@ async function rpaSectionsHandler() {
   return { enabled: true, sections };
 }
 
+/* ----------------------------- 运营台控制（链接爬虫程序） -----------------------------
+ *
+ * 每个开关写入/删除一个控制文件，由对应程序检测：
+ *   rpa-runtime/<role>/pause-<BUSINESS_TYPE>.request  → RPA worker 暂停某业务类型
+ *   rpa-runtime/research/stop.request                  → 研究爬取优雅停止
+ * 文件存在 = 暂停/停止；不存在 = 运行。worker 进程常驻，暂停只是不再认领该业务。
+ */
+
+const CONTROL_PROJECT_ROOT = path.resolve(__dirname, "..");
+
+/** 四个开关 → 控制目标。businessType 用 DB 真实 business_type（风格监测=CONTENT_STYLE_MONITOR）。 */
+function controlTarget(key) {
+  switch (key) {
+    case "DIAGNOSIS":
+      return { role: "diagnosis", businessType: "DIAGNOSIS" };
+    case "ENTRY_MONITOR":
+      return { role: "monitor", businessType: "ENTRY_MONITOR" };
+    case "CONTENT_STYLE_MONITOR":
+      return { role: "monitor", businessType: "CONTENT_STYLE_MONITOR" };
+    case "research":
+      return { role: "research", stop: true };
+    default:
+      return null;
+  }
+}
+
+function pauseFilePathFor(role, businessType) {
+  return path.join(CONTROL_PROJECT_ROOT, "rpa-runtime", role, `pause-${businessType}.request`);
+}
+function researchStopFilePath() {
+  return path.join(CONTROL_PROJECT_ROOT, "rpa-runtime", "research", "stop.request");
+}
+
+/** 写入/清空控制文件。enabled=true 写空内容（运行），false 写时间戳（暂停/停止）。
+ *  注意：出于运行环境 safe-delete 回收站保护，绝不使用删除操作，只清空内容。 */
+function setControl(key, enabled) {
+  const target = controlTarget(key);
+  if (!target) return { ok: false, error: `未知的控制项: ${key}` };
+  const file = target.stop
+    ? researchStopFilePath()
+    : pauseFilePathFor(target.role, target.businessType);
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, enabled ? "" : new Date().toISOString(), "utf8");
+  return { ok: true, key, enabled };
+}
+
+/** 读取全部开关的真实程序状态（内容为空白 = 启用/运行）。 */
+function getControlStates() {
+  const keys = ["DIAGNOSIS", "ENTRY_MONITOR", "CONTENT_STYLE_MONITOR", "research"];
+  const states = {};
+  for (const key of keys) {
+    const target = controlTarget(key);
+    if (!target) { states[key] = true; continue; }
+    const file = target.stop
+      ? researchStopFilePath()
+      : pauseFilePathFor(target.role, target.businessType);
+    const content = fs.existsSync(file) ? fs.readFileSync(file, "utf8") : "";
+    states[key] = content.trim().length === 0;
+  }
+  return states;
+}
+
+async function controlHandler(req, res, parsed) {
+  if (req.method === "GET") {
+    return sendJson(res, 200, { ok: true, states: getControlStates() });
+  }
+  if (req.method === "POST") {
+    let body = "";
+    for await (const chunk of req) body += chunk;
+    let payload;
+    try { payload = JSON.parse(body || "{}"); } catch { return sendJson(res, 400, { error: "请求体不是合法 JSON" }); }
+    const { key, enabled } = payload;
+    if (!key || typeof enabled !== "boolean") {
+      return sendJson(res, 400, { error: "需要 key(string) 与 enabled(boolean)" });
+    }
+    const result = setControl(key, enabled);
+    if (!result.ok) return sendJson(res, 400, result);
+    console.log(`[dashboard] 控制 ${key} → ${enabled ? "启用(运行)" : "停用(暂停/停止)"}`);
+    return sendJson(res, 200, result);
+  }
+  return sendJson(res, 405, { error: "方法不允许" });
+}
+
 /* ----------------------------- HTTP 路由 ----------------------------- */
 
 const HTML_PATH = path.join(__dirname, "index.html");
@@ -531,6 +614,10 @@ const server = http.createServer(async (req, res) => {
         rpaDb: !!getRpaPool(),
         time: new Date().toISOString()
       });
+    }
+
+    if (pathname === "/api/control") {
+      return controlHandler(req, res, parsed);
     }
 
     if (ROUTES[pathname]) {

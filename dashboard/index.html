@@ -160,6 +160,14 @@
     display: grid; place-items: center; font-variant-numeric: tabular-nums;
   }
   .nav-item:not(.active) .nav-badge { background: var(--border-strong); color: var(--text-secondary); }
+  /* 操纵台：导航顶部常驻项，加分隔线以区别于下方业务功能 */
+  .nav-console { margin-bottom: 6px; }
+  .nav-console::after {
+    content: ""; position: absolute; left: 12px; right: 12px; bottom: -3px;
+    height: 1px; background: var(--border); opacity: .6;
+  }
+  .nav-console.active::before { background: var(--accent); }
+
   .sidebar-foot { padding: 12px; border-top: 1px solid var(--border); display: flex; align-items: center; justify-content: space-between; }
   .sidebar-foot .conn { font-size: 12px; color: var(--text-tertiary); display: flex; align-items: center; gap: 6px; }
 
@@ -293,6 +301,45 @@
   .section-title .st-sub { font-weight: 400; font-size: 12.5px; color: var(--text-tertiary); }
   .section-group { margin-bottom: 28px; }
   .section-group:first-child .section-title { margin-top: 4px; }
+
+  /* 操纵台：功能开关页面 */
+  .console-sub { font-size: 13px; color: var(--text-tertiary); margin: -4px 0 18px; line-height: 1.6; }
+  .console-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 16px; }
+  .console-card {
+    display: flex; align-items: center; gap: 16px;
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 18px 20px; cursor: pointer;
+    box-shadow: var(--shadow-sm);
+    transition: border-color .18s, box-shadow .18s, transform .12s, background .18s;
+  }
+  .console-card:hover { border-color: var(--accent); box-shadow: var(--shadow-md); transform: translateY(-1px); }
+  .console-card.off { opacity: .62; background: var(--surface-2); }
+  .console-card.off:hover { opacity: .85; }
+  .cc-ico {
+    width: 44px; height: 44px; flex: 0 0 44px; border-radius: 12px;
+    display: grid; place-items: center; color: #fff;
+    background: var(--accent);
+    box-shadow: inset 0 -2px 0 rgba(0,0,0,.12);
+  }
+  .console-card.off .cc-ico { background: var(--border-strong); color: var(--text-secondary); }
+  .cc-ico svg { width: 22px; height: 22px; }
+  .cc-body { flex: 1; min-width: 0; }
+  .cc-name { font-family: var(--font-head); font-size: 15px; font-weight: 600; color: var(--text-primary); }
+  .cc-desc { font-size: 12.5px; color: var(--text-tertiary); margin-top: 3px; }
+  /* iOS 风切换开关 */
+  .cc-switch {
+    flex: 0 0 auto; width: 46px; height: 27px; border-radius: 14px;
+    background: var(--border-strong); position: relative;
+    transition: background .22s cubic-bezier(.4, 0, .2, 1);
+  }
+  .cc-switch.on { background: var(--accent); }
+  .cc-knob {
+    position: absolute; top: 3px; left: 3px; width: 21px; height: 21px;
+    border-radius: 50%; background: #fff; box-shadow: 0 1px 3px rgba(0,0,0,.25);
+    transition: transform .22s cubic-bezier(.34, 1.56, .64, 1);
+  }
+  .cc-switch.on .cc-knob { transform: translateX(19px); }
+  [data-theme="dark"] .cc-knob { background: var(--ink-100); }
   .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 14px; }
   .card {
     background: var(--surface); border: 1px solid var(--border);
@@ -531,13 +578,22 @@
   .col-head.running { color: var(--info-text); }
   .col-head.pending { color: var(--warning-text); }
   .col-head.done { color: var(--success-text); }
-  .trend-wrap { padding: 10px 14px 4px; border-bottom: 1px solid var(--border); background: var(--surface); }
-  .trend-wrap .trend-cap { font-size: 11px; color: var(--text-tertiary); margin-bottom: 4px; }
+
+  /* 紧凑趋势条（品牌卡片下方，仅在运行 tab 有数据时显示） */
+  .trend-compact {
+    display: flex; align-items: center; gap: 14px;
+    padding: 10px 16px; margin-top: 4px;
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 10px; font-size: 11.5px;
+  }
+  .tc-label { color: var(--text-tertiary); font-weight: 500; white-space: nowrap; }
+  .tc-legend { color: var(--text-secondary); font-variant-numeric: tabular-nums; }
+  .tc-legend::-webkit-scrollbar { display: none; }
+
   .col-body { padding: 12px; display: flex; flex-direction: column; gap: 10px; flex: 1; }
   .col-empty { color: var(--text-tertiary); font-size: 13px; text-align: center; padding: 26px 10px; }
   .col-more { font-size: 11.5px; color: var(--text-tertiary); text-align: center; padding-top: 2px; }
 
-  .tab-content { margin-bottom: 16px; }
   .tc-body { margin-top: 10px; padding-top: 10px; border-top: 1px dashed var(--border); }
   .answer-text { font-size: 13px; color: var(--text-secondary); white-space: pre-wrap; max-height: 280px; overflow: auto; line-height: 1.6; }
   .refs { display: flex; flex-direction: column; gap: 8px; margin-top: 10px; }
@@ -667,6 +723,6 @@
     });
   </script>
   <script src="/vendor/vue.global.prod.js"></script>
-  <script src="/app.js?v=20260807r"></script>
+  <script src="/app.js?v=20260807w"></script>
 </body>
 </html>

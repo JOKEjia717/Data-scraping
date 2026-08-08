@@ -40,6 +40,7 @@ import {
   privacyDebugLog,
   runWithConsolePrivacy
 } from "./consolePrivacy.js";
+import { isResearchStopRequested } from "./workerControl.js";
 import {
   createPageConversationManager,
   type ConversationBatchContext
@@ -280,6 +281,12 @@ export async function crawlPlatform(
   const executionQuestions = planBatchQuestions(options.batches);
 
   for (const [index, executionQuestion] of executionQuestions.entries()) {
+    // 运营台停止信号：研究模式下检测到 stop.request 即终止提交后续题目，
+    // 当前题目已完成的回答仍会照常保存。
+    if (options.mode === "research" && isResearchStopRequested()) {
+      console.log(`\n[${config.name}] 收到运营台停止信号，终止后续题目采集。`);
+      break;
+    }
     const {
       batch,
       batchIndex,

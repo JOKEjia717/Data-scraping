@@ -4,7 +4,12 @@
 import { pathToFileURL } from "node:url";
 import { closeRpaDatabasePool } from "./rpaDatabase.js";
 import { JsonlRpaTaskAuditLogger } from "./rpaTaskAudit.js";
-import { RpaTaskRepository } from "./rpaTaskRepository.js";
+import {
+  createRpaTaskRepositoryOptions,
+  RpaTaskRepository,
+  type RpaTaskRepositoryOptions
+} from "./rpaTaskRepository.js";
+import { parseRpaWorkerConfig } from "./rpaWorkerConfig.js";
 import {
   rpaConsoleError,
   rpaConsoleInfo
@@ -21,7 +26,11 @@ interface CheckOptions {
 export async function checkRpaTasks(argv = process.argv.slice(2)): Promise<void> {
   const options = parseCheckOptions(argv);
   const audit = new JsonlRpaTaskAuditLogger({ logDirectory: options.logDirectory });
-  const repository = new RpaTaskRepository(undefined, audit);
+  const repository = new RpaTaskRepository(
+    undefined,
+    audit,
+    resolveCheckRpaTaskRepositoryOptions(options.workerType, argv)
+  );
   try {
     if (options.claim) {
       const task = await repository.claimNextTask(options.workerType, {
@@ -31,8 +40,12 @@ export async function checkRpaTasks(argv = process.argv.slice(2)): Promise<void>
         rpaConsoleInfo({
           workerId: `${options.workerType}-task-check`,
           event: "TASK_CLAIMED",
+          businessType: task.businessType,
           executionId: task.executionId,
-          brandId: task.brandId,
+          ...(task.businessType === "ENTRY_MONITOR" ||
+              task.businessType === "CONTENT_STYLE_MONITOR"
+            ? { projectId: task.projectId }
+            : { brandId: task.brandId }),
           platformId: task.platformId,
           batchProgress: "claimed=1"
         });
@@ -57,8 +70,12 @@ export async function checkRpaTasks(argv = process.argv.slice(2)): Promise<void>
       rpaConsoleInfo({
         workerId: `${options.workerType}-task-check`,
         event: "PENDING_TASK",
+        businessType: task.businessType,
         executionId: task.executionId,
-        brandId: task.brandId,
+        ...(task.businessType === "ENTRY_MONITOR" ||
+            task.businessType === "CONTENT_STYLE_MONITOR"
+          ? { projectId: task.projectId }
+          : { brandId: task.brandId }),
         platformId: task.platformId
       });
     }
@@ -66,6 +83,17 @@ export async function checkRpaTasks(argv = process.argv.slice(2)): Promise<void>
     await audit.flush();
     await closeRpaDatabasePool();
   }
+}
+
+export function resolveCheckRpaTaskRepositoryOptions(
+  workerType: RpaWorkerType,
+  argv: readonly string[],
+  environment: NodeJS.ProcessEnv = process.env,
+  cwd = process.cwd()
+): RpaTaskRepositoryOptions {
+  return createRpaTaskRepositoryOptions(
+    parseRpaWorkerConfig(workerType, argv, environment, cwd)
+  );
 }
 
 export function parseCheckOptions(argv: readonly string[]): CheckOptions {

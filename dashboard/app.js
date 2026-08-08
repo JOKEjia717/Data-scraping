@@ -33,6 +33,23 @@ const SECTIONS = [
   { key: "CONTENT_STYLE_MONITOR", name: "风格监测", icon: "style" }
 ];
 
+/* 操纵台：四个可开关的功能（品牌诊断 / 数据监测 / 风格监测 / 研究爬取）。
+   启用状态持久化到 localStorage，默认全部启用。 */
+const FUNC_KEYS = [...SECTIONS.map(s => s.key), "research"];
+const FUNC_DEFS = [
+  { key: "DIAGNOSIS", name: "品牌诊断", icon: "diagnosis", desc: "按品牌聚合 AI 问答诊断任务" },
+  { key: "ENTRY_MONITOR", name: "数据监测", icon: "monitor", desc: "监测各平台数据更新与变化" },
+  { key: "CONTENT_STYLE_MONITOR", name: "风格监测", icon: "style", desc: "追踪内容/风格变化趋势" },
+  { key: "research", name: "研究爬取", icon: "research", desc: "研究类问答与引用资料爬取" }
+];
+function loadEnabledSections() {
+  let saved = {};
+  try { saved = JSON.parse(localStorage.getItem("dashboard-enabled") || "{}"); } catch (e) {}
+  const out = {};
+  for (const k of FUNC_KEYS) out[k] = saved[k] !== false; // 缺省 / true 均视为启用
+  return out;
+}
+
 const ICONS = {
   overview: '<svg viewBox="0 0 24 24" fill="none"><rect x="3" y="3" width="7" height="9" rx="1.5" stroke="currentColor" stroke-width="1.7"/><rect x="14" y="3" width="7" height="5" rx="1.5" stroke="currentColor" stroke-width="1.7"/><rect x="14" y="12" width="7" height="9" rx="1.5" stroke="currentColor" stroke-width="1.7"/><rect x="3" y="16" width="7" height="5" rx="1.5" stroke="currentColor" stroke-width="1.7"/></svg>',
   diagnosis: '<svg viewBox="0 0 24 24" fill="none"><circle cx="11" cy="11" r="7" stroke="currentColor" stroke-width="1.7"/><path d="m20 20-3.5-3.5" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>',
@@ -45,7 +62,8 @@ const ICONS = {
   ok: '<svg viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="9" stroke="currentColor" stroke-width="1.8"/><path d="M8 12l3 3 5-6" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>',
   warn: '<svg viewBox="0 0 24 24" fill="none"><path d="M12 7v6M12 17h.01" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/><circle cx="12" cy="12" r="9" stroke="currentColor" stroke-width="1.8"/></svg>',
   menu: '<svg viewBox="0 0 24 24" fill="none"><path d="M4 7h16M4 12h16M4 17h16" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>',
-  bell: '<svg viewBox="0 0 24 24" fill="none"><path d="M18 8A6 6 0 1 0 6 8c0 7-3 9-3 9h18s-3-2-3-9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/><path d="M13.73 21a2 2 0 0 1-3.46 0" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>'
+  bell: '<svg viewBox="0 0 24 24" fill="none"><path d="M18 8A6 6 0 1 0 6 8c0 7-3 9-3 9h18s-3-2-3-9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/><path d="M13.73 21a2 2 0 0 1-3.46 0" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>',
+  console: '<svg viewBox="0 0 24 24" fill="none"><path d="M4 8h9M17 8h3M4 16h3M11 16h9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/><circle cx="15" cy="8" r="2.4" stroke="currentColor" stroke-width="1.7"/><circle cx="9" cy="16" r="2.4" stroke="currentColor" stroke-width="1.7"/></svg>'
 };
 
 /* 品牌归并映射：子产品/系列 → 母品牌（模块级常量，extractBrand 直接引用） */
@@ -153,14 +171,15 @@ const App = {
       researchFiles: null,
       refsResearch: null,
       refsRpa: null,
-      activeNav: "overview",         // overview | DIAGNOSIS | ENTRY_MONITOR | STYLE_MONITOR | research
+      activeNav: "overview",         // overview | console | DIAGNOSIS | ENTRY_MONITOR | STYLE_MONITOR | research
       intervalMs: 120000,            // 默认 2 分钟刷新
+      enabledSections: loadEnabledSections(),  // 操纵台开关：key → bool（localStorage 持久化）
       connected: true,
       lastUpdated: "",
       nowTs: Date.now(),
       sidebarOpen: false,           // 移动端抽屉开合
       firstLoad: true,              // 首屏加载骨架屏
-      selectedTab: 1,               // 板块看板当前选中的 Tab：1=运行中 0=待运行 2=已运行 3=失败
+      selectedTab: 0,               // 板块看板当前选中的 Tab：1=运行中 0=待运行 2=已运行 3=失败（默认待运行，内容最丰富）
       notifOpen: false,              // 通知面板开合
       refsSearch: "",
       refsPlat: "",
@@ -175,14 +194,18 @@ const App = {
 
   computed: {
     navItems() {
+      const en = this.enabledSections || {};
+      const secItems = FUNC_DEFS.filter(f => en[f.key] !== false);
       return [
+        { key: "console", name: "操纵台", icon: "console" },
         { key: "overview", name: "运行总览", icon: "overview" },
-        ...SECTIONS,
-        { key: "research", name: "研究爬取", icon: "research" }
+        ...secItems
       ];
     },
     isSection() { return SECTIONS.some(s => s.key === this.activeNav); },
+    consoleFunctions() { return FUNC_DEFS; },
     currentTitle() {
+      if (this.activeNav === "console") return "操纵台";
       if (this.activeNav === "overview") return "运行总览";
       if (this.activeNav === "research") return "研究爬取";
       const s = SECTIONS.find(x => x.key === this.activeNav);
@@ -498,6 +521,47 @@ const App = {
     },
 
     setNav(key) { this.activeNav = key; this.sidebarOpen = false; },
+    persistEnabled() {
+      try { localStorage.setItem("dashboard-enabled", JSON.stringify(this.enabledSections)); } catch (e) {}
+    },
+    isEnabled(key) { return !!(this.enabledSections && this.enabledSections[key]); },
+    // 与运营台后端同步真实程序状态（控制文件是否存在），本地 localStorage 仅作离线缓存
+    async loadControlStates() {
+      try {
+        const r = await fetch("/api/control", { cache: "no-store" });
+        if (!r.ok) return;
+        const data = await r.json();
+        if (data && data.ok && data.states) {
+          for (const k of Object.keys(data.states)) {
+            if (data.states[k] !== undefined) this.enabledSections[k] = data.states[k];
+          }
+          this.persistEnabled();
+        }
+      } catch (e) { /* 后端不可达：保持 localStorage 缓存状态 */ }
+    },
+    // 点击开关：写/删后端控制文件，真实启停对应爬虫程序
+    async toggleFunction(key) {
+      const cur = this.isEnabled(key);
+      const next = !cur;
+      // 乐观更新本地状态
+      this.enabledSections[key] = next;
+      this.persistEnabled();
+      // 若停用了当前正在查看的功能，跳回操纵台，避免空页面
+      if (!next && this.activeNav === key) this.activeNav = "console";
+      try {
+        const r = await fetch("/api/control", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ key, enabled: next })
+        });
+        if (r.ok) {
+          const data = await r.json();
+          if (data && data.ok) this.enabledSections[key] = data.enabled;
+        }
+      } catch (e) {
+        console.warn("控制接口不可用，仅本地保存状态：", e);
+      }
+    },
     toggleSidebar() { this.sidebarOpen = !this.sidebarOpen; },
     closeSidebar() { this.sidebarOpen = false; },
     toggleNotif() { this.notifOpen = !this.notifOpen; },
@@ -574,7 +638,7 @@ const App = {
     isBrandOpen(brand) {
       if (Object.prototype.hasOwnProperty.call(this.brandCollapse, brand)) return !!this.brandCollapse[brand];
       // 用户尚未与任何品牌交互时，默认展开第一个品牌（避免页面显得太空）
-      const brands = Object.keys(this.groupedByPlatform);
+      const brands = (this.brandGroupList || []).map(g => g.brand);
       return brands.length > 0 && brands[0] === brand && Object.keys(this.brandCollapse).length <= 1;
     },
     kwTail(keyword, brand) {
@@ -596,7 +660,12 @@ const App = {
     pfKey(brand, pf) { return brand + "|" + pf; },
     isPfOpen(brand, pf) {
       const k = this.pfKey(brand, pf);
-      return !!this.pfCollapse[k];
+      if (Object.prototype.hasOwnProperty.call(this.pfCollapse, k)) return !!this.pfCollapse[k];
+      // 默认展开该品牌下的第一个平台（让页面有内容）
+      const g = (this.brandGroupList || []).find(x => x.brand === brand);
+      if (!g) return false;
+      const firstPf = g.platformChips && g.platformChips[0] && g.platformChips[0].pf;
+      return !!firstPf && firstPf === pf && Object.keys(this.pfCollapse).length === 0;
     },
     togglePf(brand, pf) {
       const k = this.pfKey(brand, pf);
@@ -660,6 +729,7 @@ const App = {
     this.poll();
     this.startTimer();
     this.startTick();
+    this.loadControlStates();  // 同步操纵台开关的真实程序状态
   },
 
   beforeUnmount() {
@@ -676,7 +746,7 @@ const App = {
     '      <div class="brand-text"><strong>爬取运营台</strong><span>AI Reference Crawler</span></div>',
     '    </div>',
     '    <nav class="nav" aria-label="主导航">',
-    '      <button v-for="item in navItems" :key="item.key" :class="[\'nav-item\', { active: activeNav === item.key }]" @click="setNav(item.key)" :title="item.name">',
+    '      <button v-for="item in navItems" :key="item.key" :class="[\'nav-item\', { active: activeNav === item.key }, { \'nav-console\': item.key === \'console\' }]" @click="setNav(item.key)" :title="item.name">',
     '        <span class="nav-ico" v-html="ICONS[item.icon]"></span>',
     '        <span class="nav-label">{{ item.name }}</span>',
     '        <span class="nav-badge" v-if="navBadge(item)">{{ navBadge(item) }}</span>',
@@ -748,6 +818,24 @@ const App = {
     '      <!-- 断连错误态 -->',
     '      <div v-else-if="!connected" class="alert red"><span class="alert-ico" v-html="ICONS.alert"></span><span>无法连接后端服务，请确认 dashboard 服务是否在运行（默认 http://127.0.0.1:8787）。</span></div>',
 
+    '      <!-- 操纵台：功能开关 -->',
+    '      <section v-else-if="activeNav === \'console\'">',
+    '        <div class="section-title">操纵台 · 功能开关</div>',
+    '        <p class="console-sub">点击卡片即可真实启停对应的爬虫程序。停用后 worker 会优雅暂停该业务（不再认领新任务，进程保持运行）；研究爬取会写入停止信号。状态同时保存在本地与服务端。</p>',
+    '        <div class="console-grid">',
+    '          <div v-for="fn in consoleFunctions" :key="fn.key" class="console-card" :class="{ off: !isEnabled(fn.key) }" @click="toggleFunction(fn.key)" role="button" :aria-pressed="isEnabled(fn.key)">',
+    '            <span class="cc-ico" v-html="ICONS[fn.icon]"></span>',
+    '            <div class="cc-body">',
+    '              <div class="cc-name">{{ fn.name }}</div>',
+    '              <div class="cc-desc">{{ fn.desc }}</div>',
+    '            </div>',
+    '            <div class="cc-switch" :class="{ on: isEnabled(fn.key) }" role="switch" :aria-checked="isEnabled(fn.key)">',
+    '              <span class="cc-knob"></span>',
+    '            </div>',
+    '          </div>',
+    '        </div>',
+    '      </section>',
+
     '      <!-- 总览 -->',
     '      <section v-if="activeNav === \'overview\'">',
     '        <div class="kpi-grid" v-if="kpis.length">',
@@ -798,23 +886,7 @@ const App = {
     '          </button>',
     '        </div>',
 
-    '        <!-- 正在运行：保留趋势图 + 运行中任务列表 -->',
-    '        <div v-if="selectedTab === 1" class="tab-content">',
-    '          <div class="trend-wrap" v-if="runningList.length">',
-    '            <div class="trend-cap">实时耗时趋势</div>',
-    '            <sparkline :series="trendSeries" :width="320" :height="96"></sparkline>',
-    '            <div class="legend">',
-    '              <div class="legend-item" v-for="(s, si) in trendSeries" :key="si">',
-    '                <span class="lg-dot" :style="{ background: s.color }"></span>',
-    '                <span class="lg-label" :title="s.label">{{ trunc(s.label, 18) }}</span>',
-    '                <span class="lg-val">{{ fmtDur(s.points[s.points.length - 1] || 0) }}</span>',
-    '              </div>',
-    '            </div>',
-    '          </div>',
-    '          <div v-if="!runningList.length" class="col-empty">无运行中的任务</div>',
-    '        </div>',
-
-    '        <!-- 按 品牌→平台→问题 分组展示（新版：品牌卡片头部 + 平滑展开）-->',
+    '        <!-- 按 品牌→平台→问题 分组展示（品牌卡片永远在最顶部）-->',
     '        <div class="grouped-list" v-if="brandGroupList.length">',
     '          <article v-for="g in brandGroupList" :key="g.brand" class="brand-card">',
     '            <header class="bc-head" @click="toggleBrand(g.brand)" role="button" :aria-expanded="isBrandOpen(g.brand)">',
@@ -906,7 +978,14 @@ const App = {
     '            </div>',
     '          </article>',
     '        </div>',
-    '        <div v-else class="col-empty">该分类下暂无任务</div>',
+        '        <div v-else class="col-empty">该分类下暂无任务</div>',
+
+    '        <!-- 运行中趋势（紧凑摘要，仅在运行 tab + 有数据时显示）-->',
+    '        <div v-if="selectedTab === 1 && runningList.length" class="trend-compact">',
+    '          <span class="tc-label">实时耗时趋势</span>',
+    '          <sparkline :series="trendSeries" :width="280" :height="48"></sparkline>',
+    '          <span class="tc-legend">{{ trendSeries.map(s => trunc(s.label, 12) + \' \' + fmtDur(s.points[s.points.length - 1] || 0)).join(\'  \') }}</span>',
+    '        </div>',
     '      </section>',
 
     '      <!-- 研究爬取 -->',

@@ -21,7 +21,12 @@ import { BrandBatchScheduler, type BrandBatch } from "./scheduler.js";
 import { classifyTechnicalError, type WorkerErrorCode } from "./browserDiagnostics.js";
 import type { PlatformId, ReferenceRecord } from "./types.js";
 
-export const MOCK_BUSINESS_TYPES = ["DIAGNOSIS", "ARTICLE_PROBE", "ENTRY_MONITOR"] as const;
+export const MOCK_BUSINESS_TYPES = [
+  "DIAGNOSIS",
+  "CONTENT_STYLE_MONITOR",
+  "ENTRY_MONITOR",
+  "ARTICLE_PROBE"
+] as const;
 export type MockBusinessType = (typeof MOCK_BUSINESS_TYPES)[number];
 
 export interface MockRpaTask {
@@ -501,7 +506,8 @@ export function createMockBusinessGroupId(task: Pick<
   MockRpaTask,
   "tenantKey" | "businessType" | "businessTaskId" | "projectId" | "monitorDate"
 >): string {
-  if (task.businessType === "ENTRY_MONITOR") {
+  if (task.businessType === "ENTRY_MONITOR" ||
+      task.businessType === "CONTENT_STYLE_MONITOR") {
     return JSON.stringify([
       task.tenantKey,
       task.businessType,
@@ -536,7 +542,8 @@ export function normalizeMockRpaTasks(input: unknown): MockRpaTask[] {
       !(MOCK_BUSINESS_TYPES as readonly string[]).includes(businessType)
     ) {
       throw new Error(
-        `第 ${index + 1} 个 Mock 任务 businessType 只能是 DIAGNOSIS 或 ARTICLE_PROBE，或 ENTRY_MONITOR。`
+        `第 ${index + 1} 个 Mock 任务 businessType 只能是 DIAGNOSIS、` +
+        `CONTENT_STYLE_MONITOR、ENTRY_MONITOR 或 ARTICLE_PROBE。`
       );
     }
     const aiModelId = requireString(rawTask.aiModelId, index, "aiModelId");
@@ -555,7 +562,7 @@ export function normalizeMockRpaTasks(input: unknown): MockRpaTask[] {
       aiModelName: requireString(rawTask.aiModelName, index, "aiModelName"),
       deepThinking: rawTask.deepThinking
     };
-    if (businessType === "ENTRY_MONITOR") {
+    if (businessType === "ENTRY_MONITOR" || businessType === "CONTENT_STYLE_MONITOR") {
       const repetitionNo = Number(rawTask.repetitionNo);
       if (!Number.isSafeInteger(repetitionNo) || repetitionNo <= 0) {
         throw new Error(`第 ${index + 1} 个 Mock 任务 repetitionNo 必须是正整数。`);

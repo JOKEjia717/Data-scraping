@@ -580,7 +580,8 @@ test("monitor 开启新业务后僵尸查询与恢复同时覆盖新旧 monitor 
     new FakeLeases()
   );
   assert.deepEqual(result.recoveredExecutionIds, ["31"]);
-  assert.match(client.queries[0]!.sql, /d\.business_type IN \(\?, \?\)/);
+  assert.match(client.queries[0]!.sql, /e\.business_type IN \(\?, \?\)/);
+  assert.match(client.queries[0]!.sql, /d\.business_type = e\.business_type/);
   assert.deepEqual(client.queries[0]!.parameters, [
     "ARTICLE_PROBE", "ENTRY_MONITOR", cutoff, 100
   ]);
@@ -608,6 +609,21 @@ test("ENTRY_MONITOR 配置只由 monitor 解析，错误配置不阻止 diagnosi
     ENTRY_MONITOR_ENABLED: "not-a-boolean",
     ENTRY_MONITOR_TIMEZONE: "UTC"
   }, "/workspace"));
+});
+
+test("CONTENT_STYLE_MONITOR context 未落库前即使误开配置也拒绝启动", () => {
+  assert.throws(
+    () => parseRpaWorkerConfig("monitor", [], {
+      RPA_WORKER_PROVIDER_ROUTING_ENABLED: "true",
+      CONTENT_STYLE_MONITOR_ENABLED: "true",
+      CONTENT_STYLE_MONITOR_GRAY_PROJECT_IDS: "5"
+    }),
+    /通用 execution context 尚未完成/
+  );
+  const diagnosis = parseRpaWorkerConfig("diagnosis", [], {
+    CONTENT_STYLE_MONITOR_ENABLED: "not-a-boolean"
+  });
+  assert.equal(diagnosis.contentStyleMonitorEnabled, false);
 });
 
 test("品牌窗口默认限制为两个未完成品牌，并以四个平台作为完成屏障", async () => {

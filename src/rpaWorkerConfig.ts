@@ -75,6 +75,11 @@ export interface RpaWorkerConfig {
   entryMonitorConversationMaxDurationMs: number;
   entryMonitorConversationMaxQuestions: number;
   entryMonitorTimezone: "Asia/Shanghai";
+  /** 风格监测使用独立开关；context/会话合同未完成时必须保持 false。 */
+  contentStyleMonitorEnabled: boolean;
+  contentStyleMonitorGrayProjectIds: string[];
+  /** ARTICLE_PROBE 仅为存量兼容，可在存量清零后单独关闭。 */
+  articleProbeLegacyEnabled: boolean;
 }
 
 export function parseRpaWorkerConfig(
@@ -91,6 +96,9 @@ export function parseRpaWorkerConfig(
     environment[`RPA_WORKER_${suffix}`];
   const entryConfigured = (suffix: string): string | undefined =>
     args.get(`entry-monitor-${toCliName(suffix)}`) ?? environment[`ENTRY_MONITOR_${suffix}`];
+  const contentStyleConfigured = (suffix: string): string | undefined =>
+    args.get(`content-style-monitor-${toCliName(suffix)}`) ??
+    environment[`CONTENT_STYLE_MONITOR_${suffix}`];
   const heartbeatIntervalMs = integer(
     configured("HEARTBEAT_MS") ?? "30000",
     "heartbeat-ms",
@@ -380,7 +388,23 @@ export function parseRpaWorkerConfig(
       : 10_000,
     entryMonitorTimezone: workerType === "monitor"
       ? entryMonitorTimezone(entryConfigured("TIMEZONE") ?? "Asia/Shanghai")
-      : "Asia/Shanghai"
+      : "Asia/Shanghai",
+    contentStyleMonitorEnabled: workerType === "monitor"
+      ? booleanValue(
+        contentStyleConfigured("ENABLED") ?? "false",
+        "content-style-monitor-enabled"
+      )
+      : false,
+    contentStyleMonitorGrayProjectIds: workerType === "monitor"
+      ? csvIds(contentStyleConfigured("GRAY_PROJECT_IDS"))
+      : [],
+    articleProbeLegacyEnabled: workerType === "monitor"
+      ? booleanValue(
+        args.get("article-probe-legacy-enabled") ??
+          environment.ARTICLE_PROBE_LEGACY_ENABLED ?? "true",
+        "article-probe-legacy-enabled"
+      )
+      : false
   };
   if (config.diskWarningFreeMb < config.diskStopFreeMb) {
     throw new Error("disk-warning-free-mb 不能小于 disk-stop-free-mb。");
@@ -392,6 +416,17 @@ export function parseRpaWorkerConfig(
     if (config.entryMonitorGrayProjectIds.length === 0) {
       throw new Error("启用 ENTRY_MONITOR 时必须配置灰度项目白名单。");
     }
+  }
+  if (config.contentStyleMonitorEnabled) {
+    if (!config.providerRoutingEnabled) {
+      throw new Error("启用 CONTENT_STYLE_MONITOR 前必须开启 provider-routing-enabled。");
+    }
+    if (config.contentStyleMonitorGrayProjectIds.length === 0) {
+      throw new Error("启用 CONTENT_STYLE_MONITOR 时必须配置灰度项目白名单。");
+    }
+    throw new Error(
+      "CONTENT_STYLE_MONITOR 的通用 execution context 尚未完成，当前版本禁止领取。"
+    );
   }
   if (
     config.deploymentEnvironment === "production" &&

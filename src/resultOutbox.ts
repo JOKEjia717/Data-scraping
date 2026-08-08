@@ -12,17 +12,19 @@ import type {
   RpaCollectionResult,
   RpaResultSaveOutcome
 } from "./rpaResultRepository.js";
+import type { RpaBusinessType } from "./rpaTask.js";
 import type { ReferenceRecord } from "./types.js";
 
-const OUTBOX_VERSION = 2;
+const OUTBOX_VERSION = 3;
 const COMPLETE_FILE_PATTERN = /^execution-([A-Za-z0-9_-]+)\.json$/;
 
 export interface ResultOutboxEntry {
-  version: 2;
-  schemaVersion: 2;
+  version: 3;
+  schemaVersion: 3;
   payloadChecksum: string;
   executionId: string;
   dispatchTaskId: string;
+  businessType: RpaBusinessType;
   keyword: string;
   answerContent: string;
   references: ReferenceRecord[];
@@ -335,6 +337,7 @@ function normalizeEntry(input: RpaCollectionResult, now: Date): ResultOutboxEntr
     schemaVersion: OUTBOX_VERSION,
     executionId,
     dispatchTaskId: requiredText(input.dispatchTaskId, "dispatchTaskId", 256),
+    businessType: requiredBusinessType(input.businessType),
     keyword: requiredText(input.keyword, "keyword", 100_000),
     answerContent: requiredText(input.answerContent, "answerContent", 10_000_000),
     references: input.references.map((reference) => ({ ...reference })),
@@ -365,7 +368,7 @@ function parseEntry(content: string, fileName: string): ResultOutboxEntry {
   } catch (error) {
     throw new Error(`Result Outbox JSON 损坏：${fileName}`, { cause: error });
   }
-  if (!isRecord(parsed) || (parsed.version !== 1 && parsed.version !== OUTBOX_VERSION)) {
+  if (!isRecord(parsed) || ![1, 2, OUTBOX_VERSION].includes(Number(parsed.version))) {
     throw new Error(`Result Outbox 版本无效：${fileName}`);
   }
   const normalized = normalizeStoredEntry(parsed, fileName);
@@ -392,6 +395,7 @@ function normalizeStoredEntry(
   const result = normalizeEntry({
     executionId: requiredText(value.executionId, "executionId", 256),
     dispatchTaskId: requiredText(value.dispatchTaskId, "dispatchTaskId", 256),
+    businessType: requiredBusinessType(value.businessType),
     keyword: requiredText(value.keyword, "keyword", 100_000),
     answerContent: requiredText(value.answerContent, "answerContent", 10_000_000),
     references: value.references as ReferenceRecord[],
@@ -424,6 +428,14 @@ function requiredText(value: unknown, field: string, maximumLength: number): str
   if (typeof value !== "string" || !value.trim()) throw new Error(`${field} 不能为空。`);
   if (value.length > maximumLength) throw new Error(`${field} 长度超过限制。`);
   return value;
+}
+
+function requiredBusinessType(value: unknown): RpaBusinessType {
+  if (
+    value === "DIAGNOSIS" || value === "CONTENT_STYLE_MONITOR" ||
+    value === "ENTRY_MONITOR" || value === "ARTICLE_PROBE"
+  ) return value;
+  throw new Error(`Result Outbox businessType 无效：${String(value)}`);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
